@@ -68,6 +68,37 @@ Goes beyond summarization — verifies claims, maps arguments, assesses bias, an
 | `comparative` | "Better than all others" |
 | `historical` | "Invented in 1995" |
 
+### Read Reports Aloud (Text-to-Speech)
+```bash
+# Read a deep research report aloud as MP3
+python yt_scrape.py read path/to/report_deep_research.json
+
+# Choose a different voice
+python yt_scrape.py read report.json --voice andrew
+python yt_scrape.py read report.json --voice christopher
+
+# Adjust speed and volume
+python yt_scrape.py read report.json --rate "+15%" --volume "+10%"
+
+# List all available voices
+python yt_scrape.py voices
+```
+
+Uses [edge-tts](https://github.com/rany2/edge-tts) (Microsoft Edge neural voices) — free, no API key, near-human quality. Saves MP3 to the same directory as the report.
+
+**Voice presets:**
+
+| Shortcut | Voice | Gender |
+|----------|-------|--------|
+| `ava` (default) | en-US-AvaNeural | Female |
+| `aria` | en-US-AriaNeural | Female |
+| `emma` | en-US-EmmaNeural | Female |
+| `andrew` | en-US-AndrewNeural | Male |
+| `brian` | en-US-BrianNeural | Male |
+| `christopher` | en-US-ChristopherNeural | Male |
+
+You can also pass any full voice name (e.g. `en-GB-RyanNeural` for a British accent). Run `python yt_scrape.py voices` to see all 40+ English voices.
+
 ## Installation
 
 ```bash
@@ -142,6 +173,8 @@ python yt_scrape.py metadata "https://youtube.com/watch?v=..."
 | `batch <file>` | Batch scrape from a file of URLs |
 | `metadata <URL>` | Get video metadata only |
 | `list` | List saved transcripts |
+| `read <report.json>` | Read a research report aloud as MP3 (text-to-speech) |
+| `voices` | List available TTS voices |
 
 ## Common Options
 
@@ -167,6 +200,7 @@ All files are saved to `~/yt_transcripts/` (or custom `--output` directory):
 | `<id>_research_package.json` | Deep Research package (claims + sources + schema) |
 | `<id>_research.json` | Light Research report |
 | `<id>_deep_research.json` | Deep Research brief |
+| `<id>_deep_research_audio.mp3` | TTS audio of the deep research brief |
 
 ## Tests
 
@@ -174,7 +208,7 @@ All files are saved to `~/yt_transcripts/` (or custom `--output` directory):
 python -m pytest test_yt_scrape.py -v
 ```
 
-73 tests covering: transcript cleanup pipeline, claim extraction (9 types), source extraction, Light Research workflow, Deep Research workflow, and performance.
+94 tests covering: transcript cleanup pipeline, claim extraction (9 types), source extraction, Light Research workflow, Deep Research workflow, TTS report formatting, and performance.
 
 ## Requirements
 

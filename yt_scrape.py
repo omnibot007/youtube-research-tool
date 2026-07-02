@@ -29,6 +29,7 @@ Options:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import datetime as dt
 import functools
 import glob
@@ -48,6 +49,11 @@ try:
 except ImportError:
     print("ERROR: yt-dlp not installed. Run: pip install yt-dlp", file=sys.stderr)
     sys.exit(1)
+
+try:
+    import edge_tts
+except ImportError:
+    edge_tts = None  # TTS features disabled — run: pip install edge-tts
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -1669,6 +1675,414 @@ def prepare_deep_research(
     return package
 
 
+# ---------------------------------------------------------------- TEXT-TO-SPEECH (TTS)
+
+# Default voice — Microsoft Ava neural (natural, female, US English)
+DEFAULT_VOICE = "en-US-AvaNeural"
+
+# Voices that sound good for research reports
+VOICE_OPTIONS = {
+    "ava": "en-US-AvaNeural",          # Female, natural
+    "aria": "en-US-AriaNeural",        # Female, conversational
+    "emma": "en-US-EmmaNeural",        # Female, warm
+    "andrew": "en-US-AndrewNeural",    # Male, natural
+    "brian": "en-US-BrianNeural",      # Male, conversational
+    "christopher": "en-US-ChristopherNeural",  # Male, authoritative
+}
+
+
+def _format_deep_research_for_tts(report: dict) -> str:
+    """Convert a deep research JSON report into a natural spoken script.
+
+    Produces narration-ready text — not raw JSON. Handles all sections:
+    executive summary, argument structure, claim verdicts, bias, omissions.
+    """
+    parts: list[str] = []
+
+    title = report.get("title", "")
+    channel = report.get("channel", "")
+    if title:
+        parts.append(f"Deep Research Report. {title}.")
+    if channel:
+        parts.append(f"Channel: {channel}.")
+    parts.append("")  # pause
+
+    # Executive summary
+    summary = report.get("executive_summary", "")
+    if summary:
+        parts.append("Executive Summary.")
+        parts.append(summary)
+        parts.append("")
+
+    # Argument structure
+    arg = report.get("argument_structure", {})
+    if arg:
+        thesis = arg.get("main_thesis", "")
+        if thesis:
+            parts.append("Main Thesis.")
+            parts.append(thesis)
+            parts.append("")
+
+        premises = arg.get("premises", [])
+        if premises:
+            parts.append("Premises.")
+            for i, p in enumerate(premises, 1):
+                premise_text = p.get("premise", "") if isinstance(p, dict) else str(p)
+                etype = p.get("evidence_type", "") if isinstance(p, dict) else ""
+                evidence_note = f" (Evidence type: {etype})" if etype else ""
+                parts.append(f"Premise {i}. {premise_text}{evidence_note}.")
+            parts.append("")
+
+        conclusions = arg.get("conclusions", [])
+        if conclusions:
+            parts.append("Conclusions.")
+            for c in conclusions:
+                parts.append(f"{c}.")
+            parts.append("")
+
+        reasoning = arg.get("reasoning_quality", "")
+        if reasoning:
+            parts.append("Reasoning Quality.")
+            parts.append(reasoning)
+            parts.append("")
+
+        fallacies = arg.get("fallacies_identified", [])
+        if fallacies:
+            parts.append("Logical Fallacies Identified.")
+            for f in fallacies:
+                if isinstance(f, dict):
+                    fname = f.get("fallacy", "")
+                    fexample = f.get("example", "")
+                    fexplanation = f.get("explanation", "")
+                    parts.append(f"{fname}.")
+                    if fexample:
+                        parts.append(f"Example: {fexample}.")
+                    if fexplanation:
+                        parts.append(f"Explanation: {fexplanation}.")
+                    parts.append("")
+            parts.append("")
+
+    # Claim verification
+    claims = report.get("claim_verification", [])
+    if claims:
+        parts.append("Claim Verification.")
+        parts.append(f"Total claims verified: {len(claims)}.")
+        parts.append("")
+        for i, c in enumerate(claims, 1):
+            claim_text = c.get("claim", "")
+            verdict = c.get("verdict", "")
+            evidence = c.get("evidence", "")
+            confidence = c.get("confidence", "")
+            quote = c.get("verbatim_quote", "")
+
+            parts.append(f"Claim {i}.")
+            if quote:
+                parts.append(f"Quote: {quote}.")
+            parts.append(f"Claim: {claim_text}.")
+            parts.append(f"Verdict: {verdict}.")
+            if confidence:
+                parts.append(f"Confidence: {confidence}.")
+            if evidence:
+                parts.append(f"Evidence: {evidence}.")
+            sources = c.get("sources", [])
+            if sources:
+                src_count = len(sources)
+                parts.append(f"Sources consulted: {src_count}.")
+            parts.append("")
+
+    # Bias assessment
+    bias = report.get("bias_assessment", {})
+    if bias:
+        parts.append("Bias Assessment.")
+        credibility = bias.get("speaker_credibility", "")
+        if credibility:
+            parts.append(f"Speaker credibility: {credibility}.")
+            parts.append("")
+
+        biases = bias.get("potential_biases", [])
+        if biases:
+            parts.append("Potential biases.")
+            for b in biases:
+                parts.append(f"{b}.")
+            parts.append("")
+
+        conflicts = bias.get("conflicts_of_interest", [])
+        if conflicts:
+            parts.append("Conflicts of interest.")
+            for c in conflicts:
+                parts.append(f"{c}.")
+            parts.append("")
+
+        ecosystem = bias.get("financial_ecosystem", "")
+        if ecosystem:
+            parts.append(f"Financial ecosystem: {ecosystem}.")
+            parts.append("")
+
+        reliability = bias.get("overall_reliability", "")
+        if reliability:
+            parts.append(f"Overall reliability: {reliability}.")
+            parts.append("")
+
+    # Cross-references
+    xrefs = report.get("cross_references", [])
+    if xrefs:
+        parts.append("Cross References.")
+        for xr in xrefs:
+            topic = xr.get("topic", "")
+            video_claims = xr.get("this_video_claims", "")
+            auth_says = xr.get("authoritative_sources_say", "")
+            agreement = xr.get("agreement_level", "")
+
+            parts.append(f"Topic: {topic}.")
+            if video_claims:
+                parts.append(f"This video claims: {video_claims}.")
+            if auth_says:
+                parts.append(f"Authoritative sources say: {auth_says}.")
+            if agreement:
+                parts.append(f"Agreement level: {agreement}.")
+            parts.append("")
+
+    # Omission analysis
+    omissions = report.get("omission_analysis", [])
+    if omissions:
+        parts.append("Omission Analysis. What was NOT said that should have been.")
+        for o in omissions:
+            parts.append(f"{o}.")
+        parts.append("")
+
+    # Research gaps
+    gaps = report.get("research_gaps", [])
+    if gaps:
+        parts.append("Research Gaps.")
+        for g in gaps:
+            parts.append(f"{g}.")
+        parts.append("")
+
+    # Open questions
+    questions = report.get("open_questions", [])
+    if questions:
+        parts.append("Open Questions.")
+        for q in questions:
+            parts.append(f"{q}.")
+        parts.append("")
+
+    # Overall confidence
+    conf = report.get("overall_confidence", {})
+    if conf:
+        level = conf.get("level", "")
+        rationale = conf.get("rationale", "")
+        parts.append("Overall Confidence.")
+        if level:
+            parts.append(f"Level: {level}.")
+        if rationale:
+            parts.append(f"Rationale: {rationale}.")
+        parts.append("")
+
+    # Methodology
+    methodology = report.get("methodology", {})
+    if methodology:
+        approach = methodology.get("approach", "")
+        sources_consulted = methodology.get("sources_consulted", 0)
+        searches = methodology.get("web_searches_performed", 0)
+        limitations = methodology.get("limitations", [])
+
+        parts.append("Methodology.")
+        if approach:
+            parts.append(f"Approach: {approach}.")
+        if sources_consulted:
+            parts.append(f"Sources consulted: {sources_consulted}.")
+        if searches:
+            parts.append(f"Web searches performed: {searches}.")
+        if limitations:
+            parts.append("Limitations.")
+            for lim in limitations:
+                parts.append(f"{lim}.")
+        parts.append("")
+
+    parts.append("End of report.")
+
+    return "\n".join(parts)
+
+
+def _format_light_research_for_tts(report: dict) -> str:
+    """Convert a light research JSON report into a natural spoken script."""
+    parts: list[str] = []
+
+    title = report.get("title", "")
+    channel = report.get("channel", "")
+    if title:
+        parts.append(f"Light Research Report. {title}.")
+    if channel:
+        parts.append(f"Channel: {channel}.")
+    parts.append("")
+
+    tldr = report.get("tldr", "")
+    if tldr:
+        parts.append("TL;DR.")
+        parts.append(tldr)
+        parts.append("")
+
+    summary = report.get("summary", "")
+    if summary:
+        parts.append("Summary.")
+        parts.append(summary)
+        parts.append("")
+
+    key_points = report.get("key_points", [])
+    if key_points:
+        parts.append("Key Points.")
+        for i, kp in enumerate(key_points, 1):
+            parts.append(f"Point {i}. {kp}.")
+        parts.append("")
+
+    topics = report.get("topics", [])
+    if topics:
+        parts.append("Topics Covered.")
+        for t in topics:
+            if isinstance(t, dict):
+                name = t.get("name", "")
+                desc = t.get("description", "")
+                parts.append(f"{name}. {desc}.")
+            else:
+                parts.append(f"{t}.")
+        parts.append("")
+
+    action_items = report.get("action_items", [])
+    if action_items:
+        parts.append("Action Items.")
+        for a in action_items:
+            parts.append(f"{a}.")
+        parts.append("")
+
+    quotes = report.get("quotes", [])
+    if quotes:
+        parts.append("Notable Quotes.")
+        for q in quotes:
+            parts.append(f'"{q}".')
+        parts.append("")
+
+    controversial = report.get("controversial_claims", [])
+    if controversial:
+        parts.append("Controversial Claims.")
+        for c in controversial:
+            parts.append(f"{c}.")
+        parts.append("")
+
+    sentiment = report.get("sentiment", "")
+    if sentiment:
+        parts.append(f"Sentiment: {sentiment}.")
+    energy = report.get("energy", "")
+    if energy:
+        parts.append(f"Energy: {energy}.")
+    parts.append("")
+
+    parts.append("End of report.")
+    return "\n".join(parts)
+
+
+def _format_report_for_tts(report: dict) -> str:
+    """Auto-detect report type and format for TTS."""
+    mode = report.get("research_mode", "")
+    if mode == "deep":
+        return _format_deep_research_for_tts(report)
+    # Light research or untyped
+    return _format_light_research_for_tts(report)
+
+
+async def _generate_speech(
+    text: str,
+    output_path: Path,
+    voice: str = DEFAULT_VOICE,
+    rate: str = "+0%",
+    volume: str = "+0%",
+) -> None:
+    """Generate speech audio file using edge-tts.
+
+    Args:
+        text: The text to speak
+        output_path: Where to save the MP3
+        voice: edge-tts voice name (e.g. en-US-AvaNeural)
+        rate: Speech rate adjustment (e.g. "+10%", "-5%", "+0%")
+        volume: Volume adjustment (e.g. "+10%", "-5%", "+0%")
+    """
+    communicate = edge_tts.Communicate(
+        text,
+        voice=voice,
+        rate=rate,
+        volume=volume,
+    )
+    await communicate.save(str(output_path))
+
+
+def read_report(
+    report_path: str | Path,
+    output_dir: Path | None = None,
+    voice: str = DEFAULT_VOICE,
+    rate: str = "+0%",
+    volume: str = "+0%",
+) -> dict:
+    """Read a research report aloud as an MP3 file.
+
+    Args:
+        report_path: Path to the _research.json or _deep_research.json file
+        output_dir: Where to save the MP3 (defaults to same dir as report)
+        voice: edge-tts voice name
+        rate: Speech rate (e.g. "+10%" faster, "-10%" slower)
+        volume: Volume adjustment
+
+    Returns:
+        Dict with ok, audio_path, text_length, char_count, voice, duration_estimate
+    """
+    report_path = Path(report_path)
+    if not report_path.exists():
+        return {"ok": False, "error": f"Report file not found: {report_path}"}
+
+    # Load report JSON
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        return {"ok": False, "error": f"Invalid JSON: {e}"}
+
+    # Format for TTS
+    script = _format_report_for_tts(report)
+    if not script.strip():
+        return {"ok": False, "error": "Report is empty or has no readable content"}
+
+    # Determine output path
+    out = output_dir or report_path.parent
+    out.mkdir(parents=True, exist_ok=True)
+    stem = report_path.stem  # e.g. "pCmJ8wsAS_w_deep_research"
+    audio_path = out / f"{stem}_audio.mp3"
+
+    # Generate speech
+    try:
+        asyncio.run(_generate_speech(script, audio_path, voice, rate, volume))
+    except Exception as e:
+        return {"ok": False, "error": f"TTS generation failed: {e}"}
+
+    if not audio_path.exists():
+        return {"ok": False, "error": "Audio file was not created"}
+
+    audio_size = audio_path.stat().st_size
+    char_count = len(script)
+    # Rough duration estimate: edge-tts ~150 chars/sec at +0%
+    duration_estimate = char_count / 150
+
+    return {
+        "ok": True,
+        "audio_path": str(audio_path),
+        "report_path": str(report_path),
+        "text_length": char_count,
+        "audio_size_bytes": audio_size,
+        "audio_size_mb": round(audio_size / (1024 * 1024), 2),
+        "voice": voice,
+        "duration_estimate_seconds": round(duration_estimate),
+        "duration_estimate_minutes": round(duration_estimate / 60, 1),
+        "rate": rate,
+        "volume": volume,
+    }
+
+
 # ---------------------------------------------------------------- CLI
 
 def _parse_langs(lang_str: str) -> list[str]:
@@ -1753,6 +2167,17 @@ def main() -> int:
     sp_dr.add_argument("--retries", type=int, default=DEFAULT_RETRIES, help="Max retries on network errors")
     sp_dr.add_argument("--output", default="", help="Custom output directory")
     sp_dr.add_argument("--json", action="store_true", help="Output as JSON (default: human-readable)")
+
+    sp_read = sub.add_parser("read", help="Read a research report aloud as MP3 (text-to-speech)")
+    sp_read.add_argument("report", help="Path to report JSON (_research.json or _deep_research.json)")
+    sp_read.add_argument("--voice", default="ava", help="Voice name: ava, aria, emma, andrew, brian, christopher (default: ava)")
+    sp_read.add_argument("--rate", default="+0%", help="Speech rate (e.g. +10%% faster, -10%% slower)")
+    sp_read.add_argument("--volume", default="+0%", help="Volume adjustment (e.g. +10%% louder)")
+    sp_read.add_argument("--output", default="", help="Custom output directory for MP3")
+    sp_read.add_argument("--json", action="store_true", help="Output as JSON (default: human-readable)")
+
+    sp_voices = sub.add_parser("voices", help="List available TTS voices")
+    sp_voices.add_argument("--json", action="store_true", help="Output as JSON")
 
     args = p.parse_args()
 
@@ -1999,6 +2424,83 @@ def main() -> int:
             print(f"  7. Identify omissions (what's NOT said)")
             print(f"  8. Produce deep research brief JSON")
             print(f"  Save as: {v['id']}_deep_research.json")
+            print(f"{'=' * 70}")
+        return 0
+
+    if args.cmd == "voices":
+        if edge_tts is None:
+            print("ERROR: edge-tts not installed. Run: pip install edge-tts", file=sys.stderr)
+            return 1
+        voices_data = asyncio.run(edge_tts.list_voices())
+        en_voices = [v for v in voices_data if v["Locale"].startswith("en-")]
+        if args.json:
+            print(json.dumps([
+                {"short_name": v["ShortName"], "gender": v["Gender"],
+                 "locale": v["Locale"], "friendly_name": v["FriendlyName"]}
+                for v in en_voices
+            ], ensure_ascii=False, indent=2))
+        else:
+            print(f"{'=' * 70}")
+            print(f"  AVAILABLE TTS VOICES (English)")
+            print(f"{'=' * 70}")
+            # Show preset voices first
+            print(f"  Preset shortcuts (use with --voice):")
+            for name, voice_id in VOICE_OPTIONS.items():
+                print(f"    --voice {name:<14} → {voice_id}")
+            print(f"{'─' * 70}")
+            print(f"  All English voices:")
+            for v in en_voices:
+                print(f"    {v['ShortName']:<40} {v['Gender']:<8} {v['FriendlyName']}")
+            print(f"{'=' * 70}")
+        return 0
+
+    if args.cmd == "read":
+        if edge_tts is None:
+            print("ERROR: edge-tts not installed. Run: pip install edge-tts", file=sys.stderr)
+            return 1
+
+        # Resolve voice
+        voice_input = args.voice
+        if voice_input in VOICE_OPTIONS:
+            voice = VOICE_OPTIONS[voice_input]
+        elif voice_input.startswith("en-"):
+            voice = voice_input  # Full voice name passed directly
+        else:
+            print(f"ERROR: Unknown voice '{voice_input}'. Use one of: {', '.join(VOICE_OPTIONS.keys())}", file=sys.stderr)
+            return 1
+
+        read_out = Path(args.output) if args.output else None
+
+        result = read_report(
+            args.report,
+            output_dir=read_out,
+            voice=voice,
+            rate=args.rate,
+            volume=args.volume,
+        )
+
+        if not result.get("ok"):
+            print(f"FAILED: {result.get('error', 'unknown error')}", file=sys.stderr)
+            if args.json:
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 1
+
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            print(f"{'=' * 70}")
+            print(f"  REPORT READ ALOUD — MP3 GENERATED")
+            print(f"{'=' * 70}")
+            print(f"  Report:   {result['report_path']}")
+            print(f"  Audio:    {result['audio_path']}")
+            print(f"{'─' * 70}")
+            print(f"  Voice:    {result['voice']}")
+            print(f"  Rate:     {result['rate']}")
+            print(f"  Volume:   {result['volume']}")
+            print(f"{'─' * 70}")
+            print(f"  Text length:       {result['text_length']:,} chars")
+            print(f"  Audio size:        {result['audio_size_mb']} MB")
+            print(f"  Est. duration:     {result['duration_estimate_minutes']} min ({result['duration_estimate_seconds']}s)")
             print(f"{'=' * 70}")
         return 0
 

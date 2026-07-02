@@ -5,6 +5,7 @@ censor handling, punctuation heuristics, repeat collapse) and the
 prepare_light_research function with mocked transcript extraction.
 """
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -699,3 +700,243 @@ class TestPrepareDeepResearch:
             assert pkg["claim_count"] > 0
             assert "extracted_claims" in pkg
             assert "instructions" in pkg
+
+
+# ---------------------------------------------------------------- TTS / READ REPORT
+
+from yt_scrape import (
+    _format_deep_research_for_tts,
+    _format_light_research_for_tts,
+    _format_report_for_tts,
+    VOICE_OPTIONS,
+    DEFAULT_VOICE,
+    read_report,
+)
+
+try:
+    import edge_tts
+except ImportError:
+    edge_tts = None
+
+
+class TestFormatDeepResearchForTTS:
+    def test_formats_minimal_report(self):
+        report = {
+            "research_mode": "deep",
+            "title": "Test Video",
+            "channel": "TestChan",
+            "executive_summary": "This is a test summary.",
+        }
+        script = _format_deep_research_for_tts(report)
+        assert "Test Video" in script
+        assert "TestChan" in script
+        assert "Executive Summary" in script
+        assert "This is a test summary." in script
+
+    def test_includes_claim_verdicts(self):
+        report = {
+            "research_mode": "deep",
+            "title": "Test",
+            "claim_verification": [
+                {
+                    "claim": "This strategy has 90% win rate",
+                    "verdict": "contradicted",
+                    "evidence": "Testing showed 36%",
+                    "confidence": "HIGH",
+                    "verbatim_quote": "90% win rate",
+                    "sources": [{"url": "http://example.com", "title": "Test"}],
+                }
+            ],
+        }
+        script = _format_deep_research_for_tts(report)
+        assert "Claim 1" in script
+        assert "90% win rate" in script
+        assert "contradicted" in script
+        assert "HIGH" in script
+        assert "Sources consulted: 1" in script
+
+    def test_includes_fallacies(self):
+        report = {
+            "research_mode": "deep",
+            "title": "Test",
+            "argument_structure": {
+                "fallacies_identified": [
+                    {"fallacy": "Cherry-picking", "example": "Only showed winning trades",
+                     "explanation": "Selective examples"}
+                ],
+            },
+        }
+        script = _format_deep_research_for_tts(report)
+        assert "Cherry-picking" in script
+        assert "Only showed winning trades" in script
+
+    def test_includes_bias_assessment(self):
+        report = {
+            "research_mode": "deep",
+            "title": "Test",
+            "bias_assessment": {
+                "speaker_credibility": "Unknown",
+                "potential_biases": ["Survivorship bias", "Promotional bias"],
+                "conflicts_of_interest": ["Sells paid signals"],
+                "financial_ecosystem": "YouTube + paid products",
+                "overall_reliability": "low",
+            },
+        }
+        script = _format_deep_research_for_tts(report)
+        assert "Survivorship bias" in script
+        assert "Sells paid signals" in script
+        assert "YouTube + paid products" in script
+        assert "low" in script
+
+    def test_includes_omissions(self):
+        report = {
+            "research_mode": "deep",
+            "title": "Test",
+            "omission_analysis": ["No stop-loss discussed", "No position sizing"],
+        }
+        script = _format_deep_research_for_tts(report)
+        assert "Omission Analysis" in script
+        assert "No stop-loss discussed" in script
+        assert "No position sizing" in script
+
+    def test_includes_overall_confidence(self):
+        report = {
+            "research_mode": "deep",
+            "title": "Test",
+            "overall_confidence": {"level": "MODERATE", "rationale": "Limited data"},
+        }
+        script = _format_deep_research_for_tts(report)
+        assert "Overall Confidence" in script
+        assert "MODERATE" in script
+        assert "Limited data" in script
+
+    def test_ends_with_end_of_report(self):
+        report = {"research_mode": "deep", "title": "Test"}
+        script = _format_deep_research_for_tts(report)
+        assert "End of report." in script
+
+    def test_handles_empty_report(self):
+        report = {"research_mode": "deep"}
+        script = _format_deep_research_for_tts(report)
+        assert "End of report." in script
+
+    def test_includes_methodology(self):
+        report = {
+            "research_mode": "deep",
+            "title": "Test",
+            "methodology": {
+                "approach": "Web research",
+                "sources_consulted": 14,
+                "web_searches_performed": 4,
+                "limitations": ["No exact backtest found"],
+            },
+        }
+        script = _format_deep_research_for_tts(report)
+        assert "Methodology" in script
+        assert "14" in script
+        assert "No exact backtest found" in script
+
+
+class TestFormatLightResearchForTTS:
+    def test_formats_light_report(self):
+        report = {
+            "title": "Light Test",
+            "channel": "TestChan",
+            "tldr": "This is a quick summary.",
+            "summary": "Detailed summary here.",
+            "key_points": ["Point one", "Point two"],
+        }
+        script = _format_light_research_for_tts(report)
+        assert "Light Research Report" in script
+        assert "Light Test" in script
+        assert "TL;DR" in script
+        assert "Point 1" in script
+        assert "Point 2" in script
+
+    def test_includes_quotes(self):
+        report = {
+            "title": "Test",
+            "quotes": ["This is a notable quote"],
+        }
+        script = _format_light_research_for_tts(report)
+        assert "Notable Quotes" in script
+        assert "This is a notable quote" in script
+
+    def test_includes_topics(self):
+        report = {
+            "title": "Test",
+            "topics": [{"name": "RSI", "description": "Momentum indicator"}],
+        }
+        script = _format_light_research_for_tts(report)
+        assert "RSI" in script
+        assert "Momentum indicator" in script
+
+
+class TestFormatReportForTTS:
+    def test_auto_detects_deep_research(self):
+        report = {"research_mode": "deep", "title": "Deep Test"}
+        script = _format_report_for_tts(report)
+        assert "Deep Research Report" in script
+
+    def test_auto_detects_light_research(self):
+        report = {"research_mode": "light", "title": "Light Test"}
+        script = _format_report_for_tts(report)
+        assert "Light Research Report" in script
+
+    def test_defaults_to_light_for_untyped(self):
+        report = {"title": "Untyped Test"}
+        script = _format_report_for_tts(report)
+        assert "Light Research Report" in script
+
+
+class TestVoiceOptions:
+    def test_has_ava_voice(self):
+        assert "ava" in VOICE_OPTIONS
+        assert VOICE_OPTIONS["ava"] == "en-US-AvaNeural"
+
+    def test_has_male_voices(self):
+        assert "andrew" in VOICE_OPTIONS
+        assert "brian" in VOICE_OPTIONS
+        assert "christopher" in VOICE_OPTIONS
+
+    def test_default_voice_is_ava(self):
+        assert DEFAULT_VOICE == "en-US-AvaNeural"
+
+
+class TestReadReport:
+    def test_fails_for_missing_file(self):
+        result = read_report("/nonexistent/path/report.json")
+        assert result["ok"] is False
+        assert "not found" in result["error"].lower()
+
+    def test_fails_for_invalid_json(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as f:
+            f.write("not valid json {{{")
+            f.flush()
+            result = read_report(f.name)
+        os.unlink(f.name)
+        assert result["ok"] is False
+        assert "JSON" in result["error"] or "json" in result["error"].lower()
+
+    @pytest.mark.skipif(edge_tts is None, reason="edge-tts not installed")
+    def test_generates_audio_for_real_report(self):
+        """Integration test — generates an actual MP3 from a test report."""
+        report = {
+            "research_mode": "deep",
+            "title": "TTS Test Report",
+            "channel": "TestChannel",
+            "executive_summary": "This is a test of the text to speech system.",
+            "overall_confidence": {"level": "HIGH", "rationale": "Test passed."},
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_path = Path(tmpdir) / "test_report.json"
+            report_path.write_text(json.dumps(report), encoding="utf-8")
+
+            result = read_report(report_path, output_dir=Path(tmpdir))
+
+            # Assert BEFORE the temp dir is cleaned up
+            assert result["ok"] is True
+            assert Path(result["audio_path"]).exists()
+            assert result["audio_size_bytes"] > 0
+            assert result["voice"] == "en-US-AvaNeural"
+            assert result["text_length"] > 0
