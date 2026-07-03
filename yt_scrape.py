@@ -1985,6 +1985,998 @@ def extract_claims_enriched(
     return enriched
 
 
+# ---------------------------------------------------------------- ADVANCED EXTRACTION (10 FEATURES)
+
+# === 1. CONTRADICTION DETECTION ============================================
+
+# Pairs of words that are semantic opposites
+_ANTONYM_PAIRS = [
+    ({"always", "every", "all"}, {"never", "none", "no"}),
+    ({"works", "effective", "profitable", "good", "great", "best"}, {"fails", "ineffective", "unprofitable", "bad", "worst", "useless"}),
+    ({"buy", "long", "bullish"}, {"sell", "short", "bearish"}),
+    ({"safe", "risk-free", "guaranteed"}, {"risky", "dangerous", "speculative"}),
+    ({"easy", "simple", "straightforward"}, {"hard", "difficult", "complex", "complicated"}),
+    ({"true", "correct", "accurate", "right"}, {"false", "wrong", "incorrect", "inaccurate"}),
+    ({"increase", "grow", "rise", "gain"}, {"decrease", "shrink", "fall", "lose"}),
+    ({"proven", "confirmed", "verified"}, {"debunked", "disproven", "refuted"}),
+    ({"legal", "allowed", "permitted"}, {"illegal", "banned", "prohibited"}),
+    ({"necessary", "required", "essential"}, {"unnecessary", "optional", "inessential"}),
+    ({"recommend", "endorse", "support"}, {"avoid", "warn against", "oppose"}),
+]
+
+# Negation flip: if one claim is negated and the other isn't, that's a contradiction
+def _claims_contradict(claim_a: dict, claim_b: dict) -> tuple[bool, str]:
+    """Check if two claims contradict each other.
+
+    Returns (is_contradiction, reason).
+    """
+    sent_a = claim_a.get("sentence", "").lower()
+    sent_b = claim_b.get("sentence", "").lower()
+    neg_a = claim_a.get("negated", False)
+    neg_b = claim_b.get("negated", False)
+
+    # Same subject, different polarity → contradiction
+    subj_a = claim_a.get("subject", "").lower().strip()
+    subj_b = claim_b.get("subject", "").lower().strip()
+
+    # Check antonym pairs
+    for positive_set, negative_set in _ANTONYM_PAIRS:
+        a_pos = any(w in sent_a for w in positive_set)
+        a_neg = any(w in sent_a for w in negative_set)
+        b_pos = any(w in sent_b for w in positive_set)
+        b_neg = any(w in sent_b for w in negative_set)
+
+        # A says positive, B says negative (or vice versa)
+        if (a_pos and b_neg) or (a_neg and b_pos):
+            # If they share a subject, strong contradiction
+            if subj_a and subj_b and subj_a == subj_b:
+                return True, f"Same subject '{subj_a}' with opposite polarity"
+            # If subjects overlap partially
+            if subj_a and subj_b and (subj_a in subj_b or subj_b in subj_a):
+                return True, f"Related subject with opposite polarity"
+
+    # Negation flip: A says X, B says NOT X (about same subject)
+    if subj_a and subj_b and subj_a == subj_b:
+        if neg_a != neg_b:
+            return True, f"Same subject '{subj_a}' with negation flip"
+
+    return False, ""
+
+
+def detect_contradictions(claims: list[dict]) -> list[dict]:
+    """Detect contradictions between claims in the same video.
+
+    Compares every pair of claims and flags contradictions based on:
+    - Antonym pairs (works/fails, buy/sell, safe/risky)
+    - Negation flips (same subject, opposite polarity)
+    - Same subject, opposite strength (high vs contradicted)
+
+    Returns list of contradiction dicts:
+    - claim_a: first claim sentence
+    - claim_b: second claim sentence
+    - timestamp_a, timestamp_b: when each was said
+    - reason: why they contradict
+    """
+    contradictions: list[dict] = []
+    n = len(claims)
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            a, b = claims[i], claims[j]
+            is_contra, reason = _claims_contradict(a, b)
+            if is_contra:
+                contradictions.append({
+                    "claim_a": a.get("sentence", ""),
+                    "claim_b": b.get("sentence", ""),
+                    "timestamp_a": a.get("timestamp", {}).get("timestamp", "") if isinstance(a.get("timestamp"), dict) else "",
+                    "timestamp_b": b.get("timestamp", {}).get("timestamp", "") if isinstance(b.get("timestamp"), dict) else "",
+                    "subject": a.get("subject", ""),
+                    "reason": reason,
+                })
+
+    return contradictions
+
+
+# === 2. MARKETING PRESSURE DETECTION ======================================
+
+_RE_URGENCY = re.compile(
+    r"\b(?:act\s+now|hurry|limited\s+time|last\s+chance|"
+    r"only\s+\d+\s+(?:spots?|seats?|copies?|left|remaining|available)|"
+    r"selling\s+out|going\s+fast|"
+    r"deadline|expires?|expiring|"
+    r"today\s+only|this\s+week\s+only|"
+    r"before\s+it.s\s+(?:too\s+late|gone)|"
+    r"don.t\s+(?:miss|wait)|"
+    r"once\s+in\s+a\s+lifetime|"
+    r"now\s+is\s+the\s+time)\b",
+    re.I,
+)
+_RE_SCARCITY = re.compile(
+    r"\b(?:only\s+\d+\s*(?:%|percent)?\s*(?:off|discount)|"
+    r"exclusive\s+(?:offer|deal|access)|"
+    r"members?\s+only|vip\s+only|"
+    r"invite[- ]only|"
+    r"not\s+(?:everyone|everyone\s+can|available\s+to\s+everyone)|"
+    r"secret\s+(?:link|method|strategy|access)|"
+    r"special\s+(?:link|offer|price|deal)|"
+    r"bonus\s+(?:if|when)\s+you\s+(?:join|sign\s+up|buy|purchase)|"
+    r"free\s+(?:bonus|gift|trial)|"
+    r"money[- ]back\s+guarantee|"
+    r"risk[- ]free|"
+    r"act\s+fast|"
+    r"(?:price|cost).{0,20}(?:going\s+up|increasing|rising))\b",
+    re.I,
+)
+_RE_SOCIAL_PROOF = re.compile(
+    r"\b(?:join\s+\d{1,3}(?:,\d{3})*\s+(?:traders?|members?|students?|users?|people)|"
+    r"\d{1,3}(?:,\d{3})*\s+(?:traders?|members?|students?|users?|people)\s+(?:have|already|use)|"
+    r"thousands\s+of\s+(?:traders?|students?|people)|"
+    r"what\s+(?:our|the)\s+(?:members?|students?|traders?)\s+say|"
+    r"testimonials?|"
+    r"verified\s+(?:results?|reviews?)|"
+    r"\d+\s+star\s+(?:rating|review))\b",
+    re.I,
+)
+_RE_AFFILIATE = re.compile(
+    r"\b(?:affiliate\s+link|referral\s+link|"
+    r"use\s+(?:my|the)\s+link|"
+    r"link\s+in\s+(?:the\s+)?description|"
+    r"link\s+below|"
+    r"promo\s+code|coupon\s+code|discount\s+code|"
+    r"sponsored\s+by|brought\s+to\s+you\s+by|"
+    r"partner|partnership)\b",
+    re.I,
+)
+
+
+def detect_marketing_pressure(text: str) -> dict:
+    """Detect marketing manipulation tactics in the transcript.
+
+    Returns a dict with:
+    - urgency: list of {phrase, sentence, timestamp?}
+    - scarcity: list of {phrase, sentence}
+    - social_proof: list of {phrase, sentence}
+    - affiliate: list of {phrase, sentence}
+    - pressure_score: 0-100 (higher = more manipulative)
+    - summary: human-readable assessment
+    """
+    sentences = split_sentences(text)
+    sentence_map = []
+    pos = 0
+    for s in sentences:
+        idx = text.find(s, pos)
+        if idx == -1:
+            pos += len(s)
+            continue
+        sentence_map.append((s, idx, idx + len(s)))
+        pos = idx + len(s)
+
+    def _find_context(phrase: str, pos: int) -> str:
+        for sent, start, end in sentence_map:
+            if start <= pos < end:
+                return sent
+        return ""
+
+    def _extract(pattern, label):
+        results = []
+        for m in pattern.finditer(text):
+            ctx = _find_context(m.group(), m.start())
+            results.append({"phrase": m.group(), "sentence": ctx})
+        return results
+
+    urgency = _extract(_RE_URGENCY, "urgency")
+    scarcity = _extract(_RE_SCARCITY, "scarcity")
+    social_proof = _extract(_RE_SOCIAL_PROOF, "social_proof")
+    affiliate = _extract(_RE_AFFILIATE, "affiliate")
+
+    total_hits = len(urgency) + len(scarcity) + len(social_proof) + len(affiliate)
+    # Score: 0 hits = 0, 1-2 = 25, 3-5 = 50, 6-10 = 75, 10+ = 100
+    if total_hits == 0:
+        score = 0
+    elif total_hits <= 2:
+        score = 25
+    elif total_hits <= 5:
+        score = 50
+    elif total_hits <= 10:
+        score = 75
+    else:
+        score = 100
+
+    if score == 0:
+        summary = "No marketing pressure tactics detected."
+    elif score <= 25:
+        summary = "Low marketing pressure — minor promotional language."
+    elif score <= 50:
+        summary = "Moderate marketing pressure — some urgency/scarcity tactics."
+    elif score <= 75:
+        summary = "High marketing pressure — multiple manipulation tactics detected."
+    else:
+        summary = "Extreme marketing pressure — heavy use of urgency, scarcity, and social proof."
+
+    return {
+        "urgency": urgency,
+        "scarcity": scarcity,
+        "social_proof": social_proof,
+        "affiliate": affiliate,
+        "pressure_score": score,
+        "total_tactics": total_hits,
+        "summary": summary,
+    }
+
+
+# === 3. NUMERIC PARAMETER EXTRACTION ======================================
+
+_RE_PARAM_INDICATOR = re.compile(
+    r"\b(?:RSI|MACD|Bollinger|moving\s+average|MA|EMA|SMA|stochastic|ATR|ADX|"
+    r"stop\s+loss|take\s+profit|risk\s+reward|position\s+size|"
+    r"timeframe|time\s+frame|period|length|setting|parameter)\b",
+    re.I,
+)
+_RE_NUMBER = re.compile(r"\b(\d+(?:\.\d+)?)\b")
+_RE_PARAM_PATTERN = re.compile(
+    r"\b(RSI|MACD|Bollinger|moving\s+average|MA|EMA|SMA|stochastic|ATR|ADX|CCI|"
+    r"stop\s+loss|take\s+profit|risk\s+reward|position\s+size|"
+    r"timeframe|time\s+frame|period|length|setting|parameter|"
+    r"overbought|oversold|threshold|crossover|"
+    r"leverage|margin|risk\s+per\s+trade|"
+    r"win\s+rate|profit\s+factor|drawdown|expectancy)"
+    r"\s*(?:of|is|at|set\s+to|=|:|to)?\s*"
+    r"(\d+(?:\.\d+)?)\b",
+    re.I,
+)
+_RE_RANGE = re.compile(
+    r"\b((?:overbought|oversold|RSI|level|threshold)"
+    r"\s*(?:of|is|at|set\s+to|=|:)?\s*"
+    r"(\d+(?:\.\d+)?)\s*(?:to|-|–|until)\s*(\d+(?:\.\d+)?))\b",
+    re.I,
+)
+
+
+def extract_parameters(text: str) -> list[dict]:
+    """Extract numeric strategy parameters from text.
+
+    Catches things like:
+    - "RSI length 14"
+    - "overbought at 70"
+    - "stop loss of 2%"
+    - "risk reward 1:3"
+    - "leverage 10x"
+    - "win rate 86%"
+
+    Returns list of {parameter, value, unit, sentence} dicts.
+    """
+    results: list[dict] = []
+    seen: set[str] = set()
+
+    # Pattern-based extraction
+    for m in _RE_PARAM_PATTERN.finditer(text):
+        param = m.group(1).strip().lower()
+        value = m.group(2)
+        key = f"{param}:{value}"
+        if key in seen:
+            continue
+        seen.add(key)
+
+        # Find context sentence
+        sent_start = text.rfind(".", 0, m.start())
+        sent_start = sent_start + 1 if sent_start != -1 else 0
+        sent_end = text.find(".", m.end())
+        sent_end = sent_end + 1 if sent_end != -1 else len(text)
+        sentence = text[sent_start:sent_end].strip()
+
+        results.append({
+            "parameter": param,
+            "value": float(value) if "." in value else int(value),
+            "unit": "",
+            "sentence": sentence,
+        })
+
+    # Range extraction (overbought 70-30, RSI 30-70)
+    for m in _RE_RANGE.finditer(text):
+        param = m.group(1).strip().lower()
+        val_low = m.group(2)
+        val_high = m.group(3)
+        key = f"{param}:{val_low}-{val_high}"
+        if key in seen:
+            continue
+        seen.add(key)
+
+        sent_start = text.rfind(".", 0, m.start())
+        sent_start = sent_start + 1 if sent_start != -1 else 0
+        sent_end = text.find(".", m.end())
+        sent_end = sent_end + 1 if sent_end != -1 else len(text)
+        sentence = text[sent_start:sent_end].strip()
+
+        results.append({
+            "parameter": param,
+            "value": f"{val_low}-{val_high}",
+            "unit": "range",
+            "sentence": sentence,
+        })
+
+    # Risk reward ratio (1:3, 1:2)
+    for m in re.finditer(r"\brisk\s+reward\s+(?:ratio\s+)?(?:of\s+)?(\d+):(\d+)\b", text, re.I):
+        key = f"risk_reward:{m.group(1)}:{m.group(2)}"
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append({
+            "parameter": "risk_reward_ratio",
+            "value": f"{m.group(1)}:{m.group(2)}",
+            "unit": "ratio",
+            "sentence": text[max(0, m.start()-30):min(len(text), m.end()+30)].strip(),
+        })
+
+    # Leverage (10x, 50x)
+    for m in re.finditer(r"\b(\d+)x\s+leverage\b|\bleverage\s+(?:of\s+)?(\d+)x\b", text, re.I):
+        val = m.group(1) or m.group(2)
+        key = f"leverage:{val}"
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append({
+            "parameter": "leverage",
+            "value": int(val),
+            "unit": "x",
+            "sentence": text[max(0, m.start()-30):min(len(text), m.end()+30)].strip(),
+        })
+
+    # Percentage parameters (2% risk, 1% per trade)
+    for m in re.finditer(r"\b(\d+(?:\.\d+)?)\s*%\s*(?:risk|per\s+trade|per\s+position|stop\s+loss|drawdown)", text, re.I):
+        key = f"pct:{m.group(1)}"
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append({
+            "parameter": "percentage",
+            "value": float(m.group(1)),
+            "unit": "%",
+            "sentence": text[max(0, m.start()-30):min(len(text), m.end()+30)].strip(),
+        })
+
+    return results
+
+
+# === 4. CONDITION/ACTION RULE EXTRACTION ==================================
+
+_RE_IF_THEN = re.compile(
+    r"\b(?:if|when|whenever|once|after)\s+(.{5,120}?)\s*,?\s+"
+    r"(?:then?|you\s+(?:should|can|must|need\s+to)|just|simply)?\s*"
+    r"(.{5,120}?)(?:[.!?]|\n|$)",
+    re.I,
+)
+_RE_WHEN_DO = re.compile(
+    r"\b(?:when|whenever)\s+(.{5,100}?)\s*,?\s+"
+    r"(?:you\s+)?(do|use|apply|set|place|enter|exit|buy|sell|go|switch|move|add|remove|check|look\s+for)\s+(.{5,100}?)(?:[.!?]|\n|$)",
+    re.I,
+)
+
+
+def extract_rules(text: str) -> list[dict]:
+    """Extract if/then condition-action rules from text.
+
+    Catches trading rules like:
+    - "If RSI is below 30, buy"
+    - "When the MACD crosses, sell"
+    - "Once price hits support, enter"
+
+    Returns list of {condition, action, sentence} dicts.
+    """
+    rules: list[dict] = []
+    seen: set[str] = set()
+
+    for m in _RE_IF_THEN.finditer(text):
+        condition = m.group(1).strip().rstrip(",.")
+        action = m.group(2).strip().rstrip(",.")
+
+        # Filter out non-rules (too short, no action verb)
+        if len(condition) < 5 or len(action) < 3:
+            continue
+        # Must have an action verb
+        action_verbs = {"buy", "sell", "enter", "exit", "set", "place", "use", "apply",
+                       "go", "switch", "move", "add", "remove", "check", "look", "do",
+                       "close", "open", "increase", "decrease", "raise", "lower",
+                       "stop", "start", "avoid", "wait", "confirm", "verify"}
+        action_lower = action.lower()
+        if not any(av in action_lower for av in action_verbs):
+            continue
+
+        key = f"{condition[:50]}:{action[:50]}".lower()
+        if key in seen:
+            continue
+        seen.add(key)
+
+        full_sentence = text[max(0, m.start()-10):min(len(text), m.end()+10)].strip()
+        rules.append({
+            "condition": condition,
+            "action": action,
+            "sentence": full_sentence,
+        })
+
+    return rules
+
+
+# === 5. CITATION DECOMPOSITION ============================================
+
+_RE_CITATION_FULL = re.compile(
+    r"\b((?:19|20)\d{2})\s+"
+    r"((?:Harvard|Stanford|MIT|Oxford|Cambridge|Yale|Princeton|"
+    r"Johns\s+Hopkins|Columbia|UCLA|UC\s+Berkeley|"
+    r"Federal\s+Reserve|NIH|NASA|WHO|CDC|FDA|"
+    r"Goldman\s+Sachs|JPMorgan|BlackRock)?\s*"
+    r"(?:University\s+of\s+\w+|Institute\s+of\s+\w+)?)\s*"
+    r"(?:study|research|paper|report|trial|survey|analysis)\s+"
+    r"(?:of\s+)?(\d+(?:,\d{3})*)?\s*"
+    r"(?:patients?|participants?|subjects?|people|traders?|students?|cases?)?",
+    re.I,
+)
+_RE_CITATION_JOURNAL = re.compile(
+    r"\b(?:published\s+in\s+|appearing\s+in\s+|from\s+)"
+    r"(?:the\s+)?(Journal\s+of\s+\w+|Nature|Science|Lancet|JAMA|BMJ|"
+    r"New\s+England\s+Journal|Wall\s+Street\s+Journal|Financial\s+Times)\b",
+    re.I,
+)
+_RE_CITATION_AUTHOR = re.compile(
+    r"\b(?:by|from|led\s+by)\s+"
+    r"(?:Dr\.?\s+|Professor\s+)?([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s*"
+    r"(?:et\s+al\.?)?",
+)
+
+
+def extract_citations(text: str) -> list[dict]:
+    """Decompose authority citations into structured data.
+
+    Turns "A 2023 Harvard study of 10,000 patients showed..."
+    into {year: 2023, institution: "Harvard", sample_size: 10000, type: "study"}
+
+    Returns list of citation dicts.
+    """
+    citations: list[dict] = []
+    seen: set[str] = set()
+
+    for m in _RE_CITATION_FULL.finditer(text):
+        year = m.group(1)
+        institution = (m.group(2) or "").strip()
+        sample_size = m.group(3) if m.group(3) else ""
+
+        key = f"{year}:{institution}:{sample_size}"
+        if key in seen:
+            continue
+        seen.add(key)
+
+        # Find context
+        sent_start = text.rfind(".", 0, m.start())
+        sent_start = sent_start + 1 if sent_start != -1 else 0
+        sent_end = text.find(".", m.end())
+        sent_end = sent_end + 1 if sent_end != -1 else len(text)
+        sentence = text[sent_start:sent_end].strip()
+
+        citation = {
+            "year": int(year) if year else None,
+            "institution": institution if institution else None,
+            "sample_size": int(sample_size.replace(",", "")) if sample_size else None,
+            "type": "study",
+            "sentence": sentence,
+            "verifiable": bool(year and institution),
+        }
+        citations.append(citation)
+
+    # Journal references
+    for m in _RE_CITATION_JOURNAL.finditer(text):
+        journal = m.group(1).strip()
+        key = f"journal:{journal.lower()}"
+        if key in seen:
+            continue
+        seen.add(key)
+
+        sent_start = text.rfind(".", 0, m.start())
+        sent_start = sent_start + 1 if sent_start != -1 else 0
+        sent_end = text.find(".", m.end())
+        sent_end = sent_end + 1 if sent_end != -1 else len(text)
+
+        citations.append({
+            "year": None,
+            "institution": journal,
+            "sample_size": None,
+            "type": "journal",
+            "sentence": text[sent_start:sent_end].strip(),
+            "verifiable": True,
+        })
+
+    # Author references
+    for m in _RE_CITATION_AUTHOR.finditer(text):
+        author = m.group(1).strip()
+        if author in _PERSON_BLACKLIST:
+            continue
+        key = f"author:{author.lower()}"
+        if key in seen:
+            continue
+        seen.add(key)
+
+        citations.append({
+            "year": None,
+            "institution": None,
+            "sample_size": None,
+            "author": author,
+            "type": "author_reference",
+            "sentence": text[max(0, m.start()-20):min(len(text), m.end()+40)].strip(),
+            "verifiable": True,
+        })
+
+    return citations
+
+
+# === 6. QUESTION EXTRACTION ===============================================
+
+_RE_QUESTION = re.compile(
+    r"([A-Z][^.!?]{5,200}?\?)",
+)
+_RE_RHETORICAL = re.compile(
+    r"\b(?:who\s+(?:knows|cares)|what\s+if|why\s+(?:not|bother)|"
+    r"does\s+it\s+(?:really|actually)\s+(?:matter|work)|"
+    r"is\s+it\s+(?:really|actually)\s+(?:worth|necessary)|"
+    r"can\s+you\s+(?:really|actually)|"
+    r"haven.t\s+you\s+(?:heard|seen|noticed)|"
+    r"don.t\s+you\s+(?:think|want|agree))\b",
+    re.I,
+)
+
+
+def extract_questions(text: str) -> list[dict]:
+    """Extract questions from the transcript.
+
+    Every question is a research lead. Categorizes as:
+    - research: a genuine question that should be answered
+    - rhetorical: a rhetorical question (still useful for bias assessment)
+    - sales: a leading question used in marketing ("Want to make money?")
+
+    Returns list of {question, type, sentence} dicts.
+    """
+    questions: list[dict] = []
+    seen: set[str] = set()
+
+    for m in _RE_QUESTION.finditer(text):
+        q = m.group(1).strip()
+        key = q.lower()[:80]
+        if key in seen:
+            continue
+        seen.add(key)
+
+        # Classify
+        q_lower = q.lower()
+        if _RE_RHETORICAL.search(q_lower):
+            q_type = "rhetorical"
+        elif any(w in q_lower for w in ["want to", "would you", "are you ready", "do you want"]):
+            q_type = "sales"
+        else:
+            q_type = "research"
+
+        questions.append({
+            "question": q,
+            "type": q_type,
+        })
+
+    return questions
+
+
+# === 7. HEDGE WORD DENSITY ================================================
+
+_HEDGE_WORDS = frozenset({
+    "sort", "kind", "basically", "essentially", "arguably", "debatably",
+    "allegedly", "supposedly", "presumably", "ostensibly", "apparently",
+    "seemingly", "purportedly", "reportedly", "presumably",
+    "maybe", "perhaps", "possibly", "probably", "likely", "unlikely",
+    "somewhat", "relatively", "fairly", "quite", "rather",
+    "tend", "tends", "generally", "usually", "typically", "often",
+    "mostly", "largely", "mainly", "primarily",
+    "i", "think", "guess", "suppose", "assume", "believe", "feel",
+    "seems", "appears", "looks", "sounds",
+})
+
+
+def calculate_hedge_density(text: str) -> dict:
+    """Calculate hedge word density — how uncertain the speaker is.
+
+    High hedge density = low confidence = less trustworthy for factual claims.
+
+    Returns:
+    - hedge_count: total hedge words
+    - word_count: total words
+    - density: hedge words per 100 words
+    - level: low | moderate | high | extreme
+    - hedges_found: list of which hedge words were found
+    """
+    words = re.findall(r"\b\w+\b", text.lower())
+    word_count = len(words)
+    if word_count == 0:
+        return {"hedge_count": 0, "word_count": 0, "density": 0.0, "level": "low", "hedges_found": []}
+
+    hedge_found: list[str] = []
+    for w in words:
+        if w in _HEDGE_WORDS:
+            hedge_found.append(w)
+
+    hedge_count = len(hedge_found)
+    density = (hedge_count / word_count) * 100
+
+    if density < 1:
+        level = "low"
+    elif density < 3:
+        level = "moderate"
+    elif density < 5:
+        level = "high"
+    else:
+        level = "extreme"
+
+    # Count unique hedges
+    from collections import Counter
+    hedge_counter = dict(Counter(hedge_found))
+
+    return {
+        "hedge_count": hedge_count,
+        "word_count": word_count,
+        "density": round(density, 2),
+        "level": level,
+        "hedges_found": hedge_counter,
+    }
+
+
+# === 8. TOPIC SEGMENTATION (AUTO-CHAPTERING) ==============================
+
+_TOPIC_TRANSITION_WORDS = re.compile(
+    r"\b(?:so\s+(?:now|let.s|today|first|next)|"
+    r"let.s\s+(?:talk|move|go|start|dive|look|get)|"
+    r"now\s+(?:let.s|we|I|the|this|moving)|"
+    r"moving\s+on|next\s+(?:up|thing|topic|section|let.s)|"
+    r"first\s+(?:thing|of\s+all|let.s)|"
+    r"to\s+start|to\s+begin|"
+    r"by\s+the\s+way|"
+    r"anyway|"
+    r"with\s+that\s+(?:said|out\s+of\s+the\s+way)|"
+    r"that\s+said|"
+    r"wrapping\s+up|in\s+conclusion|to\s+summarize|"
+    r"finally|lastly|in\s+the\s+end)\b",
+    re.I,
+)
+
+_TOPIC_INTRO_PATTERNS = re.compile(
+    r"\b(?:what\s+is|how\s+to|why\s+\w+|let.s\s+talk\s+about|"
+    r"today\s+we.re\s+(?:going\s+to|talking\s+about)|"
+    r"this\s+is\s+(?:called|known\s+as)|"
+    r"the\s+(?:first|second|third|next|last)\s+(?:thing|step|part|concept|rule))\b",
+    re.I,
+)
+
+
+def segment_topics(
+    text: str,
+    sentences: list[TimestampedSentence] | None = None,
+    min_segment_words: int = 50,
+) -> list[dict]:
+    """Auto-segment transcript into topic chapters.
+
+    Detects topic transitions based on:
+    - Transition phrases ("let's move on", "next up", "now let's")
+    - Topic introductions ("what is X", "how to Y")
+    - Long pauses (if timestamps available)
+
+    Returns list of chapter dicts:
+    - title: auto-generated title
+    - start_timestamp: when chapter starts
+    - end_timestamp: when chapter ends
+    - word_count: words in chapter
+    - first_sentence: opening sentence
+    """
+    if sentences is None:
+        # Create pseudo-sentences from text
+        sents = split_sentences(text)
+        sentences = [
+            TimestampedSentence(text=s, start=0.0, end=0.0, segment_index=i)
+            for i, s in enumerate(sents)
+        ]
+
+    if not sentences:
+        return []
+
+    # Find transition points
+    transitions: list[int] = [0]  # always start with first sentence
+    for i, ts in enumerate(sentences[1:], 1):
+        if _TOPIC_TRANSITION_WORDS.search(ts.text) or _TOPIC_INTRO_PATTERNS.search(ts.text):
+            # Don't create too-short segments
+            if i - transitions[-1] >= 3:
+                transitions.append(i)
+
+    # Build chapters
+    chapters: list[dict] = []
+    for ci, start_idx in enumerate(transitions):
+        end_idx = transitions[ci + 1] if ci + 1 < len(transitions) else len(sentences)
+        chapter_sents = sentences[start_idx:end_idx]
+        if not chapter_sents:
+            continue
+
+        chapter_text = " ".join(s.text for s in chapter_sents)
+        word_count = len(chapter_text.split())
+
+        if word_count < min_segment_words and ci > 0:
+            # Too short — merge into previous chapter
+            if chapters:
+                chapters[-1]["end_timestamp"] = chapter_sents[-1].timestamp_str if chapter_sents else chapters[-1]["end_timestamp"]
+                chapters[-1]["word_count"] += word_count
+                continue
+
+        # Auto-generate title from first sentence
+        first = chapter_sents[0].text
+        # Try to extract a topic from the first sentence
+        title = first[:60] + "..." if len(first) > 60 else first
+
+        chapters.append({
+            "chapter": ci + 1,
+            "title": title,
+            "start_timestamp": chapter_sents[0].timestamp_str,
+            "end_timestamp": chapter_sents[-1].timestamp_str if chapter_sents else chapter_sents[0].timestamp_str,
+            "start_seconds": chapter_sents[0].start,
+            "word_count": word_count,
+            "sentence_count": len(chapter_sents),
+            "first_sentence": first,
+        })
+
+    return chapters
+
+
+# === 9. EMOTIONAL LANGUAGE TRACKING =======================================
+
+_EMOTIONAL_WORDS = {
+    "amazing": 3, "incredible": 3, "unbelievable": 3, "mind-blowing": 3, "revolutionary": 3,
+    "game-changer": 3, "life-changing": 3, "extraordinary": 3, "phenomenal": 3, "stunning": 3,
+    "terrible": -3, "horrible": -3, "awful": -3, "disaster": -3, "catastrophic": -3,
+    "devastating": -3, "nightmare": -3, "scam": -3, "fraud": -3, "ripoff": -3,
+    "great": 2, "awesome": 2, "fantastic": 2, "excellent": 2, "perfect": 2,
+    "brilliant": 2, "outstanding": 2, "remarkable": 2, "superb": 2, "wonderful": 2,
+    "bad": -2, "poor": -2, "wrong": -2, "stupid": -2, "dumb": -2,
+    "dangerous": -2, "concerning": -2, "worrying": -2, "troubling": -2,
+    "good": 1, "nice": 1, "cool": 1, "solid": 1, "decent": 1, "fine": 1,
+    "exciting": 2, "thrilling": 2, "powerful": 2, "massive": 2, "huge": 2,
+    "fail": -2, "failure": -2, "crash": -2, "collapse": -2, "bubble": -2,
+    "fear": -2, "panic": -2, "greed": -1, "hype": -1,
+    "love": 2, "hate": -2, "best": 2, "worst": -2,
+    "boom": 2, "bust": -2, "soar": 2, "plunge": -2, "surge": 2, "crater": -2,
+}
+
+
+def track_emotional_language(
+    text: str,
+    sentences: list[TimestampedSentence] | None = None,
+) -> dict:
+    """Track emotional language throughout the transcript.
+
+    Detects spikes in emotional language — manipulation points where
+    the speaker uses strong words to sway the audience.
+
+    Returns:
+    - overall_sentiment: -3 to +3
+    - emotional_moments: list of {word, score, timestamp, sentence}
+    - positive_count, negative_count
+    - emotional_density: emotional words per 100 words
+    - spikes: list of timestamps where emotional intensity peaks
+    """
+    if sentences is None:
+        sents = split_sentences(text)
+        sentences = [TimestampedSentence(text=s, start=0.0, end=0.0, segment_index=i) for i, s in enumerate(sents)]
+
+    emotional_moments: list[dict] = []
+    positive_count = 0
+    negative_count = 0
+    total_score = 0
+    word_count = len(text.split())
+
+    for ts in sentences:
+        words = re.findall(r"\b[\w-]+\b", ts.text.lower())
+        for word in words:
+            if word in _EMOTIONAL_WORDS:
+                score = _EMOTIONAL_WORDS[word]
+                total_score += score
+                if score > 0:
+                    positive_count += 1
+                else:
+                    negative_count += 1
+                emotional_moments.append({
+                    "word": word,
+                    "score": score,
+                    "timestamp": ts.timestamp_str,
+                    "start_seconds": ts.start,
+                    "sentence": ts.text,
+                })
+
+    # Detect spikes: timestamps with 2+ emotional words within 10 seconds
+    spikes: list[dict] = []
+    if emotional_moments:
+        # Group by approximate time (10-second windows)
+        time_groups: dict[int, list[dict]] = {}
+        for m in emotional_moments:
+            window = int(m["start_seconds"] // 10)
+            time_groups.setdefault(window, []).append(m)
+
+        for window, moments in time_groups.items():
+            if len(moments) >= 2:
+                total_intensity = sum(abs(m["score"]) for m in moments)
+                spikes.append({
+                    "timestamp": moments[0]["timestamp"],
+                    "start_seconds": moments[0]["start_seconds"],
+                    "intensity": total_intensity,
+                    "words": [m["word"] for m in moments],
+                    "sentence": moments[0]["sentence"],
+                })
+
+    # Sort spikes by intensity
+    spikes.sort(key=lambda s: s["intensity"], reverse=True)
+
+    overall = total_score / max(len(emotional_moments), 1)
+    density = (len(emotional_moments) / max(word_count, 1)) * 100
+
+    return {
+        "overall_sentiment": round(overall, 2),
+        "positive_count": positive_count,
+        "negative_count": negative_count,
+        "emotional_density": round(density, 2),
+        "emotional_moments": emotional_moments[:50],  # cap for size
+        "spikes": spikes[:10],  # top 10 spikes
+        "spike_count": len(spikes),
+    }
+
+
+# === 10. DEFINITION EXTRACTION ============================================
+
+_RE_DEFINITION_IS = re.compile(
+    r"\b([A-Z][a-zA-Z]{1,}(?:\s+[a-z]+){0,4})\s+is\s+(?:a|an|the)\s+(.{10,150}?)(?:[.!?]|\n)",
+)
+_RE_DEFINITION_CALLED = re.compile(
+    r"\b(?:is\s+called|known\s+as|referred\s+to\s+as)\s+(.{3,80}?)(?:[.!?]|\n)",
+    re.I,
+)
+_RE_DEFINITION_MEANS = re.compile(
+    r"\b([A-Z][a-zA-Z]{1,}(?:\s+[a-z]+){0,3})\s+(?:means|refers\s+to|is\s+defined\s+as)\s+(.{10,150}?)(?:[.!?]|\n)",
+)
+_RE_DEFINITION_TERM = re.compile(
+    r"\b(?:what\s+(?:is|are)\s+|what.s\s+)"
+    r"([A-Z][a-zA-Z]{1,}(?:\s+[a-z]+){0,4})\?"
+    r"\s*(.{10,200}?)(?:[.!?]|\n)",
+)
+
+
+def extract_definitions(text: str) -> list[dict]:
+    """Extract term definitions from the transcript.
+
+    Catches:
+    - "RSI is a momentum oscillator..."
+    - "Bollinger Bands are volatility bands..."
+    - "This is called mean reversion."
+    - "MACD means Moving Average Convergence Divergence."
+
+    Returns list of {term, definition, sentence} dicts.
+    """
+    definitions: list[dict] = []
+    seen_terms: set[str] = set()
+
+    # Pattern 1: "X is a/an/the Y"
+    for m in _RE_DEFINITION_IS.finditer(text):
+        term = m.group(1).strip()
+        definition = m.group(2).strip().rstrip(".")
+        term_lower = term.lower()
+
+        # Filter out non-terms (pronouns, common words)
+        if term_lower in {"this", "that", "it", "here", "there", "what", "when", "why", "how"}:
+            continue
+        if len(term) < 3 or len(definition) < 10:
+            continue
+
+        if term_lower in seen_terms:
+            continue
+        seen_terms.add(term_lower)
+
+        definitions.append({
+            "term": term,
+            "definition": definition,
+            "sentence": text[max(0, m.start()-5):min(len(text), m.end()+5)].strip(),
+        })
+
+    # Pattern 2: "is called X" / "known as X"
+    for m in _RE_DEFINITION_CALLED.finditer(text):
+        term = m.group(1).strip().rstrip(".")
+        if len(term) < 3:
+            continue
+
+        # Find what's being defined (look backwards)
+        before = text[max(0, m.start()-80):m.start()].strip()
+        # Find the subject before "is called"
+        sent_start = text.rfind(".", 0, m.start())
+        subject = text[sent_start+1:m.start()].strip() if sent_start != -1 else before
+
+        term_lower = term.lower()
+        if term_lower in seen_terms:
+            continue
+        seen_terms.add(term_lower)
+
+        definitions.append({
+            "term": term,
+            "definition": subject,
+            "sentence": text[max(0, m.start()-50):min(len(text), m.end()+10)].strip(),
+        })
+
+    # Pattern 3: "X means Y" / "X refers to Y"
+    for m in _RE_DEFINITION_MEANS.finditer(text):
+        term = m.group(1).strip()
+        definition = m.group(2).strip().rstrip(".")
+        term_lower = term.lower()
+
+        if term_lower in {"this", "that", "it", "here", "there"}:
+            continue
+        if len(term) < 3 or len(definition) < 10:
+            continue
+
+        if term_lower in seen_terms:
+            continue
+        seen_terms.add(term_lower)
+
+        definitions.append({
+            "term": term,
+            "definition": definition,
+            "sentence": text[max(0, m.start()-5):min(len(text), m.end()+5)].strip(),
+        })
+
+    # Pattern 4: "What is X? X is..."
+    for m in _RE_DEFINITION_TERM.finditer(text):
+        term = m.group(1).strip()
+        definition = m.group(2).strip().rstrip(".")
+        term_lower = term.lower()
+
+        if term_lower in seen_terms:
+            continue
+        seen_terms.add(term_lower)
+
+        definitions.append({
+            "term": term,
+            "definition": definition,
+            "sentence": text[m.start():min(len(text), m.end()+5)].strip(),
+        })
+
+    return definitions
+
+
+# === MASTER EXTRACTION FUNCTION ===========================================
+
+def extract_all(text: str, sentences: list[TimestampedSentence] | None = None) -> dict:
+    """Run all 10 advanced extraction features on the text.
+
+    This is the comprehensive extraction that feeds into the Deep Research package.
+
+    Returns a dict with all extraction results:
+    - contradictions
+    - marketing_pressure
+    - parameters
+    - rules
+    - citations
+    - questions
+    - hedge_density
+    - chapters
+    - emotional_language
+    - definitions
+    """
+    return {
+        "contradictions": detect_contradictions(
+            extract_claims_enriched(text, sentences)
+        ),
+        "marketing_pressure": detect_marketing_pressure(text),
+        "parameters": extract_parameters(text),
+        "rules": extract_rules(text),
+        "citations": extract_citations(text),
+        "questions": extract_questions(text),
+        "hedge_density": calculate_hedge_density(text),
+        "chapters": segment_topics(text, sentences),
+        "emotional_language": track_emotional_language(text, sentences),
+        "definitions": extract_definitions(text),
+    }
+
+
 # ---------------------------------------------------------------- CLAIM EXTRACTION (ORIGINAL)
 
 # Regex patterns for pre-identifying factual claims in transcript text.
@@ -2302,6 +3294,7 @@ def prepare_deep_research(
         "entity_count": sum(len(v) if isinstance(v, list) else 0 for v in entities.values()),
         "source_count": sum(len(v) if isinstance(v, list) else 0 for v in sources.values()),
         "timestamped_sentences": [s.to_dict() for s in ts_sentences] if ts_sentences else [],
+        "advanced_extraction": extract_all(cleaned_body, ts_sentences or None),
         "schema": DEEP_RESEARCH_SCHEMA,
         "instructions": (
             "DEEP RESEARCH WORKFLOW — QUALITY OVER SPEED\n\n"

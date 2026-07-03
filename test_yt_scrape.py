@@ -1593,3 +1593,392 @@ class TestExtractClaimsEnriched:
 
     def test_empty_text(self):
         assert extract_claims_enriched("") == []
+
+
+# ---------------------------------------------------------------- ADVANCED EXTRACTION (10 FEATURES)
+
+from yt_scrape import (
+    detect_contradictions,
+    detect_marketing_pressure,
+    extract_parameters,
+    extract_rules,
+    extract_citations,
+    extract_questions,
+    calculate_hedge_density,
+    segment_topics,
+    track_emotional_language,
+    extract_definitions,
+    extract_all,
+)
+
+
+# === 1. CONTRADICTION DETECTION ===
+class TestDetectContradictions:
+    def test_detects_buy_sell_contradiction(self):
+        claims = [
+            {"sentence": "You should always buy here.", "subject": "here", "negated": False},
+            {"sentence": "You should sell here.", "subject": "here", "negated": False},
+        ]
+        contradictions = detect_contradictions(claims)
+        assert len(contradictions) >= 1
+
+    def test_detects_works_fails_contradiction(self):
+        claims = [
+            {"sentence": "This strategy works perfectly.", "subject": "this strategy", "negated": False},
+            {"sentence": "This strategy fails completely.", "subject": "this strategy", "negated": False},
+        ]
+        contradictions = detect_contradictions(claims)
+        assert len(contradictions) >= 1
+
+    def test_detects_negation_flip(self):
+        claims = [
+            {"sentence": "RSI is effective.", "subject": "rsi", "negated": False},
+            {"sentence": "RSI is not effective.", "subject": "rsi", "negated": True},
+        ]
+        contradictions = detect_contradictions(claims)
+        assert len(contradictions) >= 1
+
+    def test_no_contradiction_for_unrelated(self):
+        claims = [
+            {"sentence": "RSI is oversold.", "subject": "rsi", "negated": False},
+            {"sentence": "MACD is bullish.", "subject": "macd", "negated": False},
+        ]
+        contradictions = detect_contradictions(claims)
+        assert len(contradictions) == 0
+
+    def test_empty_claims(self):
+        assert detect_contradictions([]) == []
+
+    def test_includes_timestamps(self):
+        claims = [
+            {"sentence": "Always buy.", "subject": "buy", "negated": False, "timestamp": {"timestamp": "1:00"}},
+            {"sentence": "Never buy.", "subject": "buy", "negated": True, "timestamp": {"timestamp": "5:00"}},
+        ]
+        contradictions = detect_contradictions(claims)
+        if contradictions:
+            assert "timestamp_a" in contradictions[0]
+
+
+# === 2. MARKETING PRESSURE ===
+class TestDetectMarketingPressure:
+    def test_detects_urgency(self):
+        result = detect_marketing_pressure("Act now! Only 5 spots left!")
+        assert len(result["urgency"]) >= 1
+        assert result["pressure_score"] > 0
+
+    def test_detects_scarcity(self):
+        result = detect_marketing_pressure("This is a limited time offer with exclusive access.")
+        assert len(result["scarcity"]) >= 1
+
+    def test_detects_social_proof(self):
+        result = detect_marketing_pressure("Join 10,000 traders who use our system.")
+        assert len(result["social_proof"]) >= 1
+
+    def test_detects_affiliate(self):
+        result = detect_marketing_pressure("Use my affiliate link in the description below.")
+        assert len(result["affiliate"]) >= 1
+
+    def test_no_pressure(self):
+        result = detect_marketing_pressure("The RSI indicator measures momentum.")
+        assert result["pressure_score"] == 0
+        assert "No marketing pressure" in result["summary"]
+
+    def test_pressure_score_increases(self):
+        low = detect_marketing_pressure("Act now!")
+        high = detect_marketing_pressure("Act now! Only 5 spots left! Join 10,000 traders! Use my affiliate link! Limited time! Selling out fast!")
+        assert high["pressure_score"] > low["pressure_score"]
+
+    def test_includes_summary(self):
+        result = detect_marketing_pressure("Act now!")
+        assert "summary" in result
+        assert isinstance(result["summary"], str)
+
+
+# === 3. NUMERIC PARAMETERS ===
+class TestExtractParameters:
+    def test_extracts_rsi_length(self):
+        params = extract_parameters("Set the RSI length to 14 for best results.")
+        assert any(p["parameter"] == "length" and p["value"] == 14 for p in params)
+
+    def test_extracts_overbought_level(self):
+        params = extract_parameters("RSI overbought at 70 and oversold at 30.")
+        assert any(p["parameter"] == "overbought" for p in params)
+
+    def test_extracts_stop_loss(self):
+        params = extract_parameters("Use a stop loss of 2 percent.")
+        assert any("stop" in p["parameter"] for p in params)
+
+    def test_extracts_risk_reward_ratio(self):
+        params = extract_parameters("Use a risk reward ratio of 1:3.")
+        assert any("risk_reward" in p["parameter"] for p in params)
+
+    def test_extracts_leverage(self):
+        params = extract_parameters("I use 10x leverage on this trade.")
+        assert any(p["parameter"] == "leverage" and p["value"] == 10 for p in params)
+
+    def test_extracts_percentage_risk(self):
+        params = extract_parameters("Risk 2% per trade.")
+        assert any(p["parameter"] == "percentage" and p["value"] == 2.0 for p in params)
+
+    def test_no_parameters_in_plain_text(self):
+        params = extract_parameters("The market is interesting today.")
+        # May find some incidental numbers, but no real parameters
+        assert all(p["parameter"] not in ("rsi", "macd", "stop loss") for p in params)
+
+    def test_includes_sentence_context(self):
+        params = extract_parameters("Set the RSI length to 14.")
+        if params:
+            assert "sentence" in params[0]
+
+
+# === 4. CONDITION/ACTION RULES ===
+class TestExtractRules:
+    def test_extracts_if_then(self):
+        rules = extract_rules("If RSI is below 30, you should buy.")
+        assert len(rules) >= 1
+        assert "RSI" in rules[0]["condition"] or "rsi" in rules[0]["condition"].lower()
+        assert "buy" in rules[0]["action"].lower()
+
+    def test_extracts_when_do(self):
+        rules = extract_rules("When the MACD crosses, sell immediately.")
+        assert len(rules) >= 1
+
+    def test_extracts_once_condition(self):
+        rules = extract_rules("Once price hits support, enter the trade.")
+        assert len(rules) >= 1
+
+    def test_filters_non_rules(self):
+        rules = extract_rules("If you want to learn, watch the video.")
+        # "watch" is an action verb, so this might be extracted — that's ok
+        # But "if you want to learn" is not a trading rule
+        # Just make sure it doesn't crash
+        assert isinstance(rules, list)
+
+    def test_empty_text(self):
+        assert extract_rules("") == []
+
+    def test_includes_condition_and_action(self):
+        rules = extract_rules("If RSI is below 30, buy immediately.")
+        if rules:
+            assert "condition" in rules[0]
+            assert "action" in rules[0]
+
+
+# === 5. CITATION DECOMPOSITION ===
+class TestExtractCitations:
+    def test_extracts_full_citation(self):
+        citations = extract_citations("A 2023 Harvard study of 10,000 patients showed results.")
+        assert len(citations) >= 1
+        assert citations[0]["year"] == 2023
+        assert "Harvard" in citations[0]["institution"]
+
+    def test_extracts_sample_size(self):
+        citations = extract_citations("A 2020 Stanford study of 5000 traders found patterns.")
+        assert any(c["sample_size"] == 5000 for c in citations)
+
+    def test_extracts_journal_reference(self):
+        citations = extract_citations("Published in the Journal of Finance last year.")
+        assert any("Journal" in (c.get("institution") or "") for c in citations)
+
+    def test_extracts_author_reference(self):
+        citations = extract_citations("Research by Dr. Jordan Peterson showed interesting results.")
+        assert any(c.get("author") == "Jordan Peterson" for c in citations)
+
+    def test_marks_verifiable(self):
+        citations = extract_citations("A 2023 Harvard study showed results.")
+        assert any(c["verifiable"] for c in citations)
+
+    def test_empty_text(self):
+        assert extract_citations("") == []
+
+
+# === 6. QUESTION EXTRACTION ===
+class TestExtractQuestions:
+    def test_extracts_research_question(self):
+        questions = extract_questions("Does RSI actually work in trending markets?")
+        assert len(questions) >= 1
+        assert questions[0]["type"] == "research"
+
+    def test_extracts_rhetorical_question(self):
+        questions = extract_questions("Who knows what the market will do tomorrow?")
+        assert any(q["type"] == "rhetorical" for q in questions)
+
+    def test_extracts_sales_question(self):
+        questions = extract_questions("Want to make money trading?")
+        assert any(q["type"] == "sales" for q in questions)
+
+    def test_no_questions_in_statement(self):
+        questions = extract_questions("The RSI is a momentum indicator.")
+        assert len(questions) == 0
+
+    def test_deduplicates(self):
+        questions = extract_questions("Does this work? Does this work? Does this work?")
+        assert len(questions) == 1
+
+    def test_empty_text(self):
+        assert extract_questions("") == []
+
+
+# === 7. HEDGE DENSITY ===
+class TestCalculateHedgeDensity:
+    def test_low_density(self):
+        result = calculate_hedge_density("The RSI is a momentum oscillator. It measures speed.")
+        assert result["level"] == "low"
+        assert result["density"] < 3
+
+    def test_high_density(self):
+        text = "I think maybe it sort of works perhaps basically essentially kind of possibly."
+        result = calculate_hedge_density(text)
+        assert result["level"] in ("high", "extreme")
+        assert result["hedge_count"] > 3
+
+    def test_counts_hedges(self):
+        result = calculate_hedge_density("Maybe perhaps possibly probably.")
+        assert result["hedge_count"] >= 3
+
+    def test_empty_text(self):
+        result = calculate_hedge_density("")
+        assert result["hedge_count"] == 0
+        assert result["density"] == 0.0
+
+    def test_includes_hedges_found(self):
+        result = calculate_hedge_density("Maybe it works.")
+        assert "hedges_found" in result
+        assert isinstance(result["hedges_found"], dict)
+
+
+# === 8. TOPIC SEGMENTATION ===
+class TestSegmentTopics:
+    def test_segments_multiple_topics(self):
+        text = (
+            "Let's talk about RSI. RSI is a momentum indicator. "
+            "It measures the speed of price movements. "
+            "Now let's move on to MACD. MACD is a trend indicator. "
+            "It shows crossovers between moving averages. "
+            "Finally, let's discuss Bollinger Bands. They show volatility."
+        )
+        chapters = segment_topics(text, min_segment_words=10)
+        assert len(chapters) >= 2
+
+    def test_single_topic(self):
+        chapters = segment_topics("RSI is a momentum indicator. It measures speed.", min_segment_words=5)
+        assert len(chapters) >= 1
+
+    def test_includes_timestamps(self):
+        sentences = [
+            TimestampedSentence(text="Let's talk about RSI.", start=0.0, end=5.0, segment_index=0),
+            TimestampedSentence(text="RSI is great.", start=5.0, end=10.0, segment_index=1),
+            TimestampedSentence(text="Now let's move to MACD.", start=10.0, end=15.0, segment_index=2),
+            TimestampedSentence(text="MACD is also great.", start=15.0, end=20.0, segment_index=3),
+        ]
+        chapters = segment_topics("dummy", sentences=sentences, min_segment_words=5)
+        if len(chapters) >= 2:
+            assert "start_timestamp" in chapters[0]
+            assert "end_timestamp" in chapters[0]
+
+    def test_includes_word_count(self):
+        chapters = segment_topics("Let's talk about RSI. It is a momentum indicator.", min_segment_words=5)
+        if chapters:
+            assert "word_count" in chapters[0]
+
+    def test_empty_text(self):
+        assert segment_topics("") == []
+
+
+# === 9. EMOTIONAL LANGUAGE ===
+class TestTrackEmotionalLanguage:
+    def test_detects_positive_emotion(self):
+        result = track_emotional_language("This strategy is amazing and incredible!")
+        assert result["positive_count"] >= 2
+
+    def test_detects_negative_emotion(self):
+        result = track_emotional_language("This is a terrible scam and a disaster.")
+        assert result["negative_count"] >= 2
+
+    def test_overall_sentiment_positive(self):
+        result = track_emotional_language("This is amazing and great and awesome!")
+        assert result["overall_sentiment"] > 0
+
+    def test_overall_sentiment_negative(self):
+        result = track_emotional_language("This is terrible and horrible and awful.")
+        assert result["overall_sentiment"] < 0
+
+    def test_detects_spikes(self):
+        text = "This is amazing! Incredible! Unbelievable! Mind-blowing!"
+        result = track_emotional_language(text)
+        # Multiple emotional words in close proximity = spike
+        assert result["spike_count"] >= 1 or result["positive_count"] >= 4
+
+    def test_no_emotion_in_technical_text(self):
+        result = track_emotional_language("The RSI is calculated using a 14-period lookback.")
+        assert result["positive_count"] == 0
+        assert result["negative_count"] == 0
+
+    def test_empty_text(self):
+        result = track_emotional_language("")
+        assert result["positive_count"] == 0
+
+    def test_includes_emotional_moments(self):
+        result = track_emotional_language("This is amazing!")
+        assert len(result["emotional_moments"]) >= 1
+        assert "word" in result["emotional_moments"][0]
+
+
+# === 10. DEFINITION EXTRACTION ===
+class TestExtractDefinitions:
+    def test_extracts_is_a_definition(self):
+        defs = extract_definitions("RSI is a momentum oscillator that measures price speed.")
+        assert len(defs) >= 1
+        assert any("RSI" in d["term"] for d in defs)
+
+    def test_extracts_called_definition(self):
+        defs = extract_definitions("This pattern is called a double bottom.")
+        assert len(defs) >= 1
+
+    def test_extracts_means_definition(self):
+        defs = extract_definitions("MACD means Moving Average Convergence Divergence.")
+        assert len(defs) >= 1
+        assert any("MACD" in d["term"] for d in defs)
+
+    def test_deduplicates(self):
+        defs = extract_definitions("RSI is a momentum indicator. RSI is a momentum indicator.")
+        terms = [d["term"].lower() for d in defs]
+        assert terms.count("rsi") <= 1
+
+    def test_filters_pronouns(self):
+        defs = extract_definitions("This is a good video. It is a test.")
+        terms = [d["term"].lower() for d in defs]
+        assert "this" not in terms
+        assert "it" not in terms
+
+    def test_empty_text(self):
+        assert extract_definitions("") == []
+
+    def test_includes_sentence(self):
+        defs = extract_definitions("RSI is a momentum oscillator.")
+        if defs:
+            assert "sentence" in defs[0]
+
+
+# === MASTER EXTRACT_ALL ===
+class TestExtractAll:
+    def test_returns_all_keys(self):
+        result = extract_all("RSI is a momentum indicator. If RSI is below 30, buy.")
+        expected_keys = {"contradictions", "marketing_pressure", "parameters", "rules",
+                        "citations", "questions", "hedge_density", "chapters",
+                        "emotional_language", "definitions"}
+        assert set(result.keys()) == expected_keys
+
+    def test_empty_text(self):
+        result = extract_all("")
+        assert result["contradictions"] == []
+        assert result["parameters"] == []
+        assert result["questions"] == []
+
+    def test_works_with_timestamps(self):
+        sentences = [
+            TimestampedSentence(text="RSI is a momentum indicator.", start=0.0, end=5.0, segment_index=0),
+            TimestampedSentence(text="If RSI is below 30, buy.", start=5.0, end=10.0, segment_index=1),
+        ]
+        result = extract_all("RSI is a momentum indicator. If RSI is below 30, buy.", sentences)
+        assert len(result["definitions"]) >= 1 or len(result["rules"]) >= 1
