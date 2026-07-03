@@ -2083,6 +2083,868 @@ def read_report(
     }
 
 
+# ---------------------------------------------------------------- INTERACTIVE WEB REPORTS
+
+import html as _html
+
+
+def _verdict_color(verdict: str) -> str:
+    """Map a verdict string to a color for the HTML badge."""
+    v = verdict.lower().strip()
+    if "verified" == v or v == "verified":
+        return ("#22c55e", "#16a34a", "✓ Verified")
+    if "partially" in v:
+        return ("#eab308", "#ca8a04", "◐ Partially Verified")
+    if "contradicted" in v:
+        return ("#ef4444", "#dc2626", "✗ Contradicted")
+    if "unverifiable" in v:
+        return ("#94a3b8", "#64748b", "? Unverifiable")
+    if "opinion" in v:
+        return ("#94a3b8", "#64748b", "💬 Opinion")
+    # unverified or default
+    return ("#f59e0b", "#d97706", "? Unverified")
+
+
+def _confidence_bar(confidence: str) -> str:
+    """Generate an HTML confidence bar."""
+    c = confidence.upper().strip()
+    if c == "HIGH":
+        pct, color = 90, "#22c55e"
+    elif c == "MODERATE":
+        pct, color = 60, "#eab308"
+    elif c == "LOW":
+        pct, color = 30, "#ef4444"
+    else:
+        pct, color = 50, "#94a3b8"
+    return f'<div class="confidence-bar"><div class="confidence-fill" style="width:{pct}%;background:{color}"></div><span>{c}</span></div>'
+
+
+def _reliability_score(reliability: str) -> int:
+    """Convert reliability string to 0-100 score for the bias meter."""
+    r = reliability.lower().strip()
+    if "high" in r and "mixed" not in r:
+        return 85
+    if "moderate" in r:
+        return 55
+    if "mixed" in r:
+        return 45
+    if "low" in r:
+        return 20
+    return 50
+
+
+def _escape(text: str) -> str:
+    """HTML-escape text for safe insertion."""
+    return _html.escape(str(text)) if text else ""
+
+
+def _format_source_list(sources: list) -> str:
+    """Generate HTML for a list of sources."""
+    if not sources:
+        return ""
+    items = []
+    for s in sources:
+        if isinstance(s, dict):
+            url = s.get("url", "")
+            title = s.get("title", url)
+            reliability = s.get("reliability", "")
+            rel_badge = f'<span class="rel-badge rel-{reliability}">{reliability}</span>' if reliability else ""
+            if url:
+                items.append(f'<li><a href="{_escape(url)}" target="_blank" rel="noopener">{_escape(title)}</a> {rel_badge}</li>')
+            else:
+                items.append(f'<li>{_escape(title)} {rel_badge}</li>')
+        elif isinstance(s, str):
+            if s.startswith("http"):
+                items.append(f'<li><a href="{_escape(s)}" target="_blank" rel="noopener">{_escape(s)}</a></li>')
+            else:
+                items.append(f'<li>{_escape(s)}</li>')
+    return f'<ul class="source-list">{"".join(items)}</ul>'
+
+
+def report_to_html(report: dict, output_path: str | Path | None = None) -> str:
+    """Convert a research report (Light or Deep) into a self-contained interactive HTML file.
+
+    The HTML is fully self-contained — no external CSS, JS, or CDN dependencies.
+    Works offline, can be emailed, shared in Discord, etc.
+
+    Args:
+        report: The report dict (from JSON)
+        output_path: Where to save the HTML file. If None, returns HTML string only.
+
+    Returns:
+        The HTML string (also saves to file if output_path given)
+    """
+    is_deep = report.get("research_mode") == "deep"
+    title = report.get("title", "Unknown Video")
+    channel = report.get("channel", "")
+    url = report.get("url", "")
+    video_id = ""
+    if url:
+        m = re.search(r"(?:v=|youtu\.be/)([\w-]{11})", url)
+        if m:
+            video_id = m.group(1)
+
+    # --- Build sections ---
+    sections: list[str] = []
+
+    # --- Executive Summary ---
+    summary = report.get("executive_summary", "") or report.get("summary", "")
+    if summary:
+        sections.append(f'''
+        <section class="card" id="summary">
+            <h2 onclick="toggleSection(this)">▾ Executive Summary</h2>
+            <div class="card-body">
+                <p>{_escape(summary).replace(chr(10), '<br>')}</p>
+            </div>
+        </section>''')
+
+    # --- TL;DR (Light Research) ---
+    tldr = report.get("tldr", "")
+    if tldr:
+        sections.append(f'''
+        <section class="card" id="tldr">
+            <h2 onclick="toggleSection(this)">▾ TL;DR</h2>
+            <div class="card-body">
+                <p class="tldr">{_escape(tldr)}</p>
+            </div>
+        </section>''')
+
+    # --- Key Points (Light Research) ---
+    key_points = report.get("key_points", [])
+    if key_points:
+        kp_items = "".join(f"<li>{_escape(kp)}</li>" for kp in key_points)
+        sections.append(f'''
+        <section class="card" id="key-points">
+            <h2 onclick="toggleSection(this)">▾ Key Points</h2>
+            <div class="card-body">
+                <ol>{kp_items}</ol>
+            </div>
+        </section>''')
+
+    # --- Bias Meter + Assessment ---
+    bias = report.get("bias_assessment", {})
+    if bias:
+        reliability = bias.get("overall_reliability", "")
+        score = _reliability_score(reliability)
+        credibility = bias.get("speaker_credibility", "")
+        biases = bias.get("potential_biases", [])
+        conflicts = bias.get("conflicts_of_interest", [])
+        ecosystem = bias.get("financial_ecosystem", "")
+
+        bias_items = "".join(f"<li>{_escape(b)}</li>" for b in biases)
+        conflict_items = "".join(f"<li>{_escape(c)}</li>" for c in conflicts)
+
+        # Gauge color based on score
+        if score >= 70:
+            gauge_color = "#22c55e"
+        elif score >= 50:
+            gauge_color = "#eab308"
+        else:
+            gauge_color = "#ef4444"
+
+        sections.append(f'''
+        <section class="card" id="bias">
+            <h2 onclick="toggleSection(this)">▾ Bias Assessment</h2>
+            <div class="card-body">
+                <div class="bias-meter">
+                    <div class="bias-gauge">
+                        <div class="gauge-track">
+                            <div class="gauge-fill" style="width:{score}%;background:{gauge_color}"></div>
+                        </div>
+                        <div class="gauge-label">
+                            <span class="gauge-score">{score}/100</span>
+                            <span class="gauge-reliability">Reliability: {_escape(reliability)}</span>
+                        </div>
+                    </div>
+                </div>
+                {f'<p><strong>Speaker Credibility:</strong> {_escape(credibility)}</p>' if credibility else ''}
+                {f'<h3>Potential Biases</h3><ul>{bias_items}</ul>' if bias_items else ''}
+                {f'<h3>Conflicts of Interest</h3><ul class="conflicts">{conflict_items}</ul>' if conflict_items else ''}
+                {f'<p><strong>Financial Ecosystem:</strong> {_escape(ecosystem)}</p>' if ecosystem else ''}
+            </div>
+        </section>''')
+
+    # --- Claim Verification ---
+    claims = report.get("claim_verification", [])
+    if claims:
+        claim_cards = []
+        for i, c in enumerate(claims, 1):
+            claim_text = c.get("claim", "")
+            quote = c.get("verbatim_quote", "")
+            verdict = c.get("verdict", "")
+            evidence = c.get("evidence", "")
+            confidence = c.get("confidence", "")
+            sources = c.get("sources", [])
+
+            bg, border, label = _verdict_color(verdict)
+            conf_bar = _confidence_bar(confidence)
+            source_html = _format_source_list(sources)
+
+            # Timestamp link if we have video_id and quote
+            timestamp_html = ""
+            if video_id and quote:
+                timestamp_html = f'<a href="https://youtube.com/watch?v={video_id}" target="_blank" class="timestamp-link">▶ Watch on YouTube</a>'
+
+            claim_cards.append(f'''
+            <div class="claim-card" style="border-left:4px solid {border}">
+                <div class="claim-header">
+                    <span class="verdict-badge" style="background:{bg};color:#fff">{label}</span>
+                    <span class="claim-number">Claim {i}</span>
+                </div>
+                {f'<div class="claim-quote">"{_escape(quote)}"</div>' if quote else ''}
+                <div class="claim-text">{_escape(claim_text)}</div>
+                {conf_bar}
+                {f'<div class="claim-evidence"><strong>Evidence:</strong> {_escape(evidence)}</div>' if evidence else ''}
+                {timestamp_html}
+                {source_html}
+            </div>''')
+
+        sections.append(f'''
+        <section class="card" id="claims">
+            <h2 onclick="toggleSection(this)">▾ Claim Verification ({len(claims)} claims)</h2>
+            <div class="card-body">
+                {''.join(claim_cards)}
+            </div>
+        </section>''')
+
+    # --- Controversial Claims (Light Research) ---
+    controversial = report.get("controversial_claims", [])
+    if controversial:
+        items = "".join(f"<li>{_escape(c)}</li>" for c in controversial)
+        sections.append(f'''
+        <section class="card" id="controversial">
+            <h2 onclick="toggleSection(this)">▾ Controversial Claims</h2>
+            <div class="card-body">
+                <ul>{items}</ul>
+            </div>
+        </section>''')
+
+    # --- Argument Structure ---
+    arg = report.get("argument_structure", {})
+    if arg:
+        thesis = arg.get("main_thesis", "")
+        premises = arg.get("premises", [])
+        conclusions = arg.get("conclusions", [])
+        reasoning = arg.get("reasoning_quality", "")
+        fallacies = arg.get("fallacies_identified", [])
+
+        premise_items = ""
+        for i, p in enumerate(premises, 1):
+            if isinstance(p, dict):
+                ptext = p.get("premise", "")
+                etype = p.get("evidence_type", "")
+                premise_items += f'<li><span class="evidence-type evidence-{_escape(etype)}">{_escape(etype)}</span> {_escape(ptext)}</li>'
+            else:
+                premise_items += f"<li>{_escape(p)}</li>"
+
+        conclusion_items = "".join(f"<li>{_escape(c)}</li>" for c in conclusions)
+
+        fallacy_cards = ""
+        for f in fallacies:
+            if isinstance(f, dict):
+                fname = f.get("fallacy", "")
+                fexample = f.get("example", "")
+                fexplanation = f.get("explanation", "")
+                fallacy_cards += f'''
+                <div class="fallacy-card">
+                    <h4>{_escape(fname)}</h4>
+                    {f'<p class="fallacy-example">"{_escape(fexample)}"</p>' if fexample else ''}
+                    {f'<p class="fallacy-explanation">{_escape(fexplanation)}</p>' if fexplanation else ''}
+                </div>'''
+
+        sections.append(f'''
+        <section class="card" id="argument">
+            <h2 onclick="toggleSection(this)">▾ Argument Structure</h2>
+            <div class="card-body">
+                {f'<div class="thesis"><strong>Main Thesis:</strong> {_escape(thesis)}</div>' if thesis else ''}
+                {f'<h3>Premises</h3><ol>{premise_items}</ol>' if premise_items else ''}
+                {f'<h3>Conclusions</h3><ul>{conclusion_items}</ul>' if conclusion_items else ''}
+                {f'<h3>Reasoning Quality</h3><p>{_escape(reasoning)}</p>' if reasoning else ''}
+                {f'<h3>Logical Fallacies ({len(fallacies)})</h3>{fallacy_cards}' if fallacy_cards else ''}
+            </div>
+        </section>''')
+
+    # --- Cross-References ---
+    xrefs = report.get("cross_references", [])
+    if xrefs:
+        xref_cards = ""
+        for xr in xrefs:
+            topic = xr.get("topic", "")
+            video_claims = xr.get("this_video_claims", "")
+            auth_says = xr.get("authoritative_sources_say", "")
+            agreement = xr.get("agreement_level", "")
+            xr_sources = xr.get("sources", [])
+
+            # Agreement badge
+            ag_color = "#94a3b8"
+            if "consistent" in agreement.lower() and "partial" not in agreement.lower():
+                ag_color = "#22c55e"
+            elif "partial" in agreement.lower():
+                ag_color = "#eab308"
+            elif "contradict" in agreement.lower():
+                ag_color = "#ef4444"
+
+            xref_cards += f'''
+            <div class="xref-card">
+                <h4>{_escape(topic)}</h4>
+                <div class="xref-comparison">
+                    <div class="xref-side">
+                        <strong>Video Claims:</strong>
+                        <p>{_escape(video_claims)}</p>
+                    </div>
+                    <div class="xref-side">
+                        <strong>Authoritative Sources Say:</strong>
+                        <p>{_escape(auth_says)}</p>
+                    </div>
+                </div>
+                <span class="agreement-badge" style="background:{ag_color};color:#fff">{_escape(agreement)}</span>
+                {_format_source_list(xr_sources)}
+            </div>'''
+
+        sections.append(f'''
+        <section class="card" id="cross-refs">
+            <h2 onclick="toggleSection(this)">▾ Cross-References</h2>
+            <div class="card-body">
+                {xref_cards}
+            </div>
+        </section>''')
+
+    # --- Omission Analysis ---
+    omissions = report.get("omission_analysis", [])
+    if omissions:
+        items = "".join(f"<li>{_escape(o)}</li>" for o in omissions)
+        sections.append(f'''
+        <section class="card" id="omissions">
+            <h2 onclick="toggleSection(this)">▾ Omission Analysis — What Was NOT Said</h2>
+            <div class="card-body">
+                <ul class="omissions">{items}</ul>
+            </div>
+        </section>''')
+
+    # --- Topics (Light Research) ---
+    topics = report.get("topics", [])
+    if topics:
+        topic_items = ""
+        for t in topics:
+            if isinstance(t, dict):
+                topic_items += f'<div class="topic-card"><h4>{_escape(t.get("name",""))}</h4><p>{_escape(t.get("description",""))}</p></div>'
+            else:
+                topic_items += f'<div class="topic-card"><h4>{_escape(t)}</h4></div>'
+        sections.append(f'''
+        <section class="card" id="topics">
+            <h2 onclick="toggleSection(this)">▾ Topics</h2>
+            <div class="card-body">
+                <div class="topic-grid">{topic_items}</div>
+            </div>
+        </section>''')
+
+    # --- Action Items (Light Research) ---
+    action_items = report.get("action_items", [])
+    if action_items:
+        items = "".join(f"<li>{_escape(a)}</li>" for a in action_items)
+        sections.append(f'''
+        <section class="card" id="actions">
+            <h2 onclick="toggleSection(this)">▾ Action Items</h2>
+            <div class="card-body">
+                <ul>{items}</ul>
+            </div>
+        </section>''')
+
+    # --- Quotes (Light Research) ---
+    quotes = report.get("quotes", [])
+    if quotes:
+        items = "".join(f'<blockquote>"{_escape(q)}"</blockquote>' for q in quotes)
+        sections.append(f'''
+        <section class="card" id="quotes">
+            <h2 onclick="toggleSection(this)">▾ Notable Quotes</h2>
+            <div class="card-body">
+                {items}
+            </div>
+        </section>''')
+
+    # --- Source Bibliography ---
+    bibliography = report.get("source_bibliography", [])
+    if bibliography:
+        bib_items = ""
+        for b in bibliography:
+            if isinstance(b, dict):
+                burl = b.get("url", "")
+                btitle = b.get("title", burl)
+                btype = b.get("type", "")
+                brel = b.get("reliability", "")
+                rel_badge = f'<span class="rel-badge rel-{brel}">{brel}</span>' if brel else ""
+                type_badge = f'<span class="type-badge">{btype}</span>' if btype else ""
+                if burl:
+                    bib_items += f'<li><a href="{_escape(burl)}" target="_blank" rel="noopener">{_escape(btitle)}</a> {type_badge} {rel_badge}</li>'
+                else:
+                    bib_items += f'<li>{_escape(btitle)} {type_badge} {rel_badge}</li>'
+        sections.append(f'''
+        <section class="card" id="bibliography">
+            <h2 onclick="toggleSection(this)">▾ Source Bibliography ({len(bibliography)} sources)</h2>
+            <div class="card-body">
+                <ul class="bibliography">{bib_items}</ul>
+            </div>
+        </section>''')
+
+    # --- Research Gaps ---
+    gaps = report.get("research_gaps", [])
+    if gaps:
+        items = "".join(f"<li>{_escape(g)}</li>" for g in gaps)
+        sections.append(f'''
+        <section class="card" id="gaps">
+            <h2 onclick="toggleSection(this)">▾ Research Gaps</h2>
+            <div class="card-body">
+                <ul>{items}</ul>
+            </div>
+        </section>''')
+
+    # --- Open Questions ---
+    questions = report.get("open_questions", [])
+    if questions:
+        items = "".join(f"<li>{_escape(q)}</li>" for q in questions)
+        sections.append(f'''
+        <section class="card" id="questions">
+            <h2 onclick="toggleSection(this)">▾ Open Questions</h2>
+            <div class="card-body">
+                <ul>{items}</ul>
+            </div>
+        </section>''')
+
+    # --- Overall Confidence ---
+    conf = report.get("overall_confidence", {})
+    if conf:
+        level = conf.get("level", "")
+        rationale = conf.get("rationale", "")
+        conf_bar = _confidence_bar(level)
+        sections.append(f'''
+        <section class="card" id="confidence">
+            <h2 onclick="toggleSection(this)">▾ Overall Confidence</h2>
+            <div class="card-body">
+                {conf_bar}
+                {f'<p>{_escape(rationale)}</p>' if rationale else ''}
+            </div>
+        </section>''')
+
+    # --- Methodology ---
+    methodology = report.get("methodology", {})
+    if methodology:
+        approach = methodology.get("approach", "")
+        sources_count = methodology.get("sources_consulted", 0)
+        searches = methodology.get("web_searches_performed", 0)
+        limitations = methodology.get("limitations", [])
+
+        lim_items = "".join(f"<li>{_escape(l)}</li>" for l in limitations)
+        sections.append(f'''
+        <section class="card" id="methodology">
+            <h2 onclick="toggleSection(this)">▾ Methodology</h2>
+            <div class="card-body">
+                {f'<p><strong>Approach:</strong> {_escape(approach)}</p>' if approach else ''}
+                <div class="methodology-stats">
+                    <div class="stat"><span class="stat-num">{sources_count}</span><span class="stat-label">Sources</span></div>
+                    <div class="stat"><span class="stat-num">{searches}</span><span class="stat-label">Web Searches</span></div>
+                </div>
+                {f'<h3>Limitations</h3><ul>{lim_items}</ul>' if lim_items else ''}
+            </div>
+        </section>''')
+
+    # --- Sentiment / Energy (Light Research) ---
+    sentiment = report.get("sentiment", "")
+    energy = report.get("energy", "")
+    if sentiment or energy:
+        sections.append(f'''
+        <section class="card" id="meta">
+            <h2 onclick="toggleSection(this)">▾ Video Meta</h2>
+            <div class="card-body">
+                {f'<p><strong>Sentiment:</strong> {_escape(sentiment)}</p>' if sentiment else ''}
+                {f'<p><strong>Energy:</strong> {_escape(energy)}</p>' if energy else ''}
+            </div>
+        </section>''')
+
+    # --- Assemble full HTML ---
+    mode_label = "Deep Research" if is_deep else "Light Research"
+    mode_class = "deep" if is_deep else "light"
+    thumbnail = f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg" if video_id else ""
+
+    html_doc = f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{_escape(title)} — {mode_label} Report</title>
+<style>
+:root {{
+  --bg: #0f172a;
+  --card-bg: #1e293b;
+  --card-border: #334155;
+  --text: #e2e8f0;
+  --text-dim: #94a3b8;
+  --accent: #3b82f6;
+  --accent-hover: #2563eb;
+  --green: #22c55e;
+  --red: #ef4444;
+  --yellow: #eab308;
+  --orange: #f59e0b;
+  --gray: #94a3b8;
+  --radius: 12px;
+}}
+[data-theme="light"] {{
+  --bg: #f8fafc;
+  --card-bg: #ffffff;
+  --card-border: #e2e8f0;
+  --text: #1e293b;
+  --text-dim: #64748b;
+}}
+* {{ margin: 0; padding: 0; box-sizing: border-box; }}
+body {{
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  line-height: 1.6;
+  padding: 20px;
+  max-width: 900px;
+  margin: 0 auto;
+}}
+.theme-toggle {{
+  position: fixed;
+  top: 20px;
+  right: 20px;
+  background: var(--card-bg);
+  border: 1px solid var(--card-border);
+  color: var(--text);
+  padding: 8px 16px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 14px;
+  z-index: 100;
+}}
+.theme-toggle:hover {{ border-color: var(--accent); }}
+
+/* Header */
+.header {{
+  margin-bottom: 30px;
+  padding-bottom: 20px;
+  border-bottom: 1px solid var(--card-border);
+}}
+.mode-badge {{
+  display: inline-block;
+  padding: 4px 12px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  margin-bottom: 12px;
+}}
+.mode-badge.deep {{ background: var(--accent); color: #fff; }}
+.mode-badge.light {{ background: var(--yellow); color: #000; }}
+.header h1 {{
+  font-size: 28px;
+  margin-bottom: 8px;
+  line-height: 1.3;
+}}
+.header .channel {{ color: var(--text-dim); font-size: 16px; }}
+.header .channel a {{ color: var(--accent); text-decoration: none; }}
+.header .video-link {{
+  display: inline-block;
+  margin-top: 10px;
+  padding: 6px 14px;
+  background: var(--card-bg);
+  border: 1px solid var(--card-border);
+  border-radius: 8px;
+  color: var(--text);
+  text-decoration: none;
+  font-size: 14px;
+}}
+.header .video-link:hover {{ border-color: var(--accent); }}
+{f'.header img.thumbnail {{ width:100%; max-height:300px; object-fit:cover; border-radius:var(--radius); margin:15px 0; }}' if thumbnail else ''}
+
+/* Cards */
+.card {{
+  background: var(--card-bg);
+  border: 1px solid var(--card-border);
+  border-radius: var(--radius);
+  margin-bottom: 16px;
+  overflow: hidden;
+}}
+.card h2 {{
+  padding: 16px 20px;
+  cursor: pointer;
+  font-size: 18px;
+  font-weight: 600;
+  user-select: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  transition: background 0.2s;
+}}
+.card h2:hover {{ background: rgba(59,130,246,0.1); }}
+.card-body {{ padding: 0 20px 20px; }}
+.card-body h3 {{ font-size: 15px; margin: 16px 0 8px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.5px; }}
+.card-body h4 {{ font-size: 16px; margin: 12px 0 6px; }}
+.card-body p {{ margin-bottom: 10px; }}
+.card-body ul, .card-body ol {{ padding-left: 20px; margin-bottom: 12px; }}
+.card-body li {{ margin-bottom: 6px; }}
+.card.collapsed .card-body {{ display: none; }}
+.card.collapsed h2::before {{ content: '▸ '; }}
+.card h2::before {{ content: '▾ '; }}
+
+/* TL;DR */
+.tldr {{ font-size: 18px; font-weight: 500; padding: 12px; background: rgba(59,130,246,0.1); border-radius: 8px; border-left: 4px solid var(--accent); }}
+
+/* Bias Meter */
+.bias-meter {{ margin-bottom: 20px; }}
+.gauge-track {{ width: 100%; height: 30px; background: var(--bg); border-radius: 15px; overflow: hidden; border: 1px solid var(--card-border); }}
+.gauge-fill {{ height: 100%; border-radius: 15px; transition: width 0.5s ease; }}
+.gauge-label {{ display: flex; justify-content: space-between; margin-top: 8px; }}
+.gauge-score {{ font-size: 24px; font-weight: 700; }}
+.gauge-reliability {{ color: var(--text-dim); font-size: 14px; align-self: center; }}
+
+/* Claim Cards */
+.claim-card {{
+  background: var(--bg);
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 12px;
+}}
+.claim-header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }}
+.verdict-badge {{
+  padding: 4px 12px;
+  border-radius: 20px;
+  font-size: 13px;
+  font-weight: 600;
+}}
+.claim-number {{ color: var(--text-dim); font-size: 13px; }}
+.claim-quote {{ font-style: italic; color: var(--text-dim); margin-bottom: 8px; padding-left: 12px; border-left: 3px solid var(--card-border); }}
+.claim-text {{ font-size: 16px; margin-bottom: 10px; }}
+.claim-evidence {{ font-size: 14px; color: var(--text-dim); margin-bottom: 10px; }}
+.timestamp-link {{
+  display: inline-block;
+  padding: 4px 10px;
+  background: var(--accent);
+  color: #fff;
+  border-radius: 6px;
+  text-decoration: none;
+  font-size: 13px;
+  margin-bottom: 10px;
+}}
+.timestamp-link:hover {{ background: var(--accent-hover); }}
+
+/* Confidence Bar */
+.confidence-bar {{
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}}
+.confidence-bar div {{
+  height: 8px;
+  border-radius: 4px;
+  flex: 1;
+  background: var(--card-border);
+  position: relative;
+  overflow: hidden;
+}}
+.confidence-fill {{
+  height: 100%;
+  border-radius: 4px;
+  position: absolute;
+  left: 0;
+  top: 0;
+}}
+.confidence-bar span {{ font-size: 12px; color: var(--text-dim); white-space: nowrap; }}
+
+/* Source List */
+.source-list {{ list-style: none; padding-left: 0; }}
+.source-list li {{ padding: 4px 0; font-size: 14px; }}
+.source-list a {{ color: var(--accent); text-decoration: none; }}
+.source-list a:hover {{ text-decoration: underline; }}
+.rel-badge {{
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+  margin-left: 6px;
+}}
+.rel-high {{ background: rgba(34,197,94,0.2); color: var(--green); }}
+.rel-moderate {{ background: rgba(234,179,8,0.2); color: var(--yellow); }}
+.rel-low {{ background: rgba(239,68,68,0.2); color: var(--red); }}
+.type-badge {{
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  background: var(--card-border);
+  color: var(--text-dim);
+  margin-left: 6px;
+}}
+
+/* Fallacy Cards */
+.fallacy-card {{
+  background: var(--bg);
+  border-radius: 8px;
+  padding: 14px;
+  margin-bottom: 10px;
+  border-left: 3px solid var(--red);
+}}
+.fallacy-example {{ font-style: italic; color: var(--text-dim); margin: 6px 0; }}
+.fallacy-explanation {{ font-size: 14px; }}
+
+/* Evidence Type Badges */
+.evidence-type {{
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+  margin-right: 6px;
+}}
+.evidence-empirical {{ background: rgba(34,197,94,0.2); color: var(--green); }}
+.evidence-anecdotal {{ background: rgba(234,179,8,0.2); color: var(--yellow); }}
+.evidence-logical {{ background: rgba(59,130,246,0.2); color: var(--accent); }}
+.evidence-authority {{ background: rgba(168,85,247,0.2); color: #a855f7; }}
+.evidence-none {{ background: rgba(239,68,68,0.2); color: var(--red); }}
+
+/* Cross-Reference Cards */
+.xref-card {{
+  background: var(--bg);
+  border-radius: 8px;
+  padding: 14px;
+  margin-bottom: 12px;
+}}
+.xref-comparison {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 10px 0; }}
+.xref-side {{ padding: 10px; border-radius: 6px; }}
+.xref-side:first-child {{ background: rgba(239,68,68,0.1); }}
+.xref-side:last-child {{ background: rgba(34,197,94,0.1); }}
+.xref-side strong {{ font-size: 13px; color: var(--text-dim); }}
+.agreement-badge {{
+  display: inline-block;
+  padding: 4px 12px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: 600;
+}}
+
+/* Omissions */
+.omissions li {{
+  list-style: none;
+  padding: 10px 14px;
+  background: rgba(239,68,68,0.1);
+  border-radius: 6px;
+  margin-bottom: 6px;
+  border-left: 3px solid var(--red);
+}}
+.omissions li::before {{ content: '⚠ '; }}
+
+/* Conflicts */
+.conflicts li {{
+  list-style: none;
+  padding: 10px 14px;
+  background: rgba(239,68,68,0.1);
+  border-radius: 6px;
+  margin-bottom: 6px;
+  border-left: 3px solid var(--orange);
+}}
+
+/* Topic Grid */
+.topic-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 12px; }}
+.topic-card {{ background: var(--bg); border-radius: 8px; padding: 14px; }}
+
+/* Methodology Stats */
+.methodology-stats {{ display: flex; gap: 20px; margin: 16px 0; }}
+.stat {{ text-align: center; }}
+.stat-num {{ display: block; font-size: 32px; font-weight: 700; color: var(--accent); }}
+.stat-label {{ font-size: 12px; color: var(--text-dim); text-transform: uppercase; }}
+
+/* Thesis */
+.thesis {{ font-size: 18px; padding: 14px; background: rgba(59,130,246,0.1); border-radius: 8px; border-left: 4px solid var(--accent); margin-bottom: 16px; }}
+
+/* Bibliography */
+.bibliography {{ list-style: none; padding-left: 0; }}
+.bibliography li {{ padding: 6px 0; font-size: 14px; border-bottom: 1px solid var(--card-border); }}
+.bibliography a {{ color: var(--accent); text-decoration: none; }}
+
+/* Blockquotes */
+blockquote {{
+  padding: 12px 16px;
+  background: var(--bg);
+  border-left: 4px solid var(--accent);
+  border-radius: 0 8px 8px 0;
+  margin-bottom: 10px;
+  font-style: italic;
+}}
+
+/* Footer */
+.footer {{
+  text-align: center;
+  padding: 30px 0;
+  color: var(--text-dim);
+  font-size: 13px;
+  border-top: 1px solid var(--card-border);
+  margin-top: 30px;
+}}
+
+/* Responsive */
+@media (max-width: 600px) {{
+  body {{ padding: 12px; }}
+  .header h1 {{ font-size: 22px; }}
+  .xref-comparison {{ grid-template-columns: 1fr; }}
+  .methodology-stats {{ flex-direction: column; gap: 10px; }}
+  .topic-grid {{ grid-template-columns: 1fr; }}
+}}
+
+/* Print */
+@media print {{
+  .card {{ break-inside: avoid; }}
+  .card-body {{ display: block !important; }}
+  .theme-toggle {{ display: none; }}
+  body {{ background: #fff; color: #000; }}
+  .card {{ background: #fff; border: 1px solid #ddd; }}
+}}
+</style>
+</head>
+<body data-theme="dark">
+<button class="theme-toggle" onclick="toggleTheme()">🌙 Dark</button>
+
+<div class="header">
+  <span class="mode-badge {mode_class}">{mode_label}</span>
+  <h1>{_escape(title)}</h1>
+  <p class="channel">Channel: <a href="https://youtube.com/@{_escape(channel)}" target="_blank">{_escape(channel)}</a></p>
+  {f'<a href="{_escape(url)}" target="_blank" class="video-link">▶ Watch on YouTube</a>' if url else ''}
+  {f'<img class="thumbnail" src="{thumbnail}" alt="Thumbnail">' if thumbnail else ''}
+</div>
+
+{''.join(sections)}
+
+<div class="footer">
+  Generated by YouTube Research Tool · {mode_label} Mode<br>
+  <a href="https://github.com/omnibot007/youtube-research-tool" target="_blank">github.com/omnibot007/youtube-research-tool</a>
+</div>
+
+<script>
+function toggleSection(header) {{
+  const card = header.parentElement;
+  card.classList.toggle('collapsed');
+}}
+function toggleTheme() {{
+  const body = document.body;
+  const btn = document.querySelector('.theme-toggle');
+  if (body.getAttribute('data-theme') === 'dark') {{
+    body.setAttribute('data-theme', 'light');
+    btn.textContent = '☀ Light';
+  }} else {{
+    body.setAttribute('data-theme', 'dark');
+    btn.textContent = '🌙 Dark';
+  }}
+}}
+</script>
+</body>
+</html>'''
+
+    if output_path:
+        output_path = Path(output_path)
+        output_path.write_text(html_doc, encoding="utf-8")
+
+    return html_doc
+
+
 # ---------------------------------------------------------------- CLI
 
 def _parse_langs(lang_str: str) -> list[str]:
@@ -2178,6 +3040,11 @@ def main() -> int:
 
     sp_voices = sub.add_parser("voices", help="List available TTS voices")
     sp_voices.add_argument("--json", action="store_true", help="Output as JSON")
+
+    sp_web = sub.add_parser("web", help="Generate interactive HTML report from a research JSON")
+    sp_web.add_argument("report", help="Path to report JSON (_research.json or _deep_research.json)")
+    sp_web.add_argument("--output", default="", help="Custom output path for HTML file")
+    sp_web.add_argument("--open", action="store_true", help="Open in browser after generating")
 
     args = p.parse_args()
 
@@ -2502,6 +3369,44 @@ def main() -> int:
             print(f"  Audio size:        {result['audio_size_mb']} MB")
             print(f"  Est. duration:     {result['duration_estimate_minutes']} min ({result['duration_estimate_seconds']}s)")
             print(f"{'=' * 70}")
+        return 0
+
+    if args.cmd == "web":
+        report_path = Path(args.report)
+        if not report_path.exists():
+            print(f"ERROR: Report file not found: {report_path}", file=sys.stderr)
+            return 1
+
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as e:
+            print(f"ERROR: Invalid JSON: {e}", file=sys.stderr)
+            return 1
+
+        # Determine output path
+        if args.output:
+            html_path = Path(args.output)
+        else:
+            html_path = report_path.with_suffix(".html")
+
+        html_content = report_to_html(report, html_path)
+
+        html_size = html_path.stat().st_size
+        print(f"{'=' * 70}")
+        print(f"  INTERACTIVE WEB REPORT GENERATED")
+        print(f"{'=' * 70}")
+        print(f"  Report:  {report_path}")
+        print(f"  HTML:    {html_path}")
+        print(f"  Size:    {html_size / 1024:.1f} KB")
+        print(f"  Mode:    {'Deep Research' if report.get('research_mode') == 'deep' else 'Light Research'}")
+        print(f"{'=' * 70}")
+        if args.open:
+            import webbrowser
+            webbrowser.open(str(html_path))
+            print(f"  Opened in browser.")
+        else:
+            print(f"  Open with: --open flag or double-click the HTML file")
+        print(f"{'=' * 70}")
         return 0
 
     return 1

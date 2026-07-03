@@ -68,6 +68,30 @@ Goes beyond summarization — verifies claims, maps arguments, assesses bias, an
 | `comparative` | "Better than all others" |
 | `historical` | "Invented in 1995" |
 
+### Interactive Web Reports
+```bash
+# Generate a self-contained interactive HTML report
+python yt_scrape.py web path/to/report.json
+
+# Generate and open in browser immediately
+python yt_scrape.py web report.json --open
+```
+
+Produces a single `.html` file you can email, Slack, or drop in Discord — no server needed. Features:
+- **Color-coded verdict badges** — green (verified), red (contradicted), yellow (unverified), gray (opinion)
+- **Bias meter** — visual gauge scoring trustworthiness 0-100
+- **Confidence bars** — HIGH/MODERATE/LOW for each claim
+- **Collapsible sections** — click to expand/collapse any section
+- **Clickable source links** — every source opens in a new tab
+- **Fallacy cards** — each logical fallacy with example and explanation
+- **Cross-reference comparison** — side-by-side: video claims vs. authoritative sources
+- **Omission warnings** — what was NOT said, highlighted in red
+- **Dark mode** by default, light mode toggle
+- **Responsive** — works on phone, tablet, desktop
+- **Print-friendly** — can be exported to PDF
+- **Zero dependencies** — no CDN, no external CSS/JS, fully offline
+- **XSS-safe** — all user content is HTML-escaped
+
 ### Read Reports Aloud (Text-to-Speech)
 ```bash
 # Read a deep research report aloud as MP3
@@ -175,6 +199,7 @@ python yt_scrape.py metadata "https://youtube.com/watch?v=..."
 | `list` | List saved transcripts |
 | `read <report.json>` | Read a research report aloud as MP3 (text-to-speech) |
 | `voices` | List available TTS voices |
+| `web <report.json>` | Generate interactive HTML report (--open to launch browser) |
 
 ## Common Options
 
@@ -208,7 +233,7 @@ All files are saved to `~/yt_transcripts/` (or custom `--output` directory):
 python -m pytest test_yt_scrape.py -v
 ```
 
-94 tests covering: transcript cleanup pipeline, claim extraction (9 types), source extraction, Light Research workflow, Deep Research workflow, TTS report formatting, and performance.
+129 tests covering: transcript cleanup pipeline, claim extraction (9 types), source extraction, Light Research workflow, Deep Research workflow, TTS report formatting, interactive HTML report generation, and performance.
 
 ## Requirements
 

@@ -940,3 +940,287 @@ class TestReadReport:
             assert result["audio_size_bytes"] > 0
             assert result["voice"] == "en-US-AvaNeural"
             assert result["text_length"] > 0
+
+
+# ---------------------------------------------------------------- INTERACTIVE WEB REPORTS
+
+from yt_scrape import (
+    report_to_html,
+    _verdict_color,
+    _confidence_bar,
+    _reliability_score,
+    _escape,
+)
+
+
+class TestVerdictColor:
+    def test_verified_is_green(self):
+        bg, border, label = _verdict_color("verified")
+        assert "22c55e" in bg
+        assert "Verified" in label
+
+    def test_contradicted_is_red(self):
+        bg, border, label = _verdict_color("contradicted")
+        assert "ef4444" in bg
+        assert "Contradicted" in label
+
+    def test_partially_verified_is_yellow(self):
+        bg, border, label = _verdict_color("partially-verified")
+        assert "eab308" in bg
+        assert "Partially" in label
+
+    def test_opinion_is_gray(self):
+        bg, border, label = _verdict_color("opinion")
+        assert "94a3b8" in bg
+        assert "Opinion" in label
+
+    def test_unverified_is_orange(self):
+        bg, border, label = _verdict_color("unverified")
+        assert "f59e0b" in bg
+        assert "Unverified" in label
+
+    def test_unverifiable_is_gray(self):
+        bg, border, label = _verdict_color("unverifiable")
+        assert "94a3b8" in bg
+
+
+class TestConfidenceBar:
+    def test_high_confidence(self):
+        bar = _confidence_bar("HIGH")
+        assert "90%" in bar
+        assert "22c55e" in bar
+        assert "HIGH" in bar
+
+    def test_moderate_confidence(self):
+        bar = _confidence_bar("MODERATE")
+        assert "60%" in bar
+        assert "eab308" in bar
+
+    def test_low_confidence(self):
+        bar = _confidence_bar("LOW")
+        assert "30%" in bar
+        assert "ef4444" in bar
+
+    def test_unknown_confidence(self):
+        bar = _confidence_bar("UNKNOWN")
+        assert "50%" in bar
+
+
+class TestReliabilityScore:
+    def test_high_reliability(self):
+        assert _reliability_score("high") == 85
+
+    def test_moderate_reliability(self):
+        assert _reliability_score("moderate") == 55
+
+    def test_low_reliability(self):
+        assert _reliability_score("low") == 20
+
+    def test_mixed_reliability(self):
+        assert _reliability_score("mixed") == 45
+
+    def test_unknown_reliability(self):
+        assert _reliability_score("unknown") == 50
+
+
+class TestEscape:
+    def test_escapes_html(self):
+        assert _escape("<script>alert('xss')</script>") == "&lt;script&gt;alert(&#x27;xss&#x27;)&lt;/script&gt;"
+
+    def test_escapes_quotes(self):
+        assert "&quot;" in _escape('"hello"')
+
+    def test_empty_string(self):
+        assert _escape("") == ""
+
+    def test_none_returns_empty(self):
+        assert _escape(None) == ""
+
+
+class TestReportToHTML:
+    def test_generates_valid_html(self):
+        report = {
+            "research_mode": "deep",
+            "title": "Test Video",
+            "channel": "TestChan",
+            "url": "https://youtube.com/watch?v=abcdefghijk",
+            "executive_summary": "This is a test summary.",
+        }
+        html = report_to_html(report)
+        assert "<!DOCTYPE html>" in html
+        assert "</html>" in html
+        assert "Test Video" in html
+        assert "TestChan" in html
+        assert "Executive Summary" in html
+        assert "This is a test summary." in html
+
+    def test_includes_bias_meter(self):
+        report = {
+            "research_mode": "deep",
+            "title": "Test",
+            "bias_assessment": {
+                "overall_reliability": "low",
+                "speaker_credibility": "Unknown",
+                "potential_biases": ["Survivorship bias"],
+                "conflicts_of_interest": ["Sells paid signals"],
+                "financial_ecosystem": "YouTube + paid products",
+            },
+        }
+        html = report_to_html(report)
+        assert "bias-meter" in html
+        assert "gauge-fill" in html
+        assert "20/100" in html  # low = 20
+        assert "Survivorship bias" in html
+        assert "Sells paid signals" in html
+
+    def test_includes_claim_cards(self):
+        report = {
+            "research_mode": "deep",
+            "title": "Test",
+            "claim_verification": [
+                {
+                    "claim": "86% win rate",
+                    "verdict": "contradicted",
+                    "evidence": "Actual: 36%",
+                    "confidence": "HIGH",
+                    "verbatim_quote": "86% win rate",
+                    "sources": [{"url": "http://example.com", "title": "Test Source", "reliability": "moderate"}],
+                }
+            ],
+        }
+        html = report_to_html(report)
+        assert "claim-card" in html
+        assert "verdict-badge" in html
+        assert "Contradicted" in html
+        assert "86% win rate" in html
+        assert "confidence-bar" in html
+        assert "example.com" in html
+
+    def test_includes_fallacies(self):
+        report = {
+            "research_mode": "deep",
+            "title": "Test",
+            "argument_structure": {
+                "main_thesis": "This strategy works",
+                "fallacies_identified": [
+                    {"fallacy": "Cherry-picking", "example": "Only showed wins", "explanation": "Selective examples"}
+                ],
+            },
+        }
+        html = report_to_html(report)
+        assert "fallacy-card" in html
+        assert "Cherry-picking" in html
+        assert "Only showed wins" in html
+
+    def test_includes_omissions(self):
+        report = {
+            "research_mode": "deep",
+            "title": "Test",
+            "omission_analysis": ["No stop-loss discussed", "No position sizing"],
+        }
+        html = report_to_html(report)
+        assert "omissions" in html
+        assert "No stop-loss discussed" in html
+
+    def test_includes_cross_references(self):
+        report = {
+            "research_mode": "deep",
+            "title": "Test",
+            "cross_references": [
+                {
+                    "topic": "RSI effectiveness",
+                    "this_video_claims": "RSI works great",
+                    "authoritative_sources_say": "Mixed results",
+                    "agreement_level": "partially-consistent",
+                    "sources": ["http://example.com"],
+                }
+            ],
+        }
+        html = report_to_html(report)
+        assert "xref-card" in html
+        assert "RSI effectiveness" in html
+        assert "agreement-badge" in html
+
+    def test_includes_thumbnail(self):
+        report = {
+            "research_mode": "deep",
+            "title": "Test",
+            "url": "https://youtube.com/watch?v=abcdefghijk",
+        }
+        html = report_to_html(report)
+        assert "img.youtube.com" in html
+        assert "abcdefghijk" in html
+
+    def test_light_research_mode(self):
+        report = {
+            "research_mode": "light",
+            "title": "Light Test",
+            "tldr": "Quick summary",
+            "key_points": ["Point 1", "Point 2"],
+            "quotes": ["Notable quote"],
+        }
+        html = report_to_html(report)
+        assert "Light Research" in html
+        assert "mode-badge light" in html
+        assert "Quick summary" in html
+        assert "Point 1" in html
+        assert "Notable quote" in html
+
+    def test_saves_to_file(self):
+        report = {"research_mode": "deep", "title": "File Test"}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            html_path = Path(tmpdir) / "report.html"
+            report_to_html(report, html_path)
+            assert html_path.exists()
+            content = html_path.read_text(encoding="utf-8")
+            assert "<!DOCTYPE html>" in content
+            assert "File Test" in content
+
+    def test_has_dark_mode_toggle(self):
+        report = {"research_mode": "deep", "title": "Test"}
+        html = report_to_html(report)
+        assert "toggleTheme" in html
+        assert "theme-toggle" in html
+
+    def test_has_collapsible_sections(self):
+        report = {
+            "research_mode": "deep",
+            "title": "Test",
+            "executive_summary": "Summary here",
+        }
+        html = report_to_html(report)
+        assert "toggleSection" in html
+
+    def test_has_responsive_design(self):
+        report = {"research_mode": "deep", "title": "Test"}
+        html = report_to_html(report)
+        assert "@media" in html
+        assert "max-width" in html
+
+    def test_has_print_styles(self):
+        report = {"research_mode": "deep", "title": "Test"}
+        html = report_to_html(report)
+        assert "@media print" in html
+
+    def test_no_external_dependencies(self):
+        """HTML should be fully self-contained — no CDN or external CSS/JS."""
+        report = {"research_mode": "deep", "title": "Test"}
+        html = report_to_html(report)
+        assert "cdn." not in html.lower()
+        assert "<link" not in html  # no external stylesheet links
+        assert "src=\"http" not in html  # no external scripts (thumbnail is img src, not script)
+
+    def test_empty_report_doesnt_crash(self):
+        report = {"research_mode": "deep"}
+        html = report_to_html(report)
+        assert "<!DOCTYPE html>" in html
+        assert "</html>" in html
+
+    def test_escapes_xss_in_title(self):
+        report = {
+            "research_mode": "deep",
+            "title": "<script>alert('xss')</script>",
+        }
+        html = report_to_html(report)
+        assert "<script>alert" not in html
+        assert "&lt;script&gt;" in html
