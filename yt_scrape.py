@@ -1330,7 +1330,662 @@ DEEP_RESEARCH_SCHEMA = {
 }
 
 
-# ---------------------------------------------------------------- CLAIM EXTRACTION
+# ---------------------------------------------------------------- TIMESTAMPED SEGMENT PIPELINE
+
+@dataclass
+class TimestampedSentence:
+    """A sentence extracted from a transcript segment, preserving timing."""
+    text: str
+    start: float       # seconds from video start
+    end: float         # seconds from video start
+    segment_index: int # which segment this came from
+
+    @property
+    def timestamp_str(self) -> str:
+        """Human-readable timestamp like '3:42'."""
+        s = int(self.start)
+        if s >= 3600:
+            return f"{s // 3600}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+        return f"{s // 60}:{s % 60:02d}"
+
+    @property
+    def youtube_url(self) -> str:
+        """YouTube URL that jumps to this timestamp."""
+        return f"&t={int(self.start)}s"
+
+    def to_dict(self) -> dict:
+        return {
+            "text": self.text,
+            "start": round(self.start, 2),
+            "end": round(self.end, 2),
+            "timestamp": self.timestamp_str,
+        }
+
+
+# ---------------------------------------------------------------- SENTENCE SEGMENTATION
+
+# Common abbreviations that should NOT trigger sentence breaks
+_ABBREVIATIONS = frozenset({
+    "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st", "rev", "hon",
+    "vs", "etc", "inc", "ltd", "co", "corp", "dept", "est", "approx",
+    "min", "max", "avg", "fig", "no", "vol", "pp", "ch", "sec", "al",
+    "u.s", "u.k", "e.g", "i.e", "a.m", "p.m", "b.c", "a.d",
+})
+
+# Title abbreviations — never split even when followed by uppercase (Dr. Smith)
+_TITLE_ABBREVIATIONS = frozenset({
+    "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st", "rev", "hon",
+})
+
+# Single-letter initials like "A." or "J." — don't break after these
+_RE_INITIAL = re.compile(r"^\b[A-Z]\.$")
+
+
+def split_sentences(text: str) -> list[str]:
+    """Split text into sentences, handling abbreviations and decimals.
+
+    Handles:
+    - Abbreviations (Dr., Mr., U.S., etc.)
+    - Decimal numbers (3.14, 0.5)
+    - Initials (A. J. Smith)
+    - Multiple punctuation (.!? combined)
+    - Newlines as sentence boundaries (paragraph breaks)
+    """
+    if not text:
+        return []
+
+    sentences: list[str] = []
+    current: list[str] = []
+    i = 0
+    n = len(text)
+
+    while i < n:
+        ch = text[i]
+        current.append(ch)
+
+        if ch in ".!?":
+            # Look ahead to decide if this is a real sentence boundary
+            # Check if next char is a space or end (real boundary candidate)
+            j = i + 1
+            while j < n and text[j] in " \t":
+                j += 1
+
+            if j >= n:
+                # End of text — real boundary
+                sentences.append("".join(current).strip())
+                current = []
+                i = j
+                continue
+
+            next_ch = text[j]
+
+            # Newline = always a boundary
+            if text[i + 1:i + 2] == "\n":
+                sentences.append("".join(current).strip())
+                current = []
+                i = i + 1
+                continue
+
+            # Check for abbreviation: word before the period
+            if ch == ".":
+                # Get the word before this period
+                word_start = i - 1
+                while word_start >= 0 and text[word_start].isalpha():
+                    word_start -= 1
+                word = text[word_start + 1:i].lower()
+
+                if word in _ABBREVIATIONS:
+                    # Title abbreviations (Dr., Mr.) — never split
+                    if word in _TITLE_ABBREVIATIONS:
+                        i += 1
+                        continue
+                    # Other abbreviations — split if next word starts uppercase
+                    if j < n and text[j].isupper():
+                        sentences.append("".join(current).strip())
+                        current = []
+                        i = j
+                        continue
+                    i += 1
+                    continue
+
+                # Single capital letter (initial): "A." "J."
+                if len(word) == 1 and word.isalpha():
+                    i += 1
+                    continue
+
+                # Decimal: digit before and digit after the period
+                if i > 0 and text[i - 1].isdigit():
+                    if j < n and text[j].isdigit():
+                        i += 1
+                        continue
+
+                # Ellipsis: "..."
+                if text[i + 1:i + 3] == "..":
+                    i += 1
+                    continue
+
+            # Multiple punctuation: "!!!" "?!?" — consume all
+            while j < n and text[j] in ".!?":
+                current.append(text[j])
+                i = j
+                j = i + 1
+
+            # Next word starts with lowercase or is a common continuation
+            if next_ch.islower() and ch != "!":
+                # Likely continuation, not a new sentence
+                # But "!" almost always ends a sentence
+                i += 1
+                continue
+
+            # Real sentence boundary
+            sentences.append("".join(current).strip())
+            current = []
+            i = j
+            continue
+
+        if ch == "\n":
+            # Newline = sentence boundary
+            sentences.append("".join(current).strip())
+            current = []
+            i += 1
+            continue
+
+        i += 1
+
+    # Don't forget trailing text
+    if current:
+        sentences.append("".join(current).strip())
+
+    # Filter empty and very short fragments
+    return [s for s in sentences if len(s) > 2]
+
+
+def segments_to_sentences(segments: list[TranscriptSegment]) -> list[TimestampedSentence]:
+    """Convert transcript segments into timestamped sentences.
+
+    Each sentence inherits the timestamp of the segment it came from.
+    If a segment contains multiple sentences, they all share that segment's start time.
+    """
+    result: list[TimestampedSentence] = []
+    for idx, seg in enumerate(segments):
+        if not seg.text.strip():
+            continue
+        sents = split_sentences(seg.text)
+        for sent in sents:
+            if len(sent) < 3:
+                continue
+            result.append(TimestampedSentence(
+                text=sent,
+                start=seg.start,
+                end=seg.end,
+                segment_index=idx,
+            ))
+    return result
+
+
+# ---------------------------------------------------------------- ENTITY EXTRACTION
+
+# --- People ---
+# Pattern 1: Title + Name (Dr. Jordan Peterson, Professor X)
+_RE_PERSON_TITLE = re.compile(
+    r"\b(?:Dr\.?|Mr\.?|Mrs\.?|Ms\.?|Professor|Prof\.?|Sir|Lord|Lady|President|"
+    r"CEO|CTO|Author|Researcher|Scientist|Doctor)\s+"
+    r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3})",
+)
+# Pattern 2: "according to X", "says X", "X claims"
+_RE_PERSON_ATTR = re.compile(
+    r"(?:according\s+to|said\s+by|stated\s+by|claims?\s+by|"
+    r"as\s+\w+\s+said|per)\s+"
+    r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3})",
+)
+# Pattern 3: First Last (two capitalized words, not common phrases)
+_RE_PERSON_NAME = re.compile(
+    r"\b([A-Z][a-z]{2,}\s+[A-Z][a-z]{2,})\b"
+)
+# Common false positives to filter
+_PERSON_BLACKLIST = frozenset({
+    "The Best", "The Most", "The Only", "The First", "The Last",
+    "New York", "San Francisco", "Los Angeles", "United States",
+    "Wall Street", "Main Street", "High Street", "Central Park",
+    "Bollinger Bands", "Moving Average", "Standard Deviation",
+    "Relative Strength", "Fibonacci Retracement", "Support Resistance",
+    "Bull Market", "Bear Market", "Bull Trap", "Bear Trap",
+    "Candle Stick", "Candlestick Pattern", "Day Trading",
+    "Swing Trading", "Position Trading", "Trend Line",
+    "Stop Loss", "Take Profit", "Risk Reward",
+    "Real Time", "Long Term", "Short Term", "Mid Term",
+    "YouTube Channel", "Social Media", "Web Site",
+    "Thank You", "Good Morning", "Good Evening", "Good Night",
+    "White House", "Red Sea", "Black Sea",
+})
+
+# --- Organizations ---
+_RE_ORG_SUFFIX = re.compile(
+    r"\b([A-Z][A-Za-z]*(?:\s+[A-Z][A-Za-z]*){0,4})\s+"
+    r"(?:Inc\.?|LLC|Ltd\.?|Corp\.?|Corporation|Company|Co\.?|"
+    r"University|Institute|Foundation|Association|"
+    r"Bank|Group|Holdings|Partners|Capital|Management)\b",
+)
+_RE_ORG_KNOWN = re.compile(
+    r"\b(?:Federal\s+Reserve|Wall\s+Street|NASDAQ|NYSE|S&P\s*500|"
+    r"SEC|FTC|FDA|CDC|WHO|NASA|MIT|Harvard|Stanford|Oxford|Cambridge|"
+    r"Google|Apple|Microsoft|Amazon|Meta|Facebook|Netflix|Tesla|"
+    r"OpenAI|Anthropic|DeepMind|Goldman\s+Sachs|JPMorgan|BlackRock|"
+    r"Vanguard|Fidelity|Berkshire\s+Hathaway)\b",
+)
+
+# --- Tools / Software / Platforms ---
+_RE_TOOLS = re.compile(
+    r"\b(?:TradingView|MetaTrader|MT4|MT5|ThinkOrSwim|NinjaTrader|"
+    r"eSignal|StockCharts|Finviz|Yahoo\s+Finance|Bloomberg|Reuters|"
+    r"Coinbase|Binance|Kraken|Robinhood|Wealthfront|Betterment|"
+    r"Excel|Google\s+Sheets|Python|R\s+Studio|Jupyter|"
+    r"ChatGPT|Claude|Gemini|Copilot|Midjourney|Stable\s+Diffusion|"
+    r"Notion|Obsidian|Roam|Linear|GitHub|GitLab|Bitbucket|"
+    r"Photoshop|Illustrator|Figma|Sketch|After\s+Effects|Premiere)\b",
+)
+
+# --- Financial / Technical Metrics ---
+_RE_METRICS_FINANCIAL = re.compile(
+    r"\b(?:P\/E\s+ratio|price[- ]to[- ]earnings|market\s+cap|"
+    r"earnings\s+per\s+share|EPS|dividend\s+yield|"
+    r"alpha|beta|Sharpe\s+ratio|Sortino\s+ratio|"
+    r"ROI|ROE|ROA|ROIC|EBITDA|gross\s+margin|net\s+margin|"
+    r"debt[- ]to[- ]equity|current\s+ratio|quick\s+ratio)\b",
+    re.I,
+)
+_RE_METRICS_TRADING = re.compile(
+    r"\b(?:RSI|MACD|Bollinger\s+Bands?|moving\s+average|MA|EMA|SMA|WMA|"
+    r"stochastic|Stoch|ATR|ADX|CCI|Williams\s+%R|OBV|"
+    r"Fibonacci|Fib|pivot\s+points?|support\s+level|resistance\s+level|"
+    r"stop\s+loss|take\s+profit|position\s+sizing|risk[- ]reward|"
+    r"drawdown|max\s+drawdown|backtest|forward\s+test|"
+    r"win\s+rate|loss\s+rate|profit\s+factor|expectancy|"
+    r"Kelly\s+criterion|Martingale|DCA|dollar[- ]cost\s+averaging)\b",
+    re.I,
+)
+_RE_METRICS_HEALTH = re.compile(
+    r"\b(?:BMI|blood\s+pressure|heart\s+rate|cholesterol|LDL|HDL|triglycerides|"
+    r"A1C|glucose|insulin|cortisol|testosterone|estrogen|"
+    r"VO2\s+max|resting\s+heart\s+rate|sleep\s+quality)\b",
+    re.I,
+)
+
+# --- Concepts / Topics (signal words that indicate topic areas) ---
+_RE_CONCEPTS = re.compile(
+    r"\b(?:inflation|deflation|stagflation|recession|depression|"
+    r"supply\s+chain|monetary\s+policy|fiscal\s+policy|quantitative\s+easing|"
+    r"interest\s+rate|yield\s+curve|bond\s+market|stock\s+market|"
+    r"crypto(?:currency)?|blockchain|DeFi|NFT|Web3|"
+    r"machine\s+learning|deep\s+learning|neural\s+network|"
+    r"artificial\s+intelligence|AI|AGI|transformer|LLM|"
+    r"intermittent\s+fasting|keto|paleo|vegan|Mediterranean\s+diet|"
+    r"high[- ]intensity|HIIT|strength\s+training|cardio|"
+    r"meditation|mindfulness|gratitude|stoicism)\b",
+    re.I,
+)
+
+
+def extract_entities(text: str) -> dict:
+    """Extract named entities from text.
+
+    Returns a dict with:
+    - people: list of {name, context} — people mentioned
+    - organizations: list of {name, context}
+    - tools: list of {name, context} — software/platforms
+    - metrics: list of {name, type, context} — financial/trading/health metrics
+    - concepts: list of {name, context} — topic concepts
+
+    Each "context" is the sentence containing the entity.
+    """
+    sentences = split_sentences(text)
+    sentence_map: list[tuple[str, int, int]] = []  # (sentence, start, end)
+    pos = 0
+    for s in sentences:
+        idx = text.find(s, pos)
+        if idx == -1:
+            pos += len(s)
+            continue
+        sentence_map.append((s, idx, idx + len(s)))
+        pos = idx + len(s)
+
+    def _find_context(entity: str, entity_pos: int) -> str:
+        """Find the sentence containing this entity position."""
+        for sent, start, end in sentence_map:
+            if start <= entity_pos < end:
+                return sent
+        # Fallback: find by text search
+        for sent, start, end in sentence_map:
+            if entity.lower() in sent.lower():
+                return sent
+        return ""
+
+    def _dedup(items: list[dict], key: str = "name") -> list[dict]:
+        """Deduplicate by name, preserving first occurrence."""
+        seen: set[str] = set()
+        result: list[dict] = []
+        for item in items:
+            name_lower = item[key].lower().strip()
+            if name_lower not in seen:
+                seen.add(name_lower)
+                result.append(item)
+        return result
+
+    people: list[dict] = []
+    organizations: list[dict] = []
+    tools: list[dict] = []
+    metrics: list[dict] = []
+    concepts: list[dict] = []
+
+    # --- People ---
+    for pattern in [_RE_PERSON_TITLE, _RE_PERSON_ATTR]:
+        for m in pattern.finditer(text):
+            name = m.group(1).strip()
+            if name.split()[0].lower() in {"the", "a", "an"}:
+                continue
+            if name in _PERSON_BLACKLIST:
+                continue
+            ctx = _find_context(name, m.start(1))
+            people.append({"name": name, "context": ctx})
+
+    # Pattern 3: Two-capitalized-words (filter aggressively)
+    for m in _RE_PERSON_NAME.finditer(text):
+        name = m.group(1).strip()
+        if name in _PERSON_BLACKLIST:
+            continue
+        # Skip if both words are common nouns
+        words = name.split()
+        if any(w.lower() in {"the", "best", "most", "only", "first", "last",
+                             "new", "old", "good", "bad", "big", "small",
+                             "high", "low", "long", "short", "bull", "bear",
+                             "candle", "candlestick", "moving", "average",
+                             "standard", "deviation", "relative", "strength",
+                             "support", "resistance", "stop", "loss", "take",
+                             "profit", "risk", "reward", "day", "swing",
+                             "position", "trend", "line", "white", "black",
+                             "red", "green", "blue", "thank", "good"} for w in words):
+            continue
+        ctx = _find_context(name, m.start(1))
+        # Only add if not already captured by title/attr patterns
+        if not any(p["name"].lower() == name.lower() for p in people):
+            people.append({"name": name, "context": ctx})
+
+    # --- Organizations ---
+    for m in _RE_ORG_SUFFIX.finditer(text):
+        name = (m.group(1) + " " + text[m.end(1):m.end()].strip()).strip()
+        ctx = _find_context(name, m.start())
+        organizations.append({"name": name, "context": ctx})
+
+    for m in _RE_ORG_KNOWN.finditer(text):
+        name = m.group()
+        ctx = _find_context(name, m.start())
+        organizations.append({"name": name, "context": ctx})
+
+    # --- Tools ---
+    for m in _RE_TOOLS.finditer(text):
+        name = m.group()
+        ctx = _find_context(name, m.start())
+        tools.append({"name": name, "context": ctx})
+
+    # --- Metrics ---
+    for m in _RE_METRICS_FINANCIAL.finditer(text):
+        name = m.group()
+        ctx = _find_context(name, m.start())
+        metrics.append({"name": name, "type": "financial", "context": ctx})
+
+    for m in _RE_METRICS_TRADING.finditer(text):
+        name = m.group()
+        ctx = _find_context(name, m.start())
+        metrics.append({"name": name, "type": "trading", "context": ctx})
+
+    for m in _RE_METRICS_HEALTH.finditer(text):
+        name = m.group()
+        ctx = _find_context(name, m.start())
+        metrics.append({"name": name, "type": "health", "context": ctx})
+
+    # --- Concepts ---
+    for m in _RE_CONCEPTS.finditer(text):
+        name = m.group()
+        ctx = _find_context(name, m.start())
+        concepts.append({"name": name, "context": ctx})
+
+    return {
+        "people": _dedup(people),
+        "organizations": _dedup(organizations),
+        "tools": _dedup(tools),
+        "metrics": _dedup(metrics),
+        "concepts": _dedup(concepts),
+    }
+
+
+# ---------------------------------------------------------------- CLAIM ENRICHMENT
+
+# Negation words that flip a claim's polarity
+_NEGATION_WORDS = frozenset({
+    "not", "no", "never", "none", "nobody", "nothing", "nowhere",
+    "neither", "nor", "cannot", "cant", "wont", "doesnt", "dont",
+    "didnt", "isnt", "arent", "wasnt", "werent", "hasnt", "havent",
+    "hadnt", "shouldnt", "wouldnt", "couldnt",
+})
+
+# Claim strength modifiers
+_STRENGTH_HIGH = frozenset({
+    "proven", "demonstrated", "established", "confirmed", "verified",
+    "definitively", "conclusively", "undoubtedly", "certainly",
+    "always", "never", "100%", "guaranteed", "fact", "truth",
+})
+_STRENGTH_MODERATE = frozenset({
+    "studies", "research", "evidence", "data", "shown", "suggests",
+    "indicates", "likely", "probably", "usually", "typically",
+    "often", "generally", "tends", "appears",
+})
+_STRENGTH_LOW = frozenset({
+    "might", "could", "may", "possibly", "perhaps", "maybe",
+    "seems", "feels", "believe", "think", "guess", "suppose",
+    "arguably", "debatably", "allegedly", "supposedly",
+})
+
+
+def _detect_negation(sentence: str) -> bool:
+    """Check if a sentence contains negation within 3 words before a claim keyword."""
+    words = sentence.lower().split()
+    for i, word in enumerate(words):
+        # Strip punctuation for comparison
+        clean = word.strip(".,!?;:\"'()[]{}")
+        if clean in _NEGATION_WORDS:
+            return True
+    return False
+
+
+def _assess_strength(sentence: str) -> str:
+    """Assess the strength of a claim: high, moderate, low, or opinion."""
+    lower = sentence.lower()
+    words = set(re.findall(r"\b\w+\b", lower))
+
+    # Opinion: first-person + belief verb (checked first — trumps strength)
+    opinion_markers = {"i", "me", "my", "we", "our", "feel", "believe", "think", "guess"}
+    opinion_verbs = {"feel", "believe", "think", "guess", "suppose"}
+    if words & opinion_verbs and words & {"i", "we"}:
+        return "opinion"
+
+    high_hits = words & _STRENGTH_HIGH
+    if high_hits:
+        return "high"
+
+    low_hits = words & _STRENGTH_LOW
+    moderate_hits = words & _STRENGTH_MODERATE
+
+    if moderate_hits and not low_hits:
+        return "moderate"
+    if low_hits and not moderate_hits:
+        return "low"
+    if low_hits and moderate_hits:
+        return "low"  # hedging language weakens
+
+    return "moderate"  # default: bare assertion
+
+
+def _extract_subject(sentence: str, claim_type: str, matched: str) -> str:
+    """Try to extract the subject of a claim (what the claim is about).
+
+    For "RSI causes false signals" → subject is "RSI"
+    For "studies show that..." → subject is the topic after "that"
+    """
+    lower = sentence.lower()
+
+    # For causal claims, look for "X causes/leads to Y" pattern
+    if claim_type == "causal":
+        # Try to find the subject before the causal keyword
+        for kw in ["causes", "leads to", "results in", "prevents", "cures",
+                    "fixes", "solves", "creates", "produces", "generates"]:
+            idx = lower.find(kw)
+            if idx > 0:
+                subject = sentence[:idx].strip().rstrip(",.")
+                # Take last 1-3 words of subject (the noun phrase)
+                words = subject.split()
+                if len(words) > 4:
+                    return " ".join(words[-3:])
+                return subject
+
+    # For authority claims, look for the topic after "that" or "show"
+    if claim_type == "authority":
+        for kw in ["that", "show", "shows", "prove", "proves", "indicate", "indicates"]:
+            idx = lower.find(kw)
+            if idx > 0:
+                after = sentence[idx + len(kw):].strip().lstrip(",.")
+                words = after.split()
+                if words:
+                    return " ".join(words[:4])
+
+    # For comparative claims, look for what's being compared
+    if claim_type == "comparative":
+        for kw in ["better than", "worse than", "more effective than",
+                    "superior to", "inferior to", "outperforms"]:
+            idx = lower.find(kw)
+            if idx > 0:
+                subject = sentence[:idx].strip().rstrip(",.")
+                words = subject.split()
+                if len(words) > 3:
+                    return " ".join(words[-2:])
+                return subject
+
+    # For win_rate/statistical, look for the metric name
+    if claim_type in ("win_rate", "statistical"):
+        # Find words near the percentage/rate
+        idx = lower.find(matched.lower())
+        if idx > 0:
+            before = sentence[:idx].strip().rstrip(",.:;")
+            words = before.split()
+            if words:
+                return " ".join(words[-3:])
+
+    # For financial claims, the subject is usually right before the dollar amount
+    if claim_type == "financial":
+        idx = lower.find(matched.lower())
+        if idx > 0:
+            before = sentence[:idx].strip().rstrip(",.:;")
+            words = before.split()
+            if words:
+                return " ".join(words[-3:])
+
+    # For superlative claims, look for what's "the best/worst"
+    if claim_type == "superlative":
+        for kw in ["the best", "the worst", "the only", "the most", "the fastest"]:
+            idx = lower.find(kw)
+            if idx > 0:
+                before = sentence[:idx].strip().rstrip(",.:;")
+                words = before.split()
+                if words:
+                    return " ".join(words[-2:])
+
+    return ""
+
+
+def enrich_claim(
+    claim: dict,
+    sentence: str,
+    timestamp: TimestampedSentence | None = None,
+) -> dict:
+    """Enrich a raw claim dict with additional metadata.
+
+    Adds:
+    - subject: what the claim is about
+    - negated: whether the claim is negated
+    - strength: high | moderate | low | opinion
+    - timestamp: {start, end, timestamp_str} if available
+    - youtube_url: clickable URL to the moment in the video
+    """
+    claim_type = claim.get("claim_types", ["unknown"])[0] if isinstance(claim.get("claim_types"), list) else "unknown"
+    matched = claim.get("matched_pattern", "")
+
+    enriched = dict(claim)  # immutable: copy, don't mutate original
+    enriched["subject"] = _extract_subject(sentence, claim_type, matched)
+    enriched["negated"] = _detect_negation(sentence)
+    enriched["strength"] = _assess_strength(sentence)
+
+    if timestamp:
+        enriched["timestamp"] = timestamp.to_dict()
+        enriched["youtube_url"] = f"https://youtube.com/watch?v={{VIDEO_ID}}{timestamp.youtube_url}"
+
+    return enriched
+
+
+def extract_claims_enriched(
+    text: str,
+    sentences: list[TimestampedSentence] | None = None,
+) -> list[dict]:
+    """Extract and enrich claims from text, with optional timestamp mapping.
+
+    This is the enhanced version of extract_claims() that adds:
+    - Subject extraction (what the claim is about)
+    - Negation detection
+    - Strength assessment (high/moderate/low/opinion)
+    - Timestamp mapping (if sentences provided)
+
+    Args:
+        text: The transcript text
+        sentences: Pre-split timestamped sentences. If None, uses plain text.
+
+    Returns:
+        List of enriched claim dicts.
+    """
+    # Get raw claims using existing extraction
+    raw_claims = extract_claims(text)
+
+    if not sentences:
+        # No timestamps — just enrich without timing
+        return [enrich_claim(c, c.get("sentence", "")) for c in raw_claims]
+
+    # Build a position → timestamp mapping
+    # For each raw claim, find which timestamped sentence it belongs to
+    enriched: list[dict] = []
+    for claim in raw_claims:
+        claim_sentence = claim.get("sentence", "")
+        claim_offset = claim.get("char_offset", 0)
+
+        # Find the matching timestamped sentence
+        best_ts = None
+        best_score = -1
+
+        for ts_sent in sentences:
+            # Score by text overlap
+            if claim_sentence.strip() == ts_sent.text.strip():
+                best_ts = ts_sent
+                break
+            # Partial overlap: check if claim sentence contains the ts sentence
+            # or vice versa
+            if ts_sent.text in claim_sentence or claim_sentence in ts_sent.text:
+                overlap = min(len(ts_sent.text), len(claim_sentence))
+                if overlap > best_score:
+                    best_ts = ts_sent
+                    best_score = overlap
+
+        enriched.append(enrich_claim(claim, claim_sentence, best_ts))
+
+    return enriched
+
+
+# ---------------------------------------------------------------- CLAIM EXTRACTION (ORIGINAL)
 
 # Regex patterns for pre-identifying factual claims in transcript text.
 # These give Devin a starting list — Devin will add more during reading.
@@ -1568,7 +2223,7 @@ def prepare_deep_research(
         }
 
     # Step 2: Clean transcript
-    print(f"[2/3] Cleaning transcript + extracting claims...", file=sys.stderr)
+    print(f"[2/4] Cleaning transcript + extracting claims...", file=sys.stderr)
     raw_path = Path(result.transcript_path)
     raw_text = raw_path.read_text(encoding="utf-8", errors="replace")
     header_end = raw_text.find("=" * 20)
@@ -1584,8 +2239,19 @@ def prepare_deep_research(
     out.mkdir(parents=True, exist_ok=True)
     cleaned_path = _write_cleaned_transcript(result, cleaned_body, out)
 
+    # Re-parse the VTT to get timestamped segments (for claim timestamp mapping)
+    print(f"[3/4] Extracting entities and enriched claims...", file=sys.stderr)
+    segments: list[TranscriptSegment] = []
+    vtt_files = list(out.glob(f"{result.id}*.vtt"))
+    if vtt_files:
+        _, segments = parse_vtt(str(vtt_files[0]))
+
+    # Convert segments to timestamped sentences
+    ts_sentences: list[TimestampedSentence] = []
+    if segments:
+        ts_sentences = segments_to_sentences(segments)
+
     # Fetch metadata for description (VideoInfo doesn't carry it)
-    print(f"[3/3] Extracting claims and sources...", file=sys.stderr)
     description = ""
     try:
         meta = extract_metadata(url_or_id, cookies_file=cookies_file,
@@ -1595,8 +2261,13 @@ def prepare_deep_research(
     except Exception:
         pass
 
-    # Extract claims and sources from cleaned transcript + description
-    claims = extract_claims(cleaned_body)
+    # Extract enriched claims (with subject, negation, strength, timestamps)
+    claims = extract_claims_enriched(cleaned_body, ts_sentences)
+
+    # Extract entities (people, orgs, tools, metrics, concepts)
+    entities = extract_entities(cleaned_body)
+
+    # Extract sources from cleaned transcript + description
     sources = extract_sources(cleaned_body, description)
 
     # Build the research package
@@ -1621,19 +2292,30 @@ def prepare_deep_research(
             "cleaned_chars": cleaned_chars,
             "reduction_pct": round(reduction, 1),
             "paragraph_count": len(cleaned_body.split("\n\n")),
+            "has_timestamps": len(segments) > 0,
+            "segment_count": len(segments),
         },
         "extracted_claims": claims,
+        "extracted_entities": entities,
         "extracted_sources": sources,
         "claim_count": len(claims),
+        "entity_count": sum(len(v) if isinstance(v, list) else 0 for v in entities.values()),
         "source_count": sum(len(v) if isinstance(v, list) else 0 for v in sources.values()),
+        "timestamped_sentences": [s.to_dict() for s in ts_sentences] if ts_sentences else [],
         "schema": DEEP_RESEARCH_SCHEMA,
         "instructions": (
             "DEEP RESEARCH WORKFLOW — QUALITY OVER SPEED\n\n"
             "This is a comprehensive research brief, not a summary. Take as long as needed.\n\n"
             "Phase 2 — Devin executes the following:\n\n"
             "1. READ the cleaned transcript thoroughly.\n"
-            "2. REVIEW the extracted_claims list. ADD any claims you identify that regex missed "
-            "(implicit claims, contextual claims, nuanced assertions).\n"
+            "2. REVIEW the extracted_claims list. Each claim now includes:\n"
+            "   - subject: what the claim is about (when extractable)\n"
+            "   - negated: whether the claim is negated (NOT X causes Y)\n"
+            "   - strength: high | moderate | low | opinion\n"
+            "   - timestamp: when in the video this claim was made (if available)\n"
+            "   ADD any claims you identify that regex missed (implicit claims, contextual claims).\n"
+            "3. REVIEW the extracted_entities: people, organizations, tools, metrics, and concepts.\n"
+            "   Use these to guide your research — verify the people's credentials, the tools' claims, etc.\n"
             "3. PRIORITIZE claims for verification. Verify EVERY significant claim — do not cap the number. "
             "A claim is significant if it is: central to the argument, potentially harmful if false, "
             "verifiable, or controversial.\n"
@@ -2280,19 +2962,44 @@ def report_to_html(report: dict, output_path: str | Path | None = None) -> str:
             conf_bar = _confidence_bar(confidence)
             source_html = _format_source_list(sources)
 
-            # Timestamp link if we have video_id and quote
+            # Timestamp link — jump to exact moment if we have timestamp, else just video
             timestamp_html = ""
-            if video_id and quote:
-                timestamp_html = f'<a href="https://youtube.com/watch?v={video_id}" target="_blank" class="timestamp-link">▶ Watch on YouTube</a>'
+            if video_id:
+                claim_ts = c.get("timestamp", {})
+                ts_seconds = claim_ts.get("start") if isinstance(claim_ts, dict) else None
+                ts_label = claim_ts.get("timestamp", "") if isinstance(claim_ts, dict) else ""
+                if ts_seconds is not None:
+                    timestamp_html = f'<a href="https://youtube.com/watch?v={video_id}&t={int(ts_seconds)}s" target="_blank" class="timestamp-link">▶ Jump to {ts_label}</a>'
+                else:
+                    timestamp_html = f'<a href="https://youtube.com/watch?v={video_id}" target="_blank" class="timestamp-link">▶ Watch on YouTube</a>'
+
+            # Strength badge
+            strength = c.get("strength", "")
+            strength_badge = ""
+            if strength:
+                s_colors = {"high": "#22c55e", "moderate": "#eab308", "low": "#f59e0b", "opinion": "#94a3b8"}
+                s_color = s_colors.get(strength, "#94a3b8")
+                strength_badge = f'<span class="strength-badge" style="background:{s_color};color:#fff">{strength}</span>'
+
+            # Negation indicator
+            negated = c.get("negated", False)
+            negated_badge = '<span class="negated-badge" style="background:#ef4444;color:#fff">NEGATED</span>' if negated else ""
+
+            # Subject
+            subject = c.get("subject", "")
+            subject_html = f'<div class="claim-subject"><strong>Subject:</strong> {_escape(subject)}</div>' if subject else ""
 
             claim_cards.append(f'''
             <div class="claim-card" style="border-left:4px solid {border}">
                 <div class="claim-header">
                     <span class="verdict-badge" style="background:{bg};color:#fff">{label}</span>
+                    {strength_badge}
+                    {negated_badge}
                     <span class="claim-number">Claim {i}</span>
                 </div>
                 {f'<div class="claim-quote">"{_escape(quote)}"</div>' if quote else ''}
                 <div class="claim-text">{_escape(claim_text)}</div>
+                {subject_html}
                 {conf_bar}
                 {f'<div class="claim-evidence"><strong>Evidence:</strong> {_escape(evidence)}</div>' if evidence else ''}
                 {timestamp_html}
@@ -2713,7 +3420,10 @@ body {{
   font-size: 13px;
   font-weight: 600;
 }}
-.claim-number {{ color: var(--text-dim); font-size: 13px; }}
+.claim-number {{ color: var(--text-dim); font-size: 13px; margin-left: auto; }}
+.strength-badge {{ padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }}
+.negated-badge {{ padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }}
+.claim-subject {{ font-size: 14px; color: var(--text-dim); margin-bottom: 8px; padding: 6px 10px; background: var(--bg); border-radius: 6px; }}
 .claim-quote {{ font-style: italic; color: var(--text-dim); margin-bottom: 8px; padding-left: 12px; border-left: 3px solid var(--card-border); }}
 .claim-text {{ font-size: 16px; margin-bottom: 10px; }}
 .claim-evidence {{ font-size: 14px; color: var(--text-dim); margin-bottom: 10px; }}

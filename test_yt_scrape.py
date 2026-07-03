@@ -1224,3 +1224,372 @@ class TestReportToHTML:
         html = report_to_html(report)
         assert "<script>alert" not in html
         assert "&lt;script&gt;" in html
+
+
+# ---------------------------------------------------------------- SENTENCE SEGMENTATION
+
+from yt_scrape import (
+    split_sentences,
+    segments_to_sentences,
+    TranscriptSegment,
+    TimestampedSentence,
+)
+
+
+class TestSplitSentences:
+    def test_basic_split(self):
+        sents = split_sentences("Hello world. This is a test. Goodbye.")
+        assert len(sents) == 3
+        assert "Hello world" in sents[0]
+        assert "This is a test" in sents[1]
+
+    def test_handles_abbreviations(self):
+        sents = split_sentences("Dr. Smith said the strategy works. It is profitable.")
+        assert len(sents) == 2
+        assert "Dr. Smith said the strategy works" in sents[0]
+
+    def test_handles_mr_abbreviation(self):
+        sents = split_sentences("Mr. Jones trades options. He makes money.")
+        assert len(sents) == 2
+
+    def test_handles_decimals(self):
+        sents = split_sentences("The win rate is 86.5 percent. That is high.")
+        assert len(sents) == 2
+        assert "86.5" in sents[0]
+
+    def test_handles_us_abbreviation(self):
+        sents = split_sentences("The U.S. market is strong. Stocks are up.")
+        assert len(sents) == 2
+
+    def test_handles_etc_abbreviation(self):
+        sents = split_sentences("Use RSI, MACD, etc. These are indicators.")
+        assert len(sents) == 2
+
+    def test_handles_initials(self):
+        sents = split_sentences("A. J. Smith wrote the book. It is good.")
+        assert len(sents) == 2
+
+    def test_question_marks(self):
+        sents = split_sentences("Is this true? Yes it is. Done.")
+        assert len(sents) == 3
+
+    def test_exclamation_marks(self):
+        sents = split_sentences("Wow! This works. Great.")
+        assert len(sents) == 3
+
+    def test_multiple_punctuation(self):
+        sents = split_sentences("Really?! That is amazing. Wow.")
+        assert len(sents) == 3
+
+    def test_newline_as_boundary(self):
+        sents = split_sentences("First sentence.\nSecond sentence.")
+        assert len(sents) == 2
+
+    def test_empty_string(self):
+        assert split_sentences("") == []
+
+    def test_single_sentence(self):
+        sents = split_sentences("Just one sentence here.")
+        assert len(sents) == 1
+
+    def test_no_ending_punctuation(self):
+        sents = split_sentences("This has no period")
+        assert len(sents) == 1
+
+    def test_ellipsis_not_split(self):
+        sents = split_sentences("Wait... let me think. OK done.")
+        # "Wait..." should be one sentence, "let me think" another, "OK done" third
+        assert len(sents) >= 2
+
+    def test_lowercase_continuation(self):
+        # "i.e." should not split
+        sents = split_sentences("Use the strategy, i.e. the RSI method. It works.")
+        assert len(sents) == 2
+
+
+class TestSegmentsToSentences:
+    def test_basic_conversion(self):
+        segments = [
+            TranscriptSegment(text="Hello world. This is a test.", start=0.0, end=5.0),
+            TranscriptSegment(text="Second segment here.", start=5.0, end=10.0),
+        ]
+        sents = segments_to_sentences(segments)
+        assert len(sents) == 3
+        assert sents[0].text == "Hello world."
+        assert sents[0].start == 0.0
+        assert sents[1].text == "This is a test."
+        assert sents[1].start == 0.0  # same segment
+        assert sents[2].text == "Second segment here."
+        assert sents[2].start == 5.0
+
+    def test_timestamp_str_format(self):
+        seg = TranscriptSegment(text="Test.", start=222.0, end=225.0)
+        sents = segments_to_sentences([seg])
+        assert sents[0].timestamp_str == "3:42"
+
+    def test_timestamp_str_with_hours(self):
+        seg = TranscriptSegment(text="Test.", start=3725.0, end=3730.0)
+        sents = segments_to_sentences([seg])
+        assert sents[0].timestamp_str == "1:02:05"
+
+    def test_youtube_url(self):
+        seg = TranscriptSegment(text="Test.", start=60.0, end=65.0)
+        sents = segments_to_sentences([seg])
+        assert "t=60s" in sents[0].youtube_url
+
+    def test_empty_segments(self):
+        assert segments_to_sentences([]) == []
+
+    def test_empty_text_segment(self):
+        seg = TranscriptSegment(text="", start=0.0, end=5.0)
+        assert segments_to_sentences([seg]) == []
+
+    def test_to_dict(self):
+        seg = TranscriptSegment(text="Test sentence.", start=10.5, end=15.0)
+        sents = segments_to_sentences([seg])
+        d = sents[0].to_dict()
+        assert d["text"] == "Test sentence."
+        assert d["start"] == 10.5
+        assert d["timestamp"] == "0:10"
+
+
+# ---------------------------------------------------------------- ENTITY EXTRACTION
+
+from yt_scrape import extract_entities
+
+
+class TestExtractEntities:
+    def test_extracts_people_with_title(self):
+        text = "Dr. Jordan Peterson said the strategy works."
+        entities = extract_entities(text)
+        assert any("Jordan Peterson" in p["name"] for p in entities["people"])
+
+    def test_extracts_people_with_attribution(self):
+        text = "According to Warren Buffett, the best strategy is value investing."
+        entities = extract_entities(text)
+        assert any("Warren Buffett" in p["name"] for p in entities["people"])
+
+    def test_filters_blacklist_names(self):
+        text = "The Best strategy is here. Bollinger Bands are great."
+        entities = extract_entities(text)
+        # "The Best" and "Bollinger Bands" should not be people
+        people_names = [p["name"] for p in entities["people"]]
+        assert "The Best" not in people_names
+        assert "Bollinger Bands" not in people_names
+
+    def test_extracts_organizations_with_suffix(self):
+        text = "Goldman Sachs Inc. released a report. Vanguard Group also commented."
+        entities = extract_entities(text)
+        org_names = [o["name"] for o in entities["organizations"]]
+        assert any("Goldman Sachs" in n for n in org_names)
+
+    def test_extracts_known_organizations(self):
+        text = "The Federal Reserve raised interest rates. NASA confirmed the data."
+        entities = extract_entities(text)
+        org_names = [o["name"] for o in entities["organizations"]]
+        assert "Federal Reserve" in org_names
+        assert "NASA" in org_names
+
+    def test_extracts_tools(self):
+        text = "I use TradingView for charting and MetaTrader for execution."
+        entities = extract_entities(text)
+        tool_names = [t["name"] for t in entities["tools"]]
+        assert "TradingView" in tool_names
+        assert "MetaTrader" in tool_names
+
+    def test_extracts_trading_metrics(self):
+        text = "The RSI is oversold. The MACD shows a crossover. Use Bollinger Bands."
+        entities = extract_entities(text)
+        metric_names = [m["name"] for m in entities["metrics"]]
+        assert "RSI" in metric_names
+        assert "MACD" in metric_names
+
+    def test_extracts_financial_metrics(self):
+        text = "The P/E ratio is high. Check the Sharpe ratio and alpha."
+        entities = extract_entities(text)
+        metric_names = [m["name"] for m in entities["metrics"]]
+        assert any("P/E" in m or "Sharpe" in m for m in metric_names)
+
+    def test_extracts_concepts(self):
+        text = "Inflation is rising. The Federal Reserve may use quantitative easing."
+        entities = extract_entities(text)
+        concept_names = [c["name"] for c in entities["concepts"]]
+        assert "inflation" in [c.lower() for c in concept_names]
+
+    def test_deduplication(self):
+        text = "Dr. Smith said X. Dr. Smith also said Y."
+        entities = extract_entities(text)
+        smiths = [p for p in entities["people"] if "Smith" in p["name"]]
+        assert len(smiths) == 1  # deduplicated
+
+    def test_empty_text(self):
+        entities = extract_entities("")
+        assert entities["people"] == []
+        assert entities["organizations"] == []
+
+    def test_includes_context(self):
+        text = "Dr. Jordan Peterson said the strategy works perfectly."
+        entities = extract_entities(text)
+        if entities["people"]:
+            assert entities["people"][0]["context"] != ""
+
+    def test_metric_types(self):
+        text = "Check the RSI and the P/E ratio."
+        entities = extract_entities(text)
+        types = {m["type"] for m in entities["metrics"]}
+        assert "trading" in types
+        assert "financial" in types
+
+
+# ---------------------------------------------------------------- CLAIM ENRICHMENT
+
+from yt_scrape import (
+    extract_claims_enriched,
+    enrich_claim,
+    _detect_negation,
+    _assess_strength,
+    _extract_subject,
+)
+
+
+class TestDetectNegation:
+    def test_detects_not(self):
+        assert _detect_negation("This does not work.") is True
+
+    def test_detects_never(self):
+        assert _detect_negation("This never works.") is True
+
+    def test_no_negation(self):
+        assert _detect_negation("This always works.") is False
+
+    def test_detects_cannot(self):
+        assert _detect_negation("You cannot win every trade.") is True
+
+    def test_detects_no(self):
+        assert _detect_negation("There is no evidence for this.") is True
+
+
+class TestAssessStrength:
+    def test_high_strength(self):
+        assert _assess_strength("This is proven to work 100% of the time.") == "high"
+
+    def test_moderate_strength(self):
+        assert _assess_strength("Studies show this usually works.") == "moderate"
+
+    def test_low_strength(self):
+        assert _assess_strength("This might work, perhaps.") == "low"
+
+    def test_opinion(self):
+        assert _assess_strength("I think this is good.") == "opinion"
+
+    def test_bare_assertion(self):
+        assert _assess_strength("The RSI is oversold.") == "moderate"
+
+
+class TestExtractSubject:
+    def test_causal_subject(self):
+        subject = _extract_subject("RSI causes false signals in trending markets.", "causal", "causes")
+        assert "RSI" in subject
+
+    def test_authority_subject(self):
+        subject = _extract_subject("Studies show that RSI is effective.", "authority", "studies show")
+        assert "RSI" in subject
+
+    def test_comparative_subject(self):
+        subject = _extract_subject("RSI is better than MACD for timing.", "comparative", "better than")
+        assert "RSI" in subject
+
+    def test_empty_sentence(self):
+        assert _extract_subject("", "causal", "") == ""
+
+
+class TestEnrichClaim:
+    def test_enriches_with_subject(self):
+        claim = {
+            "claim_types": ["causal"],
+            "matched_pattern": "causes",
+            "sentence": "RSI causes false signals.",
+            "char_offset": 0,
+        }
+        enriched = enrich_claim(claim, "RSI causes false signals.")
+        assert enriched["subject"] != ""
+        assert "causal" in enriched["claim_types"]
+
+    def test_enriches_with_negation(self):
+        claim = {
+            "claim_types": ["causal"],
+            "matched_pattern": "causes",
+            "sentence": "This does not cause cancer.",
+            "char_offset": 0,
+        }
+        enriched = enrich_claim(claim, "This does not cause cancer.")
+        assert enriched["negated"] is True
+
+    def test_enriches_with_strength(self):
+        claim = {
+            "claim_types": ["authority"],
+            "matched_pattern": "studies show",
+            "sentence": "Studies prove this works.",
+            "char_offset": 0,
+        }
+        enriched = enrich_claim(claim, "Studies prove this works.")
+        assert enriched["strength"] in ("high", "moderate", "low", "opinion")
+
+    def test_enriches_with_timestamp(self):
+        claim = {
+            "claim_types": ["statistical"],
+            "matched_pattern": "86%",
+            "sentence": "The win rate is 86%.",
+            "char_offset": 0,
+        }
+        ts = TimestampedSentence(text="The win rate is 86%.", start=120.0, end=125.0, segment_index=0)
+        enriched = enrich_claim(claim, "The win rate is 86%.", ts)
+        assert enriched["timestamp"]["timestamp"] == "2:00"
+        assert "youtube_url" in enriched
+
+    def test_no_timestamp(self):
+        claim = {
+            "claim_types": ["statistical"],
+            "matched_pattern": "86%",
+            "sentence": "The win rate is 86%.",
+            "char_offset": 0,
+        }
+        enriched = enrich_claim(claim, "The win rate is 86%.")
+        assert "timestamp" not in enriched
+
+    def test_does_not_mutate_original(self):
+        claim = {
+            "claim_types": ["causal"],
+            "matched_pattern": "causes",
+            "sentence": "RSI causes false signals.",
+            "char_offset": 0,
+        }
+        original = dict(claim)
+        enrich_claim(claim, "RSI causes false signals.")
+        assert claim == original  # original not mutated
+
+
+class TestExtractClaimsEnriched:
+    def test_enriches_all_claims(self):
+        text = "The win rate is 86%. Studies show RSI works. This costs $500."
+        claims = extract_claims_enriched(text)
+        assert len(claims) > 0
+        for c in claims:
+            assert "strength" in c
+            assert "negated" in c
+
+    def test_with_timestamps(self):
+        text = "The win rate is 86%."
+        ts = [TimestampedSentence(text="The win rate is 86%.", start=60.0, end=65.0, segment_index=0)]
+        claims = extract_claims_enriched(text, ts)
+        assert len(claims) > 0
+        assert claims[0]["timestamp"]["timestamp"] == "1:00"
+
+    def test_without_timestamps(self):
+        text = "The win rate is 86%."
+        claims = extract_claims_enriched(text)
+        assert len(claims) > 0
+        assert "timestamp" not in claims[0]
+
+    def test_empty_text(self):
+        assert extract_claims_enriched("") == []
