@@ -40,7 +40,7 @@ import shutil
 import sys
 import tempfile
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -81,11 +81,15 @@ class VideoInfo:
     transcript_source: str = ""  # "caption" | "whisper" | ""
     transcript_lang: str = ""
     timestamped_path: str = ""   # .tsv file path if --timestamps
+    segments: list = field(default_factory=list)  # TranscriptSegment list (not serialized by asdict if we exclude)
     error: str = ""
     error_type: str = ""         # "no_subtitles" | "private" | "age_restricted" | "region_locked" | "rate_limited" | "network" | "unknown"
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        # Don't serialize segments in the dict (they're internal)
+        d.pop("segments", None)
+        return d
 
 
 @dataclass
@@ -720,6 +724,8 @@ def extract_transcript(
                 info.transcript_chars = len(text)
                 info.has_transcript = True
                 _write_transcript(info, text, segments, out_dir, timestamps)
+                # Store segments for downstream use (deep-research)
+                info.segments = segments
                 # Clean up VTT
                 for f in vtt_files:
                     try:
@@ -1534,8 +1540,8 @@ _RE_PERSON_TITLE = re.compile(
 )
 # Pattern 2: "according to X", "says X", "X claims"
 _RE_PERSON_ATTR = re.compile(
-    r"(?:according\s+to|said\s+by|stated\s+by|claims?\s+by|"
-    r"as\s+\w+\s+said|per)\s+"
+    r"(?i:according\s+to|said\s+by|stated\s+by|claims?\s+by|"
+    r"as\s+\w+\s+said|\bper\b)\s+"
     r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3})",
 )
 # Pattern 3: First Last (two capitalized words, not common phrases)
@@ -1626,7 +1632,7 @@ _RE_CONCEPTS = re.compile(
 )
 
 
-def extract_entities(text: str) -> dict:
+def extract_entities(text: str, trust_punctuation: bool = True) -> dict:
     """Extract named entities from text.
 
     Returns a dict with:
@@ -1689,26 +1695,64 @@ def extract_entities(text: str) -> dict:
             people.append({"name": name, "context": ctx})
 
     # Pattern 3: Two-capitalized-words (filter aggressively)
-    for m in _RE_PERSON_NAME.finditer(text):
-        name = m.group(1).strip()
-        if name in _PERSON_BLACKLIST:
-            continue
-        # Skip if both words are common nouns
-        words = name.split()
-        if any(w.lower() in {"the", "best", "most", "only", "first", "last",
-                             "new", "old", "good", "bad", "big", "small",
-                             "high", "low", "long", "short", "bull", "bear",
-                             "candle", "candlestick", "moving", "average",
-                             "standard", "deviation", "relative", "strength",
-                             "support", "resistance", "stop", "loss", "take",
-                             "profit", "risk", "reward", "day", "swing",
-                             "position", "trend", "line", "white", "black",
-                             "red", "green", "blue", "thank", "good"} for w in words):
-            continue
-        ctx = _find_context(name, m.start(1))
-        # Only add if not already captured by title/attr patterns
-        if not any(p["name"].lower() == name.lower() for p in people):
-            people.append({"name": name, "context": ctx})
+    # Only use this pattern when we have proper sentence punctuation
+    # (auto-captions with no punctuation produce too many false positives)
+    # Count only real sentence-ending punctuation, NOT newlines
+    punct_count = text.count(".") + text.count("?") + text.count("!")
+    # When trust_punctuation=False (auto-captions with fake periods),
+    # require a higher threshold and check period-to-word ratio
+    if trust_punctuation:
+        has_sentence_punctuation = punct_count > 10
+    else:
+        # Real punctuation has ~1 period per 15-20 words
+        word_count = len(text.split())
+        period_ratio = punct_count / max(word_count, 1)
+        has_sentence_punctuation = punct_count > 10 and period_ratio < 0.1
+
+    if has_sentence_punctuation:
+        for m in _RE_PERSON_NAME.finditer(text):
+            name = m.group(1).strip()
+            if name in _PERSON_BLACKLIST:
+                continue
+            # Skip if both words are common nouns
+            words = name.split()
+            if any(w.lower() in {"the", "best", "most", "only", "first", "last",
+                                 "new", "old", "good", "bad", "big", "small",
+                                 "high", "low", "long", "short", "bull", "bear",
+                                 "candle", "candlestick", "moving", "average",
+                                 "standard", "deviation", "relative", "strength",
+                                 "support", "resistance", "stop", "loss", "take",
+                                 "profit", "risk", "reward", "day", "swing",
+                                 "position", "trend", "line", "white", "black",
+                                 "red", "green", "blue", "thank", "good",
+                                 # Additional common false positives from trading videos
+                                 "financial", "market", "advanced", "traders",
+                                 "divergence", "prints", "lower", "one",
+                                 "direction", "styles", "tab", "line", "this",
+                                 "finding", "going", "using", "unshaking",
+                                 "based", "back", "here", "way", "special",
+                                 "setting", "highs", "unshaking",
+                                 # Common false positives from science/educational videos
+                                 "with", "and", "for", "but", "or", "nor", "yet",
+                                 "so", "as", "at", "by", "in", "on", "to", "of",
+                                 "from", "into", "onto", "upon", "over", "under",
+                                 "addiction", "learning", "rethink", "reimagining",
+                                 "european", "nature", "science", "journal",
+                                 "central", "valley", "giardia", "roka",
+                                 "stanford", "harvard", "mit", "oxford",
+                                 "huberman", "lab", "school", "university",
+                                 "clinic", "hospital", "institute"} for w in words):
+                continue
+            # Skip if first word is a conjunction/preposition (false positive pattern)
+            first_word = words[0].lower()
+            if first_word in {"with", "and", "for", "but", "or", "so", "as", "at",
+                              "by", "in", "on", "to", "of", "from", "into", "onto",
+                              "upon", "over", "under", "yet", "nor"}:
+                continue
+            ctx = _find_context(name, m.start(1))
+            # Only add if not already captured by title/attr patterns
+            if not any(p["name"].lower() == name.lower() for p in people):
+                people.append({"name": name, "context": ctx})
 
     # --- Organizations ---
     for m in _RE_ORG_SUFFIX.finditer(text):
@@ -2340,9 +2384,9 @@ def extract_parameters(text: str) -> list[dict]:
 # === 4. CONDITION/ACTION RULE EXTRACTION ==================================
 
 _RE_IF_THEN = re.compile(
-    r"\b(?:if|when|whenever|once|after)\s+(.{5,120}?)\s*,?\s+"
-    r"(?:then?|you\s+(?:should|can|must|need\s+to)|just|simply)?\s*"
-    r"(.{5,120}?)(?:[.!?]|\n|$)",
+    r"\b(?:if|when|whenever|once|after)\s+(.{5,120}?)"
+    r"(?:,\s*|\s+,\s*|\s+(?:then?|you\s+(?:should|can|must|need\s+to)|just|simply)\s+)"
+    r"(.{3,120}?)(?:[.!?]|\n|$)",
     re.I,
 )
 _RE_WHEN_DO = re.compile(
@@ -2372,12 +2416,27 @@ def extract_rules(text: str) -> list[dict]:
         # Filter out non-rules (too short, no action verb)
         if len(condition) < 5 or len(action) < 3:
             continue
-        # Must have an action verb
+        # Must have a trading-relevant action verb
         action_verbs = {"buy", "sell", "enter", "exit", "set", "place", "use", "apply",
-                       "go", "switch", "move", "add", "remove", "check", "look", "do",
+                       "go", "switch", "move", "add", "remove", "check", "look",
                        "close", "open", "increase", "decrease", "raise", "lower",
-                       "stop", "start", "avoid", "wait", "confirm", "verify"}
+                       "stop", "start", "avoid", "wait", "confirm", "verify",
+                       "take", "put", "cut", "dump", "load", "unload"}
+        # Common non-trading phrases to filter out
+        non_rule_phrases = {"want to", "pause", "watch", "learn", "understand",
+                           "take a look", "look at", "see", "find", "notice",
+                           "know", "think", "remember", "forget"}
         action_lower = action.lower()
+        condition_lower = condition.lower()
+
+        # Skip if the action is just "look at" or "take a look" — not a rule
+        if any(nrp in action_lower for nrp in non_rule_phrases):
+            continue
+        # Skip if condition is too generic ("you guys", "you have", "we take")
+        if condition_lower in {"you guys", "you have", "we take", "you want",
+                               "we have", "you can", "we can", "you need",
+                               "we need", "you see", "we see"}:
+            continue
         if not any(av in action_lower for av in action_verbs):
             continue
 
@@ -2857,14 +2916,37 @@ def extract_definitions(text: str) -> list[dict]:
     definitions: list[dict] = []
     seen_terms: set[str] = set()
 
+    # Definitions require real sentence punctuation to work properly
+    # (auto-captions with fake periods produce too many false positives)
+    punct_count = text.count(".") + text.count("?") + text.count("!")
+    word_count = len(text.split())
+    if word_count > 0:
+        period_ratio = punct_count / word_count
+    else:
+        period_ratio = 0
+    # Real punctuation: ~1 period per 15-20 words. Fake: ~1 per 5-8.
+    # Only apply ratio check for longer texts (transcripts, not test sentences)
+    if word_count > 100:
+        has_real_punctuation = punct_count > 10 and period_ratio < 0.1
+    else:
+        has_real_punctuation = punct_count > 0
+    if not has_real_punctuation:
+        return []
+
     # Pattern 1: "X is a/an/the Y"
     for m in _RE_DEFINITION_IS.finditer(text):
         term = m.group(1).strip()
         definition = m.group(2).strip().rstrip(".")
         term_lower = term.lower()
 
-        # Filter out non-terms (pronouns, common words)
-        if term_lower in {"this", "that", "it", "here", "there", "what", "when", "why", "how"}:
+        # Filter out non-terms (pronouns, common words, phrases)
+        _NON_TERMS = {"this", "that", "it", "here", "there", "what", "when", "why", "how",
+                      "look at what", "words what", "works so this", "let's", "now",
+                      "so", "but", "and", "or", "the", "a", "an"}
+        if term_lower in _NON_TERMS:
+            continue
+        # Skip if term starts with a common non-term word
+        if any(term_lower.startswith(w + " ") for w in {"look", "let", "now", "so", "but", "and", "or", "what", "words", "works", "this", "that", "here", "there", "when", "why", "how", "good", "okay", "well"}):
             continue
         if len(term) < 3 or len(definition) < 10:
             continue
@@ -3142,8 +3224,7 @@ _RE_PAPER = re.compile(
 )
 # Person names after "according to", "says", "by"
 _RE_PERSON = re.compile(
-    r'(?:according\s+to|said\s+by|stated\s+by|by)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})',
-    re.I,
+    r'(?i:according\s+to|said\s+by|stated\s+by|\bby\b)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})',
 )
 
 
@@ -3229,14 +3310,36 @@ def prepare_deep_research(
     # Save cleaned transcript
     out = output_dir or OUTPUT_DIR
     out.mkdir(parents=True, exist_ok=True)
-    cleaned_path = _write_cleaned_transcript(result, cleaned_body, out)
 
-    # Re-parse the VTT to get timestamped segments (for claim timestamp mapping)
+    # Get segments from VideoInfo (stored during extract_transcript)
     print(f"[3/4] Extracting entities and enriched claims...", file=sys.stderr)
-    segments: list[TranscriptSegment] = []
-    vtt_files = list(out.glob(f"{result.id}*.vtt"))
-    if vtt_files:
-        _, segments = parse_vtt(str(vtt_files[0]))
+    segments: list[TranscriptSegment] = result.segments if hasattr(result, 'segments') else []
+
+    # If text has no punctuation (common in auto-captions), use segment
+    # boundaries to insert paragraph breaks before cleaning
+    period_count = raw_body.count(".") + raw_body.count("?") + raw_body.count("!")
+    auto_captioned = False  # track whether we added fake punctuation
+    if segments and period_count < 5 and len(raw_body) > 1000:
+        # Rebuild text with segment boundaries as paragraph breaks
+        seg_texts = [seg.text.strip() for seg in segments if seg.text.strip()]
+        # Group segments into paragraphs by timing gaps (2+ second pauses)
+        paragraphs: list[str] = []
+        current_para: list[str] = []
+        prev_end = 0.0
+        for seg, text in zip(segments, seg_texts):
+            if current_para and seg.start - prev_end > 2.0:
+                paragraphs.append(" ".join(current_para))
+                current_para = []
+            current_para.append(text)
+            prev_end = seg.end
+        if current_para:
+            paragraphs.append(" ".join(current_para))
+        raw_body = "\n\n".join(paragraphs)
+        # Re-clean with proper paragraph breaks
+        cleaned_body = clean_transcript_text(raw_body)
+        auto_captioned = True  # we added fake paragraph breaks
+
+    cleaned_path = _write_cleaned_transcript(result, cleaned_body, out)
 
     # Convert segments to timestamped sentences
     ts_sentences: list[TimestampedSentence] = []
@@ -3257,7 +3360,8 @@ def prepare_deep_research(
     claims = extract_claims_enriched(cleaned_body, ts_sentences)
 
     # Extract entities (people, orgs, tools, metrics, concepts)
-    entities = extract_entities(cleaned_body)
+    # When auto-captioned (fake punctuation), don't trust two-word capitalization
+    entities = extract_entities(cleaned_body, trust_punctuation=not auto_captioned)
 
     # Extract sources from cleaned transcript + description
     sources = extract_sources(cleaned_body, description)
