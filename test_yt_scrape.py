@@ -29,7 +29,11 @@ from yt_scrape import (
     _group_segments_by_pauses,
     restore_punctuation,
     extract_visual_content,
-    _analyze_frame_with_vision,
+    _extract_ocr_from_frame,
+    _extract_visual_claims_from_ocr,
+    _detect_llm_provider,
+    _find_tesseract,
+    _frames_are_similar,
 )
 
 
@@ -2072,47 +2076,53 @@ class TestRestorePunctuation:
         result, used_llm = restore_punctuation(text, [])
         assert result == text
 
-    def test_timing_fallback_adds_periods(self):
-        """Without LLM, timing-based fallback should add periods."""
+    def test_heuristic_adds_periods_without_llm(self):
+        """Word-count heuristic should add periods without any API call."""
         text = "this is the first sentence this is the second sentence" + " word" * 200
         segs = [
             TranscriptSegment(text="this is the first sentence", start=0.0, end=2.0),
             TranscriptSegment(text="this is the second sentence", start=3.0, end=5.0),
         ] + [TranscriptSegment(text=f"word{i}", start=5.0 + i, end=5.5 + i) for i in range(200)]
-        # Mock LLM to return None (no API key)
-        with patch("yt_scrape._restore_punctuation_llm", return_value=None):
-            result, used_llm = restore_punctuation(text, segs)
+        result, used_llm = restore_punctuation(text, segs)
         assert used_llm is False
-        assert "." in result  # timing fallback added periods
+        assert "." in result  # heuristic added periods
         assert result[0].isupper()  # capitalized
 
-    def test_llm_punctuation_used_when_available(self):
-        """When LLM returns text, it should be used."""
+    def test_llm_punctuation_used_when_requested(self):
+        """When use_llm=True and LLM returns text, it should be used."""
         text = "this is unpunctuated text " + "word " * 200
         segs = [TranscriptSegment(text="test", start=0.0, end=1.0)]
         llm_result = "This is unpunctuated text. " + "word. " * 200
         with patch("yt_scrape._restore_punctuation_llm", return_value=llm_result):
-            result, used_llm = restore_punctuation(text, segs)
+            result, used_llm = restore_punctuation(text, segs, use_llm=True)
         assert used_llm is True
         assert result == llm_result
 
-    def test_llm_failure_falls_back_to_timing(self):
-        """If LLM returns None, should fall back to timing."""
+    def test_llm_not_used_by_default(self):
+        """By default, LLM should NOT be called — heuristic only."""
+        text = "this is unpunctuated text " + "word " * 200
+        segs = [TranscriptSegment(text="test", start=0.0, end=1.0)]
+        with patch("yt_scrape._restore_punctuation_llm", return_value="SHOULD NOT BE USED"):
+            result, used_llm = restore_punctuation(text, segs)
+        assert used_llm is False
+        assert "SHOULD NOT BE USED" not in result
+
+    def test_llm_failure_falls_back_to_heuristic(self):
+        """If LLM returns None, should fall back to heuristic."""
         text = "first part second part" + " word" * 200
         segs = [
             TranscriptSegment(text="first part", start=0.0, end=2.0),
             TranscriptSegment(text="second part", start=3.0, end=5.0),
         ] + [TranscriptSegment(text=f"word{i}", start=5.0 + i, end=5.5 + i) for i in range(200)]
         with patch("yt_scrape._restore_punctuation_llm", return_value=None):
-            result, used_llm = restore_punctuation(text, segs)
+            result, used_llm = restore_punctuation(text, segs, use_llm=True)
         assert used_llm is False
         assert "." in result
 
     def test_no_segments_returns_original(self):
         """With no segments and no LLM, should return original text."""
         text = "no punctuation at all " + "word " * 200
-        with patch("yt_scrape._restore_punctuation_llm", return_value=None):
-            result, used_llm = restore_punctuation(text, [])
+        result, used_llm = restore_punctuation(text, [])
         assert result == text
         assert used_llm is False
 
@@ -2126,52 +2136,149 @@ class TestExtractVisualContent:
         assert result["frames_extracted"] == 0
         assert result["visual_claims"] == []
 
-    def test_no_api_key_returns_empty(self):
-        """When no OPENAI_API_KEY, should return empty results."""
+
+class TestFindTesseract:
+    def test_returns_string(self):
+        """Should return a string (path or empty)."""
+        result = _find_tesseract()
+        assert isinstance(result, str)
+
+
+class TestDetectLLMProvider:
+    def test_no_providers_returns_empty(self):
+        """When no API keys and no Ollama, should return empty string."""
         with patch.dict(os.environ, {}, clear=True):
-            result = extract_visual_content("test_id", Path("/tmp"), enable_visual=True)
-        assert result["enabled"] is True
-        assert result["video_downloaded"] is False
-        assert result["frames_analyzed"] == 0
+            with patch("urllib.request.urlopen", side_effect=Exception("no connection")):
+                result = _detect_llm_provider()
+        assert result == ""
+
+    def test_openai_detected(self):
+        """When OPENAI_API_KEY is set, should return 'openai'."""
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test_key"}, clear=True):
+            result = _detect_llm_provider()
+        assert result == "openai"
+
+    def test_anthropic_detected(self):
+        """When ANTHROPIC_API_KEY is set (but no OpenAI), should return 'anthropic'."""
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test_key"}, clear=True):
+            result = _detect_llm_provider()
+        assert result == "anthropic"
 
 
-class TestAnalyzeFrameWithVision:
-    def test_no_api_key_returns_none(self):
-        """When no API key, should return None."""
-        with patch.dict(os.environ, {}, clear=True):
-            result = _analyze_frame_with_vision(Path("/tmp/fake.png"), 0.0)
-        assert result is None
+class TestExtractOCRFromFrame:
+    def test_nonexistent_frame_returns_error(self):
+        """Should handle missing file gracefully."""
+        result = _extract_ocr_from_frame(Path("/nonexistent/frame.png"))
+        assert result["has_content"] is False
+        assert "error" in result or result["text"] == ""
 
-    def test_mocked_api_call(self):
-        """When API returns JSON, should parse it correctly."""
-        from pathlib import Path as P
-        import base64
-        # Create a fake image file
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-            f.write(b"fake_png_data")
-            frame_path = P(f.name)
+    def test_real_frame_extracts_text(self):
+        """Should extract text from an actual video frame if available."""
+        frame = Path(r"C:\Users\Entit\yt_transcripts\_frames\frame_0001_02m00s.png")
+        if not frame.exists():
+            pytest.skip("Test frame not available — run visual extraction first")
+        result = _extract_ocr_from_frame(frame)
+        # Should find some text (this frame has the table of contents)
+        assert isinstance(result["text"], str)
+        assert isinstance(result["words"], list)
+        assert isinstance(result["lines"], list)
 
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = json.dumps({
-            "on_screen_text": "RSI: 14",
-            "chart_patterns": "Bullish divergence",
-            "visual_content": "Trading chart",
-            "description": "Chart showing RSI indicator with bullish divergence",
-        })
 
-        with patch.dict(os.environ, {"OPENAI_API_KEY": "test_key"}):
-            with patch("openai.OpenAI") as mock_openai:
-                mock_client = MagicMock()
-                mock_client.chat.completions.create.return_value = mock_response
-                mock_openai.return_value = mock_client
-                result = _analyze_frame_with_vision(frame_path, 120.0, "test_key")
+class TestExtractVisualClaimsFromOCR:
+    def test_extracts_bullet_points(self):
+        """Should detect bullet points from OCR text."""
+        text = ". What is the RSI?\n. How the RSI Indicator Works\n. RSI Divergence"
+        claims = _extract_visual_claims_from_ocr(text, 120.0)
+        bullet_claims = [c for c in claims if c["type"] == "bullet_point"]
+        assert len(bullet_claims) >= 2
+        assert any("RSI" in c["claim"] for c in bullet_claims)
 
-        assert result is not None
-        assert result["timestamp"] == 120.0
-        assert result["on_screen_text"] == "RSI: 14"
-        assert result["chart_patterns"] == "Bullish divergence"
-        assert result["timestamp_str"] == "02:00"
+    def test_extracts_indicator_settings(self):
+        """Should detect indicator settings like RSI: 14."""
+        text = "RSI: 14\nMA = 200\nLength: 9"
+        claims = _extract_visual_claims_from_ocr(text, 60.0)
+        settings = [c for c in claims if c["type"] == "indicator_setting"]
+        assert len(settings) >= 2
+        assert any("RSI" in c["claim"] for c in settings)
 
-        # Cleanup
-        frame_path.unlink(missing_ok=True)
+    def test_extracts_indicator_thresholds(self):
+        """Should detect threshold patterns like 'RSI is above 70'."""
+        text = "A Stock is Overbought when the RSI is above 70\nA Stock is Oversold when the RSI is below 30"
+        claims = _extract_visual_claims_from_ocr(text, 600.0)
+        thresholds = [c for c in claims if c["type"] == "indicator_threshold"]
+        assert len(thresholds) >= 2
+        assert any("70" in c["claim"] for c in thresholds)
+        assert any("30" in c["claim"] for c in thresholds)
+
+    def test_extracts_visual_definitions(self):
+        """Should detect definitions like 'Momentum = Speed & Direction'."""
+        text = "Momentum = Speed & Direction of a Price Movement"
+        claims = _extract_visual_claims_from_ocr(text, 180.0)
+        defs = [c for c in claims if c["type"] == "visual_definition"]
+        assert len(defs) >= 1
+        assert any("Momentum" in c["claim"] for c in defs)
+
+    def test_extracts_price_levels(self):
+        """Should detect price levels like $100."""
+        text = "Entry: $100\nStop: $95\nTarget: $120"
+        claims = _extract_visual_claims_from_ocr(text, 30.0)
+        prices = [c for c in claims if c["type"] == "price_level"]
+        assert len(prices) >= 2
+
+    def test_extracts_percentages(self):
+        """Should detect percentages."""
+        text = "Win rate: 70%\nRisk: 2%"
+        claims = _extract_visual_claims_from_ocr(text, 45.0)
+        pcts = [c for c in claims if c["type"] == "percentage"]
+        assert len(pcts) >= 1
+
+    def test_empty_text_no_claims(self):
+        """Empty OCR text should produce no claims."""
+        claims = _extract_visual_claims_from_ocr("", 0.0)
+        assert claims == []
+
+    def test_claims_have_timestamps(self):
+        """All claims should have timestamp and timestamp_str."""
+        text = ". Test bullet point"
+        claims = _extract_visual_claims_from_ocr(text, 125.0)
+        assert len(claims) >= 1
+        assert claims[0]["timestamp"] == 125.0
+        assert claims[0]["timestamp_str"] == "02:05"
+
+
+class TestFramesAreSimilar:
+    def test_identical_files_are_similar(self):
+        """Same file should be considered similar."""
+        # Create two identical test images
+        from PIL import Image
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f1:
+            img = Image.new("RGB", (100, 100), (255, 0, 0))
+            img.save(f1.name)
+            path1 = Path(f1.name)
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f2:
+            img.save(f2.name)
+            path2 = Path(f2.name)
+        try:
+            assert _frames_are_similar(path1, path2) is True
+        finally:
+            path1.unlink(missing_ok=True)
+            path2.unlink(missing_ok=True)
+
+    def test_different_images_not_similar(self):
+        """Very different images should not be considered similar."""
+        from PIL import Image
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f1:
+            img1 = Image.new("RGB", (100, 100), (0, 0, 0))  # black
+            img1.save(f1.name)
+            path1 = Path(f1.name)
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f2:
+            img2 = Image.new("RGB", (100, 100), (255, 255, 255))  # white
+            img2.save(f2.name)
+            path2 = Path(f2.name)
+        try:
+            assert _frames_are_similar(path1, path2) is False
+        finally:
+            path1.unlink(missing_ok=True)
+            path2.unlink(missing_ok=True)

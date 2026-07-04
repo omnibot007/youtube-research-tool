@@ -470,46 +470,95 @@ def _group_segments_by_pauses(
     return sentences
 
 
-def _restore_punctuation_llm(text: str) -> str | None:
-    """Use OpenAI GPT-4o-mini to restore punctuation and capitalization.
+def _restore_punctuation_llm(text: str, provider: str | None = None) -> str | None:
+    """Use an LLM to restore punctuation and capitalization.
 
-    Returns punctuated text, or None if the API call fails or no API key.
+    Optional enhancement — the word-count heuristic in restore_punctuation()
+    already produces good results without any API call. This function is only
+    called when use_llm=True is passed to restore_punctuation().
+
+    Supports multiple providers (auto-detected):
+      - OpenAI / 9router (OPENAI_API_KEY, optionally OPENAI_BASE_URL)
+      - Anthropic (ANTHROPIC_API_KEY)
+      - Ollama (local, no API key, needs ollama running)
+
+    Returns punctuated text, or None if no provider available or call fails.
     """
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
+    provider = provider or _detect_llm_provider()
+    if not provider:
         return None
+
+    # Chunk the text for API limits
+    words = text.split()
+    chunks: list[str] = []
+    for i in range(0, len(words), _LLM_CHUNK_WORDS):
+        chunk = " ".join(words[i : i + _LLM_CHUNK_WORDS])
+        chunks.append(chunk)
+
+    system_msg = (
+        "You are a punctuation restoration tool. Add periods, "
+        "commas, question marks, and capitalization to the "
+        "following auto-generated transcript text. Preserve "
+        "the original words exactly — only add punctuation and "
+        "fix capitalization. Do not add or remove words."
+    )
+
     try:
-        from openai import OpenAI
-        client = OpenAI(api_key=api_key, timeout=60)
-        # Process in chunks to stay within token limits
-        words = text.split()
-        chunks: list[str] = []
-        for i in range(0, len(words), _LLM_CHUNK_WORDS):
-            chunk = " ".join(words[i : i + _LLM_CHUNK_WORDS])
-            chunks.append(chunk)
         results: list[str] = []
-        for chunk in chunks:
-            resp = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a punctuation restoration tool. Add periods, "
-                            "commas, question marks, and capitalization to the "
-                            "following auto-generated transcript text. Preserve "
-                            "the original words exactly — only add punctuation and "
-                            "fix capitalization. Do not add or remove words."
-                        ),
-                    },
-                    {"role": "user", "content": chunk},
-                ],
-                temperature=0,
-                max_tokens=2000,
+
+        if provider == "openai":
+            from openai import OpenAI
+            api_key = os.environ.get("OPENAI_API_KEY", "")
+            client_kwargs: dict[str, Any] = {"api_key": api_key, "timeout": 60}
+            base_url = os.environ.get("OPENAI_BASE_URL")
+            if base_url:
+                client_kwargs["base_url"] = base_url
+            client = OpenAI(**client_kwargs)
+            for chunk in chunks:
+                resp = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "system", "content": system_msg},
+                        {"role": "user", "content": chunk},
+                    ],
+                    temperature=0,
+                    max_tokens=2000,
+                )
+                results.append(resp.choices[0].message.content.strip())
+
+        elif provider == "anthropic":
+            import anthropic
+            client = anthropic.Anthropic(
+                api_key=os.environ.get("ANTHROPIC_API_KEY", ""), timeout=60,
             )
-            punctuated = resp.choices[0].message.content.strip()
-            results.append(punctuated)
+            for chunk in chunks:
+                resp = client.messages.create(
+                    model="claude-sonnet-4-20250514",
+                    max_tokens=2000,
+                    system=system_msg,
+                    messages=[{"role": "user", "content": chunk}],
+                )
+                text_out = resp.content[0].text if resp.content else chunk
+                results.append(text_out.strip())
+
+        elif provider == "ollama":
+            import ollama
+            for chunk in chunks:
+                resp = ollama.chat(
+                    model="llama3.2",
+                    messages=[
+                        {"role": "system", "content": system_msg},
+                        {"role": "user", "content": chunk},
+                    ],
+                )
+                text_out = resp.get("message", {}).get("content", chunk)
+                results.append(text_out.strip())
+
+        else:
+            return None
+
         return " ".join(results)
+
     except Exception:
         return None
 
@@ -517,13 +566,16 @@ def _restore_punctuation_llm(text: str) -> str | None:
 def restore_punctuation(
     text: str,
     segments: list[TranscriptSegment],
+    use_llm: bool = False,
 ) -> tuple[str, bool]:
     """Restore punctuation to unpunctuated auto-caption text.
 
-    Tries (in order):
-      1. OpenAI GPT-4o-mini (best quality, ~$0.01/video)
-      2. Timing-based sentence boundaries from VTT segments
-      3. Returns original text unchanged (last resort)
+    Primary method: word-count heuristic + timing-based sentence boundaries
+    from VTT segments. This requires NO API key and works offline.
+
+    Optional enhancement: if use_llm=True, tries an LLM (OpenAI/Anthropic/
+    Ollama, auto-detected) for better quality. This costs ~$0.01/video with
+    cloud providers, or is free with local Ollama.
 
     Returns (punctuated_text, used_llm) tuple.
     """
@@ -532,12 +584,7 @@ def restore_punctuation(
     if period_count > 5 or len(text) < 200:
         return text, False
 
-    # Try LLM first
-    llm_result = _restore_punctuation_llm(text)
-    if llm_result and len(llm_result) > len(text) * 0.5:
-        return llm_result, True
-
-    # Fallback: timing-based sentence boundaries
+    # Primary: timing-based / word-count heuristic (always works, no API)
     grouped = _group_segments_by_pauses(segments)
     if grouped:
         sentences: list[str] = []
@@ -551,9 +598,17 @@ def restore_punctuation(
             if s[-1] not in ".!?":
                 s += "."
             sentences.append(s)
-        return " ".join(sentences), False
+        heuristic_result = " ".join(sentences)
+    else:
+        heuristic_result = text
 
-    return text, False
+    # Optional: LLM enhancement (only if explicitly requested)
+    if use_llm:
+        llm_result = _restore_punctuation_llm(text)
+        if llm_result and len(llm_result) > len(text) * 0.5:
+            return llm_result, True
+
+    return heuristic_result, False
 
 
 # ---------------------------------------------------------------- YT-DLP OPTIONS BUILDER
@@ -3567,7 +3622,8 @@ def prepare_deep_research(
     Quality over speed — no caps on claims. Every significant claim gets verified.
 
     If enable_visual is True, also downloads the video and extracts visual
-    content (on-screen text, chart patterns) using OpenAI vision API.
+    content (on-screen text, chart patterns) using OCR (Tesseract, free, local)
+    as the primary method, with optional LLM analysis for chart patterns.
     """
     # Step 1: Fetch transcript
     print(f"[1/3] Fetching transcript for: {url_or_id}", file=sys.stderr)
@@ -3609,7 +3665,8 @@ def prepare_deep_research(
     auto_captioned = False  # track whether we restored punctuation
     used_llm_punctuation = False
     if segments and period_count < 5 and len(raw_body) > 1000:
-        # Restore punctuation using LLM (best) or timing-based fallback
+        # Restore punctuation using word-count heuristic (no API needed)
+        # LLM enhancement is optional and only used if use_llm=True
         restored, used_llm_punctuation = restore_punctuation(raw_body, segments)
         if restored != raw_body:
             raw_body = restored
@@ -3652,12 +3709,16 @@ def prepare_deep_research(
     # Extract advanced content (contradictions, marketing, rules, etc.)
     advanced = extract_all(extractor_body, ts_sentences or None)
 
-    # Extract visual content (frames + vision AI analysis)
+    # Extract visual content (frames + OCR + optional LLM analysis)
     visual_content: dict[str, Any] = {
         "enabled": enable_visual,
+        "ocr_available": False,
+        "llm_provider": "",
         "video_downloaded": False,
         "frames_extracted": 0,
-        "frames_analyzed": 0,
+        "frames_after_dedup": 0,
+        "frames_analyzed_ocr": 0,
+        "frames_analyzed_llm": 0,
         "visual_claims": [],
         "on_screen_texts": [],
         "chart_patterns": [],
@@ -3666,10 +3727,16 @@ def prepare_deep_research(
     if enable_visual:
         print(f"[4/4] Extracting visual content from video frames...", file=sys.stderr)
         video_id = parse_video_id(url_or_id)
+        # Use chapter boundaries for smart frame sampling
+        chapter_ts: list[float] | None = None
+        chapters = advanced.get("chapters", [])
+        if chapters:
+            chapter_ts = [c.get("start", 0) for c in chapters if c.get("start", 0) > 0]
         visual_content = extract_visual_content(
             video_id, out, duration=result.duration,
             cookies_file=cookies_file, cookies_from_browser=cookies_from_browser,
             proxy=proxy, enable_visual=enable_visual,
+            chapter_timestamps=chapter_ts,
         )
 
     # Build the research package
@@ -3774,6 +3841,36 @@ _MAX_FRAMES = 60
 _VIDEO_FORMAT = "worst[ext=mp4]/worst"
 # Frames directory name within output dir.
 _FRAMES_SUBDIR = "_frames"
+# Tesseract binary path (auto-detected, fallback to PATH).
+_TESSERACT_CMD = ""
+# Minimum OCR confidence to keep a word (0-100).
+_OCR_MIN_CONFIDENCE = 50
+# Minimum OCR text length to consider a frame "has content".
+_OCR_MIN_TEXT_LEN = 5
+# Frame deduplication: skip if image hash matches previous (perceptual diff threshold).
+_FRAME_DEDUP_THRESHOLD = 0.95
+
+
+def _find_tesseract() -> str:
+    """Find the Tesseract binary path. Caches result."""
+    global _TESSERACT_CMD
+    if _TESSERACT_CMD:
+        return _TESSERACT_CMD
+    # Check common Windows install locations
+    candidates = [
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+    ]
+    for c in candidates:
+        if Path(c).exists():
+            _TESSERACT_CMD = c
+            return c
+    # Check PATH
+    found = shutil.which("tesseract")
+    if found:
+        _TESSERACT_CMD = found
+        return found
+    return ""
 
 
 def _download_video_low_quality(
@@ -3820,8 +3917,17 @@ def _extract_frames(
     output_dir: Path,
     interval: int = _FRAME_INTERVAL,
     max_frames: int = _MAX_FRAMES,
+    timestamps: list[float] | None = None,
 ) -> list[Path]:
-    """Extract frames from video at regular intervals using ffmpeg.
+    """Extract frames from video at regular intervals or specific timestamps.
+
+    Args:
+        video_path: Path to the video file.
+        output_dir: Directory for the _frames subdirectory.
+        interval: Seconds between frames (ignored if timestamps given).
+        max_frames: Maximum number of frames to extract.
+        timestamps: Optional list of specific timestamps (seconds) to extract.
+                     If provided, overrides interval-based extraction.
 
     Returns list of frame file paths (PNG).
     """
@@ -3834,24 +3940,27 @@ def _extract_frames(
 
     frames: list[Path] = []
     try:
-        # Get video duration
         import subprocess
-        probe = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)],
-            capture_output=True, text=True, timeout=30,
-        )
-        duration = float(probe.stdout.strip()) if probe.stdout.strip() else 0
-        if duration <= 0:
-            return []
 
-        # Calculate frame timestamps
-        num_frames = min(max_frames, int(duration / interval))
-        if num_frames < 1:
-            num_frames = 1
+        if timestamps:
+            # Extract at specific timestamps (e.g., chapter boundaries)
+            ts_list = timestamps[:max_frames]
+        else:
+            # Get video duration for interval-based extraction
+            probe = subprocess.run(
+                ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)],
+                capture_output=True, text=True, timeout=30,
+            )
+            duration = float(probe.stdout.strip()) if probe.stdout.strip() else 0
+            if duration <= 0:
+                return []
+            num_frames = min(max_frames, int(duration / interval))
+            if num_frames < 1:
+                num_frames = 1
+            ts_list = [i * interval for i in range(num_frames)]
 
-        for i in range(num_frames):
-            timestamp = i * interval
+        for i, timestamp in enumerate(ts_list):
             frame_path = frames_dir / f"frame_{i:04d}_{int(timestamp//60):02d}m{int(timestamp%60):02d}s.png"
             subprocess.run(
                 ["ffmpeg", "-ss", str(timestamp), "-i", str(video_path),
@@ -3867,33 +3976,147 @@ def _extract_frames(
     return frames
 
 
-def _analyze_frame_with_vision(
+def _extract_ocr_from_frame(frame_path: Path) -> dict:
+    """Extract text from a video frame using Tesseract OCR.
+
+    This is the primary visual extraction method — free, local, no API needed.
+    Returns dict with:
+        - text: Full OCR text
+        - words: List of (word, confidence) tuples
+        - lines: List of text lines
+        - has_content: bool, whether meaningful text was found
+    """
+    tess_path = _find_tesseract()
+    if not tess_path:
+        return {"text": "", "words": [], "lines": [], "has_content": False,
+                "error": "Tesseract not found"}
+
+    try:
+        import pytesseract
+        from PIL import Image
+        pytesseract.pytesseract.tesseract_cmd = tess_path
+
+        img = Image.open(frame_path)
+
+        # Full text extraction
+        full_text = pytesseract.image_to_string(img)
+
+        # Word-level data with confidence scores
+        data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+
+        words: list[tuple[str, int]] = []
+        for w, conf in zip(data["text"], data["conf"]):
+            w = w.strip()
+            if w and conf != "-1":
+                try:
+                    c = int(conf)
+                    if c >= _OCR_MIN_CONFIDENCE:
+                        words.append((w, c))
+                except (ValueError, TypeError):
+                    pass
+
+        # Lines (grouped by line number)
+        lines_dict: dict[int, list[str]] = {}
+        for i, line_num in enumerate(data["line_num"]):
+            if line_num == 0:
+                continue
+            w = data["text"][i].strip()
+            if w:
+                lines_dict.setdefault(line_num, []).append(w)
+        lines = [" ".join(ws) for ws in lines_dict.values()]
+
+        # Clean text
+        clean_text = full_text.strip()
+        # Remove excessive whitespace
+        clean_text = re.sub(r"\n{3,}", "\n\n", clean_text)
+
+        has_content = len(clean_text) >= _OCR_MIN_TEXT_LEN
+
+        return {
+            "text": clean_text,
+            "words": words,
+            "lines": lines,
+            "has_content": has_content,
+        }
+
+    except Exception as e:
+        return {"text": "", "words": [], "lines": [], "has_content": False,
+                "error": str(e)}
+
+
+def _frames_are_similar(frame1: Path, frame2: Path) -> bool:
+    """Check if two frames are visually similar (for deduplication).
+
+    Uses a simple histogram comparison. Returns True if frames are
+    nearly identical (e.g., same slide with minor changes).
+    """
+    try:
+        from PIL import Image
+        import struct
+
+        img1 = Image.open(frame1).convert("L").resize((64, 64))
+        img2 = Image.open(frame2).convert("L").resize((64, 64))
+
+        # Simple pixel difference
+        pixels1 = list(img1.getpixel((x, y)) for y in range(64) for x in range(64))
+        pixels2 = list(img2.getpixel((x, y)) for y in range(64) for x in range(64))
+
+        if len(pixels1) != len(pixels2):
+            return False
+
+        diff = sum(abs(a - b) for a, b in zip(pixels1, pixels2))
+        max_diff = 255 * len(pixels1)
+        similarity = 1 - (diff / max_diff)
+        return similarity >= _FRAME_DEDUP_THRESHOLD
+
+    except Exception:
+        return False
+
+
+def _deduplicate_frames(frames: list[Path]) -> list[Path]:
+    """Remove consecutive duplicate frames. Keeps first occurrence.
+
+    Returns filtered list of frame paths.
+    """
+    if len(frames) <= 1:
+        return frames
+
+    result: list[Path] = [frames[0]]
+    for i in range(1, len(frames)):
+        if not _frames_are_similar(frames[i], frames[i - 1]):
+            result.append(frames[i])
+        else:
+            # Remove the duplicate frame file
+            try:
+                frames[i].unlink()
+            except Exception:
+                pass
+    return result
+
+
+# --- Pluggable LLM backend for chart pattern analysis ---
+
+def _llm_analyze_frame_openai(
     frame_path: Path,
     timestamp: float,
-    api_key: str | None = None,
+    api_key: str,
+    base_url: str | None = None,
 ) -> dict | None:
-    """Analyze a single video frame using OpenAI vision API.
-
-    Returns dict with: timestamp, on_screen_text, chart_patterns,
-    visual_content, description. Or None if API unavailable.
-    """
-    api_key = api_key or os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        return None
-
+    """Analyze frame using OpenAI-compatible vision API (OpenAI, 9router, etc.)."""
     try:
         import base64
         from openai import OpenAI
-        client = OpenAI(api_key=api_key, timeout=60)
 
-        # Encode image
+        client_kwargs: dict[str, Any] = {"api_key": api_key, "timeout": 60}
+        if base_url:
+            client_kwargs["base_url"] = base_url
+        client = OpenAI(**client_kwargs)
+
         with open(frame_path, "rb") as f:
             img_data = base64.b64encode(f.read()).decode("utf-8")
 
-        # Determine mime type
         ext = frame_path.suffix.lower()
         mime = "image/png" if ext == ".png" else "image/jpeg"
-
         timestamp_str = f"{int(timestamp // 60):02d}:{int(timestamp % 60):02d}"
 
         resp = client.chat.completions.create(
@@ -3904,14 +4127,12 @@ def _analyze_frame_with_vision(
                     "content": (
                         "You are a visual content analyzer for educational/trading videos. "
                         "Analyze the provided video frame and extract:\n"
-                        "1. on_screen_text: Any text visible on screen (indicator settings, "
-                        "price levels, labels, titles, bullet points, code snippets)\n"
-                        "2. chart_patterns: If this shows a financial chart, identify any "
+                        "1. chart_patterns: If this shows a financial chart, identify any "
                         "visible patterns (head and shoulders, candlesticks, trendlines, "
                         "support/resistance levels, indicators shown)\n"
-                        "3. visual_content: What's being shown (diagram, chart, slide, "
+                        "2. visual_content: What's being shown (diagram, chart, slide, "
                         "person talking, screen recording, demo, etc.)\n"
-                        "4. description: One-sentence summary of what's visible\n\n"
+                        "3. description: One-sentence summary of what's visible\n\n"
                         "Respond as JSON with these exact keys."
                     ),
                 },
@@ -3920,7 +4141,7 @@ def _analyze_frame_with_vision(
                     "content": [
                         {
                             "type": "text",
-                            "text": f"This frame is from timestamp {timestamp_str} in the video. Analyze it.",
+                            "text": f"Frame from timestamp {timestamp_str}. Analyze it.",
                         },
                         {
                             "type": "image_url",
@@ -3930,7 +4151,7 @@ def _analyze_frame_with_vision(
                 },
             ],
             temperature=0,
-            max_tokens=500,
+            max_tokens=400,
             response_format={"type": "json_object"},
         )
 
@@ -3938,11 +4159,303 @@ def _analyze_frame_with_vision(
         result["timestamp"] = timestamp
         result["timestamp_str"] = timestamp_str
         result["frame_file"] = frame_path.name
+        result["llm_provider"] = "openai"
         return result
 
     except Exception as e:
-        print(f"  [visual] Frame analysis failed for {frame_path.name}: {e}", file=sys.stderr)
+        print(f"  [visual] OpenAI analysis failed: {e}", file=sys.stderr)
         return None
+
+
+def _llm_analyze_frame_anthropic(
+    frame_path: Path,
+    timestamp: float,
+    api_key: str,
+) -> dict | None:
+    """Analyze frame using Anthropic Claude vision API."""
+    try:
+        import base64
+        import anthropic
+
+        client = anthropic.Anthropic(api_key=api_key, timeout=60)
+
+        with open(frame_path, "rb") as f:
+            img_data = base64.b64encode(f.read()).decode("utf-8")
+
+        ext = frame_path.suffix.lower()
+        media_type = "image/png" if ext == ".png" else "image/jpeg"
+        timestamp_str = f"{int(timestamp // 60):02d}:{int(timestamp % 60):02d}"
+
+        resp = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=400,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": img_data,
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": (
+                                f"Frame from timestamp {timestamp_str} in an educational video. "
+                                "Analyze this frame and respond as JSON with these keys: "
+                                "chart_patterns (visible chart patterns, indicators, price levels), "
+                                "visual_content (what's being shown), "
+                                "description (one-sentence summary)."
+                            ),
+                        },
+                    ],
+                },
+            ],
+        )
+
+        text = resp.content[0].text if resp.content else ""
+        # Try to parse JSON from response
+        try:
+            result = json.loads(text)
+        except json.JSONDecodeError:
+            # Extract JSON from markdown code blocks
+            match = re.search(r"\{[^}]+\}", text, re.DOTALL)
+            if match:
+                result = json.loads(match.group())
+            else:
+                result = {"description": text, "chart_patterns": "", "visual_content": ""}
+
+        result["timestamp"] = timestamp
+        result["timestamp_str"] = timestamp_str
+        result["frame_file"] = frame_path.name
+        result["llm_provider"] = "anthropic"
+        return result
+
+    except Exception as e:
+        print(f"  [visual] Anthropic analysis failed: {e}", file=sys.stderr)
+        return None
+
+
+def _llm_analyze_frame_ollama(
+    frame_path: Path,
+    timestamp: float,
+    model: str = "llama3.2-vision",
+) -> dict | None:
+    """Analyze frame using local Ollama vision model. No API key needed."""
+    try:
+        import ollama
+
+        timestamp_str = f"{int(timestamp // 60):02d}:{int(timestamp % 60):02d}"
+
+        resp = ollama.chat(
+            model=model,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Frame from timestamp {timestamp_str} in an educational video. "
+                    "Analyze this frame and respond as JSON with these keys: "
+                    "chart_patterns, visual_content, description."
+                ),
+                "images": [str(frame_path)],
+            }],
+        )
+
+        text = resp.get("message", {}).get("content", "")
+        try:
+            result = json.loads(text)
+        except json.JSONDecodeError:
+            match = re.search(r"\{[^}]+\}", text, re.DOTALL)
+            if match:
+                result = json.loads(match.group())
+            else:
+                result = {"description": text, "chart_patterns": "", "visual_content": ""}
+
+        result["timestamp"] = timestamp
+        result["timestamp_str"] = timestamp_str
+        result["frame_file"] = frame_path.name
+        result["llm_provider"] = "ollama"
+        return result
+
+    except Exception as e:
+        print(f"  [visual] Ollama analysis failed: {e}", file=sys.stderr)
+        return None
+
+
+def _detect_llm_provider() -> str:
+    """Auto-detect which LLM provider is available.
+
+    Priority: OPENAI_API_KEY (or 9router) > ANTHROPIC_API_KEY > Ollama running.
+    Returns: "openai" | "anthropic" | "ollama" | ""
+    """
+    # Check for OpenAI (includes 9router which uses OpenAI-compatible API)
+    if os.environ.get("OPENAI_API_KEY"):
+        return "openai"
+    # Check for Anthropic
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return "anthropic"
+    # Check if Ollama is running locally
+    try:
+        import urllib.request
+        req = urllib.request.Request("http://localhost:11434/api/tags", method="GET")
+        urllib.request.urlopen(req, timeout=2)
+        return "ollama"
+    except Exception:
+        pass
+    return ""
+
+
+def _analyze_frame_with_llm(
+    frame_path: Path,
+    timestamp: float,
+    provider: str | None = None,
+) -> dict | None:
+    """Analyze a frame using the best available LLM provider.
+
+    This is OPTIONAL — OCR runs first and always. LLM adds chart pattern
+    analysis and visual context that OCR can't provide.
+
+    Args:
+        frame_path: Path to the frame image.
+        timestamp: Timestamp in seconds.
+        provider: Force a specific provider ("openai" | "anthropic" | "ollama").
+                  If None, auto-detects.
+
+    Returns dict with chart_patterns, visual_content, description, or None.
+    """
+    provider = provider or _detect_llm_provider()
+
+    if provider == "openai":
+        api_key = os.environ.get("OPENAI_API_KEY", "")
+        base_url = os.environ.get("OPENAI_BASE_URL")  # 9router uses this
+        return _llm_analyze_frame_openai(frame_path, timestamp, api_key, base_url)
+
+    elif provider == "anthropic":
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        return _llm_analyze_frame_anthropic(frame_path, timestamp, api_key)
+
+    elif provider == "ollama":
+        return _llm_analyze_frame_ollama(frame_path, timestamp)
+
+    return None
+
+
+def _extract_visual_claims_from_ocr(
+    ocr_text: str,
+    timestamp: float,
+) -> list[dict]:
+    """Parse OCR text into structured visual claims.
+
+    Detects:
+    - Bullet points / numbered lists (slide content)
+    - Indicator settings (RSI: 14, MA: 200, etc.)
+    - Price levels ($100, €50, etc.)
+    - Percentages (70%, 30%)
+    - Definitions (X = Y, X is Y)
+    """
+    claims: list[dict] = []
+    timestamp_str = f"{int(timestamp // 60):02d}:{int(timestamp % 60):02d}"
+    lines = [l.strip() for l in ocr_text.split("\n") if l.strip()]
+
+    # Detect bullet points / list items
+    for line in lines:
+        # Bullet point: ". Item" or "• Item" or "1. Item"
+        bullet_match = re.match(r"^[.•\-\*]\s*(.+)", line) or re.match(r"^\d+[.)]\s*(.+)", line)
+        if bullet_match:
+            content = bullet_match.group(1).strip()
+            if len(content) > 3:
+                claims.append({
+                    "timestamp": timestamp,
+                    "timestamp_str": timestamp_str,
+                    "claim": content,
+                    "source": "visual_ocr",
+                    "type": "bullet_point",
+                })
+
+    # Detect indicator settings: "RSI: 14", "MA = 200", "Length: 9"
+    for line in lines:
+        setting_match = re.search(
+            r"(?i)\b(RSI|RSI length|MA|SMA|EMA|MACD|Stochastic|ATR|Bollinger|"
+            r"Length|Period|Standard Deviation|Risk Reward|Stop Loss|Take Profit)"
+            r"\s*[:=]\s*(\d+(?:\.\d+)?)",
+            line,
+        )
+        if setting_match:
+            claims.append({
+                "timestamp": timestamp,
+                "timestamp_str": timestamp_str,
+                "claim": f"{setting_match.group(1)} = {setting_match.group(2)}",
+                "source": "visual_ocr",
+                "type": "indicator_setting",
+            })
+
+    # Detect threshold patterns: "RSI is above 70", "RSI is below 30"
+    for line in lines:
+        threshold_match = re.search(
+            r"(?i)\b(RSI|MACD|Stochastic|ATR|MA|SMA|EMA|OBV|ADX)"
+            r"\s+(?:is\s+)?(above|below|over|under|>|<)\s*(\d+(?:\.\d+)?)",
+            line,
+        )
+        if threshold_match:
+            indicator = threshold_match.group(1)
+            direction = threshold_match.group(2)
+            value = threshold_match.group(3)
+            claims.append({
+                "timestamp": timestamp,
+                "timestamp_str": timestamp_str,
+                "claim": f"{indicator} {direction} {value}",
+                "source": "visual_ocr",
+                "type": "indicator_threshold",
+            })
+
+    # Detect definitions on slides: "X = Y" or "X is Y"
+    for line in lines:
+        def_match = re.search(
+            r"(?i)\b(Momentum|Divergence|Overbought|Oversold|Bullish|Bearish|"
+            r"Support|Resistance|Trendline|Breakout|Reversal)"
+            r"\s*[=:]\s*(.{5,80})",
+            line,
+        )
+        if def_match:
+            term = def_match.group(1)
+            definition = def_match.group(2).strip().rstrip(".,;|")
+            if len(definition) > 5:
+                claims.append({
+                    "timestamp": timestamp,
+                    "timestamp_str": timestamp_str,
+                    "claim": f"{term} = {definition}",
+                    "source": "visual_ocr",
+                    "type": "visual_definition",
+                })
+
+    # Detect price levels: $100, €50, £75
+    for line in lines:
+        for m in re.finditer(r"[$€£]\s*(\d+(?:,\d{3})*(?:\.\d+)?)", line):
+            claims.append({
+                "timestamp": timestamp,
+                "timestamp_str": timestamp_str,
+                "claim": f"Price level: {m.group(0)}",
+                "source": "visual_ocr",
+                "type": "price_level",
+            })
+
+    # Detect percentages
+    for line in lines:
+        for m in re.finditer(r"(\d+(?:\.\d+)?)\s*%", line):
+            pct = m.group(0)
+            # Avoid double-counting with indicator settings
+            if not any(c["claim"].endswith(pct) for c in claims if c["type"] == "indicator_setting"):
+                claims.append({
+                    "timestamp": timestamp,
+                    "timestamp_str": timestamp_str,
+                    "claim": f"Percentage shown: {pct}",
+                    "source": "visual_ocr",
+                    "type": "percentage",
+                })
+
+    return claims
 
 
 def extract_visual_content(
@@ -3953,31 +4466,48 @@ def extract_visual_content(
     cookies_from_browser: str | None = None,
     proxy: str | None = None,
     enable_visual: bool = True,
+    llm_provider: str | None = None,
+    chapter_timestamps: list[float] | None = None,
 ) -> dict:
     """Extract visual content from a YouTube video.
 
-    Downloads the video, extracts frames at intervals, and analyzes each
-    frame using OpenAI vision API. Returns a dict with visual extraction
-    results. If visual extraction is disabled or API unavailable, returns
-    empty results.
+    Pipeline:
+      1. Download video in lowest quality
+      2. Extract frames at intervals (or chapter boundaries if provided)
+      3. Deduplicate similar frames
+      4. Run OCR (Tesseract) on each frame — ALWAYS, free, local
+      5. Optionally run LLM vision analysis for chart patterns — pluggable
+      6. Parse OCR text into structured claims
+
+    OCR is the primary method and requires no API key.
+    LLM analysis is optional and auto-detects the best available provider
+    (OpenAI/9router, Anthropic, or local Ollama).
 
     Returns:
         {
             "enabled": bool,
+            "ocr_available": bool,
+            "llm_provider": str,  # "" if none
             "video_downloaded": bool,
             "frames_extracted": int,
-            "frames_analyzed": int,
-            "visual_claims": [...],  # claims derived from visual content
-            "on_screen_texts": [...],  # text seen on screen
-            "chart_patterns": [...],  # chart patterns identified
-            "frame_analyses": [...],  # full analysis per frame
+            "frames_after_dedup": int,
+            "frames_analyzed_ocr": int,
+            "frames_analyzed_llm": int,
+            "visual_claims": [...],
+            "on_screen_texts": [...],
+            "chart_patterns": [...],
+            "frame_analyses": [...],
         }
     """
     result: dict[str, Any] = {
         "enabled": enable_visual,
+        "ocr_available": bool(_find_tesseract()),
+        "llm_provider": "",
         "video_downloaded": False,
         "frames_extracted": 0,
-        "frames_analyzed": 0,
+        "frames_after_dedup": 0,
+        "frames_analyzed_ocr": 0,
+        "frames_analyzed_llm": 0,
         "visual_claims": [],
         "on_screen_texts": [],
         "chart_patterns": [],
@@ -3987,10 +4517,18 @@ def extract_visual_content(
     if not enable_visual:
         return result
 
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        print("  [visual] No OPENAI_API_KEY — skipping visual extraction", file=sys.stderr)
-        return result
+    # Detect LLM provider (for optional chart pattern analysis)
+    provider = llm_provider or _detect_llm_provider()
+    result["llm_provider"] = provider
+
+    # Check OCR availability
+    if not result["ocr_available"]:
+        print("  [visual] Tesseract OCR not found — install: winget install UB-Mannheim.TesseractOCR",
+              file=sys.stderr)
+        # Still try LLM-only if available
+        if not provider:
+            print("  [visual] No OCR and no LLM — cannot do visual extraction", file=sys.stderr)
+            return result
 
     # Step 1: Download video
     print("  [visual] Downloading video (low quality)...", file=sys.stderr)
@@ -4003,59 +4541,101 @@ def extract_visual_content(
 
     # Step 2: Extract frames
     print("  [visual] Extracting frames...", file=sys.stderr)
-    frames = _extract_frames(video_path, output_dir)
+    frames = _extract_frames(
+        video_path, output_dir,
+        timestamps=chapter_timestamps if chapter_timestamps else None,
+    )
     result["frames_extracted"] = len(frames)
     if not frames:
         return result
 
-    # Step 3: Analyze each frame
-    print(f"  [visual] Analyzing {len(frames)} frames with vision AI...", file=sys.stderr)
+    # Step 3: Deduplicate similar frames
+    frames = _deduplicate_frames(frames)
+    result["frames_after_dedup"] = len(frames)
+    print(f"  [visual] {len(frames)} unique frames after dedup", file=sys.stderr)
+
+    # Step 4: OCR on each frame (always runs if Tesseract available)
     on_screen_texts: list[dict] = []
-    chart_patterns: list[dict] = []
     visual_claims: list[dict] = []
     frame_analyses: list[dict] = []
 
-    for frame in frames:
-        # Parse timestamp from filename (frame_NNNN_MMmSSs.png)
-        match = re.search(r"(\d+)m(\d+)s", frame.name)
-        timestamp = int(match.group(1)) * 60 + int(match.group(2)) if match else 0
+    if result["ocr_available"]:
+        print(f"  [visual] Running OCR on {len(frames)} frames...", file=sys.stderr)
+        for frame in frames:
+            # Parse timestamp from filename
+            match = re.search(r"(\d+)m(\d+)s", frame.name)
+            timestamp = int(match.group(1)) * 60 + int(match.group(2)) if match else 0
+            timestamp_str = f"{int(timestamp // 60):02d}:{int(timestamp % 60):02d}"
 
-        analysis = _analyze_frame_with_vision(frame, timestamp, api_key)
-        if analysis:
-            frame_analyses.append(analysis)
-            result["frames_analyzed"] += 1
+            ocr_result = _extract_ocr_from_frame(frame)
+            if ocr_result.get("has_content"):
+                result["frames_analyzed_ocr"] += 1
 
-            # Collect on-screen text
-            ost = analysis.get("on_screen_text", "")
-            if ost and len(ost) > 3:
+                # Store on-screen text
                 on_screen_texts.append({
                     "timestamp": timestamp,
-                    "timestamp_str": analysis.get("timestamp_str", ""),
-                    "text": ost,
+                    "timestamp_str": timestamp_str,
+                    "text": ocr_result["text"],
+                    "word_count": len(ocr_result["words"]),
+                    "avg_confidence": (
+                        sum(c for _, c in ocr_result["words"]) / len(ocr_result["words"])
+                        if ocr_result["words"] else 0
+                    ),
                 })
 
-            # Collect chart patterns
-            cp = analysis.get("chart_patterns", "")
-            if cp and len(cp) > 3:
-                chart_patterns.append({
+                # Extract structured claims from OCR text
+                ocr_claims = _extract_visual_claims_from_ocr(ocr_result["text"], timestamp)
+                visual_claims.extend(ocr_claims)
+
+                # Store frame analysis
+                frame_analyses.append({
                     "timestamp": timestamp,
-                    "timestamp_str": analysis.get("timestamp_str", ""),
-                    "patterns": cp,
+                    "timestamp_str": timestamp_str,
+                    "frame_file": frame.name,
+                    "ocr_text": ocr_result["text"],
+                    "ocr_lines": ocr_result["lines"],
+                    "ocr_word_count": len(ocr_result["words"]),
+                    "ocr_avg_confidence": (
+                        sum(c for _, c in ocr_result["words"]) / len(ocr_result["words"])
+                        if ocr_result["words"] else 0
+                    ),
                 })
 
-            # Generate visual claims from description
-            desc = analysis.get("description", "")
-            if desc:
-                visual_claims.append({
-                    "timestamp": timestamp,
-                    "timestamp_str": analysis.get("timestamp_str", ""),
-                    "claim": desc,
-                    "source": "visual",
-                    "type": "visual_observation",
-                })
+    # Step 5: Optional LLM analysis for chart patterns
+    if provider:
+        print(f"  [visual] Running LLM analysis ({provider}) on frames with content...",
+              file=sys.stderr)
+        for fa in frame_analyses:
+            frame_path = output_dir / _FRAMES_SUBDIR / fa["frame_file"]
+            if not frame_path.exists():
+                continue
+            llm_result = _analyze_frame_with_llm(frame_path, fa["timestamp"], provider)
+            if llm_result:
+                result["frames_analyzed_llm"] += 1
+                fa["llm_analysis"] = llm_result
+
+                # Collect chart patterns
+                cp = llm_result.get("chart_patterns", "")
+                if cp and len(cp) > 3:
+                    result["chart_patterns"].append({
+                        "timestamp": fa["timestamp"],
+                        "timestamp_str": fa["timestamp_str"],
+                        "patterns": cp,
+                        "provider": provider,
+                    })
+
+                # Add visual description as a claim
+                desc = llm_result.get("description", "")
+                if desc:
+                    visual_claims.append({
+                        "timestamp": fa["timestamp"],
+                        "timestamp_str": fa["timestamp_str"],
+                        "claim": desc,
+                        "source": f"visual_llm_{provider}",
+                        "type": "visual_description",
+                    })
 
     result["on_screen_texts"] = on_screen_texts
-    result["chart_patterns"] = chart_patterns
     result["visual_claims"] = visual_claims
     result["frame_analyses"] = frame_analyses
 
@@ -5450,7 +6030,7 @@ def main() -> int:
     sp_dr.add_argument("--retries", type=int, default=DEFAULT_RETRIES, help="Max retries on network errors")
     sp_dr.add_argument("--output", default="", help="Custom output directory")
     sp_dr.add_argument("--json", action="store_true", help="Output as JSON (default: human-readable)")
-    sp_dr.add_argument("--visual", action="store_true", help="Extract visual content from video frames (requires OpenAI API key)")
+    sp_dr.add_argument("--visual", action="store_true", help="Extract visual content from video frames (OCR-first, no API key needed. Optional LLM for chart patterns.)")
 
     sp_read = sub.add_parser("read", help="Read a research report aloud as MP3 (text-to-speech)")
     sp_read.add_argument("report", help="Path to report JSON (_research.json or _deep_research.json)")
@@ -5706,9 +6286,15 @@ def main() -> int:
             ve = result.get("visual_extraction", {})
             if ve.get("enabled"):
                 print(f"  VISUAL EXTRACTION")
+                print(f"  OCR available:    {ve.get('ocr_available', False)}")
+                llm_prov = ve.get("llm_provider", "")
+                print(f"  LLM provider:     {llm_prov or 'none (OCR only)'}")
                 print(f"  Video downloaded: {ve.get('video_downloaded', False)}")
                 print(f"  Frames extracted: {ve.get('frames_extracted', 0)}")
-                print(f"  Frames analyzed:  {ve.get('frames_analyzed', 0)}")
+                print(f"  After dedup:      {ve.get('frames_after_dedup', 0)}")
+                print(f"  OCR analyzed:     {ve.get('frames_analyzed_ocr', 0)}")
+                if llm_prov:
+                    print(f"  LLM analyzed:     {ve.get('frames_analyzed_llm', 0)}")
                 if ve.get("on_screen_texts"):
                     print(f"  On-screen texts:  {len(ve['on_screen_texts'])}")
                 if ve.get("chart_patterns"):
