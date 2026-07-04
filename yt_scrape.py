@@ -260,10 +260,15 @@ def parse_vtt(vtt_path: str) -> tuple[str | None, list[TranscriptSegment]]:
                 ))
                 current_texts = []
 
-            # Parse new timestamps
+            # Parse new timestamps — strip extra metadata (align:start, position:0%, etc.)
             times = line.split("-->")
             current_start = _parse_vtt_time(times[0].strip())
-            current_end = _parse_vtt_time(times[1].strip()) if len(times) > 1 else None
+            if len(times) > 1:
+                # End time may have "align:start position:0%" after it
+                end_str = times[1].strip().split()[0]  # take first whitespace-delimited token
+                current_end = _parse_vtt_time(end_str)
+            else:
+                current_end = None
             continue
 
         # Text line
@@ -395,6 +400,160 @@ def transcribe_with_whisper(
     if not transcript:
         raise RuntimeError(f"Whisper produced empty transcript for {video_id}")
     return transcript, segments
+
+
+# ---------------------------------------------------------------- PUNCTUATION RESTORATION
+
+# Speech-pause thresholds (seconds) for timing-based sentence detection.
+_PAUSE_SENTENCE = 0.8   # gap >= this → sentence boundary (period)
+_PAUSE_COMMA = 0.3      # gap >= this → clause boundary (comma)
+# Group segments into chunks of ~this many words before sending to LLM.
+_LLM_CHUNK_WORDS = 400
+# Fallback: target word count per sentence when timing gaps are absent.
+_SENTENCE_WORD_TARGET = 20
+_SENTENCE_WORD_MIN = 10
+
+
+def _group_segments_by_pauses(
+    segments: list[TranscriptSegment],
+) -> list[tuple[str, float, float]]:
+    """Group VTT segments into sentence-like units using speech pauses.
+
+    Returns list of (text, start, end) tuples. Each tuple is one probable
+    sentence. Uses two signals:
+      1. Timing gaps (>= _PAUSE_SENTENCE → new sentence, >= _PAUSE_COMMA → comma)
+      2. Word count heuristic (if no timing gaps, split at ~_SENTENCE_WORD_TARGET words)
+    """
+    if not segments:
+        return []
+    sentences: list[tuple[str, float, float]] = []
+    current_words: list[str] = []
+    current_start = segments[0].start
+    current_end = segments[0].end
+    prev_end = segments[0].end
+
+    # Check if we have meaningful timing gaps
+    has_gaps = False
+    for i in range(1, len(segments)):
+        gap = segments[i].start - segments[i - 1].end
+        if gap >= _PAUSE_COMMA:
+            has_gaps = True
+            break
+
+    for i, seg in enumerate(segments):
+        text = seg.text.strip()
+        if not text:
+            continue
+        gap = seg.start - prev_end if i > 0 else 0.0
+        word_count = len(current_words)
+
+        # Start new sentence on: long pause OR word count target (when no gaps)
+        should_break = False
+        if gap >= _PAUSE_SENTENCE and current_words:
+            should_break = True
+        elif not has_gaps and word_count >= _SENTENCE_WORD_TARGET and current_words:
+            should_break = True
+        elif gap >= _PAUSE_COMMA and current_words and has_gaps:
+            current_words.append(",")
+
+        if should_break:
+            sentences.append((" ".join(current_words), current_start, current_end))
+            current_words = []
+            current_start = seg.start
+
+        current_words.extend(text.split())
+        current_end = seg.end
+        prev_end = seg.end
+
+    if current_words:
+        sentences.append((" ".join(current_words), current_start, current_end))
+    return sentences
+
+
+def _restore_punctuation_llm(text: str) -> str | None:
+    """Use OpenAI GPT-4o-mini to restore punctuation and capitalization.
+
+    Returns punctuated text, or None if the API call fails or no API key.
+    """
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        return None
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key, timeout=60)
+        # Process in chunks to stay within token limits
+        words = text.split()
+        chunks: list[str] = []
+        for i in range(0, len(words), _LLM_CHUNK_WORDS):
+            chunk = " ".join(words[i : i + _LLM_CHUNK_WORDS])
+            chunks.append(chunk)
+        results: list[str] = []
+        for chunk in chunks:
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a punctuation restoration tool. Add periods, "
+                            "commas, question marks, and capitalization to the "
+                            "following auto-generated transcript text. Preserve "
+                            "the original words exactly — only add punctuation and "
+                            "fix capitalization. Do not add or remove words."
+                        ),
+                    },
+                    {"role": "user", "content": chunk},
+                ],
+                temperature=0,
+                max_tokens=2000,
+            )
+            punctuated = resp.choices[0].message.content.strip()
+            results.append(punctuated)
+        return " ".join(results)
+    except Exception:
+        return None
+
+
+def restore_punctuation(
+    text: str,
+    segments: list[TranscriptSegment],
+) -> tuple[str, bool]:
+    """Restore punctuation to unpunctuated auto-caption text.
+
+    Tries (in order):
+      1. OpenAI GPT-4o-mini (best quality, ~$0.01/video)
+      2. Timing-based sentence boundaries from VTT segments
+      3. Returns original text unchanged (last resort)
+
+    Returns (punctuated_text, used_llm) tuple.
+    """
+    # Already punctuated? Don't touch it.
+    period_count = text.count(".") + text.count("?") + text.count("!")
+    if period_count > 5 or len(text) < 200:
+        return text, False
+
+    # Try LLM first
+    llm_result = _restore_punctuation_llm(text)
+    if llm_result and len(llm_result) > len(text) * 0.5:
+        return llm_result, True
+
+    # Fallback: timing-based sentence boundaries
+    grouped = _group_segments_by_pauses(segments)
+    if grouped:
+        sentences: list[str] = []
+        for raw, _start, _end in grouped:
+            s = raw.strip().rstrip(",").strip()
+            if not s:
+                continue
+            # Capitalize first letter
+            s = s[0].upper() + s[1:] if s else s
+            # Ensure terminal punctuation
+            if s[-1] not in ".!?":
+                s += "."
+            sentences.append(s)
+        return " ".join(sentences), False
+
+    return text, False
 
 
 # ---------------------------------------------------------------- YT-DLP OPTIONS BUILDER
@@ -3395,6 +3554,7 @@ def prepare_deep_research(
     cookies_from_browser: str | None = None,
     proxy: str | None = None,
     retries: int = DEFAULT_RETRIES,
+    enable_visual: bool = False,
 ) -> dict:
     """Fetch transcript, clean it, extract claims + sources, and prepare
     a comprehensive research package for Deep Research analysis.
@@ -3405,6 +3565,9 @@ def prepare_deep_research(
        maps arguments, assesses bias, cross-references, produces deep research brief
 
     Quality over speed — no caps on claims. Every significant claim gets verified.
+
+    If enable_visual is True, also downloads the video and extracts visual
+    content (on-screen text, chart patterns) using OpenAI vision API.
     """
     # Step 1: Fetch transcript
     print(f"[1/3] Fetching transcript for: {url_or_id}", file=sys.stderr)
@@ -3441,50 +3604,23 @@ def prepare_deep_research(
     print(f"[3/4] Extracting entities and enriched claims...", file=sys.stderr)
     segments: list[TranscriptSegment] = result.segments if hasattr(result, 'segments') else []
 
-    # If text has no punctuation (common in auto-captions), use segment
-    # boundaries to insert paragraph breaks before cleaning
+    # If text has no punctuation (common in auto-captions), restore it.
     period_count = raw_body.count(".") + raw_body.count("?") + raw_body.count("!")
-    auto_captioned = False  # track whether we added fake punctuation
+    auto_captioned = False  # track whether we restored punctuation
+    used_llm_punctuation = False
     if segments and period_count < 5 and len(raw_body) > 1000:
-        # Rebuild text with segment boundaries as paragraph breaks
-        seg_texts = [seg.text.strip() for seg in segments if seg.text.strip()]
-        # Group segments into paragraphs by timing gaps (2+ second pauses)
-        paragraphs: list[str] = []
-        current_para: list[str] = []
-        prev_end = 0.0
-        for seg, text in zip(segments, seg_texts):
-            if current_para and seg.start - prev_end > 2.0:
-                paragraphs.append(" ".join(current_para))
-                current_para = []
-            current_para.append(text)
-            prev_end = seg.end
-        if current_para:
-            paragraphs.append(" ".join(current_para))
-        raw_body = "\n\n".join(paragraphs)
-        # Re-clean with proper paragraph breaks
-        cleaned_body = clean_transcript_text(raw_body)
-        auto_captioned = True  # we added fake paragraph breaks
+        # Restore punctuation using LLM (best) or timing-based fallback
+        restored, used_llm_punctuation = restore_punctuation(raw_body, segments)
+        if restored != raw_body:
+            raw_body = restored
+            cleaned_body = clean_transcript_text(raw_body)
+            auto_captioned = True
 
-    # Build a properly-punctuated version for extractors that need
-    # real sentence boundaries (definitions, rules, questions).
-    # When auto-captioned, use VTT segment boundaries as sentence boundaries.
+    # extractor_body is the properly-punctuated text for sentence-dependent
+    # extractors (definitions, rules, questions). For auto-captioned videos
+    # we already restored punctuation above, so it matches cleaned_body.
+    # For human-captioned videos, cleaned_body already has real punctuation.
     extractor_body = cleaned_body
-    if auto_captioned and segments:
-        # Each VTT segment is roughly one phrase/sentence.
-        # Build text with real periods at segment boundaries.
-        seg_sentences: list[str] = []
-        for seg in segments:
-            text = seg.text.strip()
-            if not text:
-                continue
-            # Ensure it ends with punctuation
-            if text[-1] not in ".!?":
-                text += "."
-            # Capitalize first letter
-            if text:
-                text = text[0].upper() + text[1:]
-            seg_sentences.append(text)
-        extractor_body = " ".join(seg_sentences)
 
     cleaned_path = _write_cleaned_transcript(result, cleaned_body, out)
 
@@ -3513,6 +3649,29 @@ def prepare_deep_research(
     # Extract sources from cleaned transcript + description
     sources = extract_sources(extractor_body, description)
 
+    # Extract advanced content (contradictions, marketing, rules, etc.)
+    advanced = extract_all(extractor_body, ts_sentences or None)
+
+    # Extract visual content (frames + vision AI analysis)
+    visual_content: dict[str, Any] = {
+        "enabled": enable_visual,
+        "video_downloaded": False,
+        "frames_extracted": 0,
+        "frames_analyzed": 0,
+        "visual_claims": [],
+        "on_screen_texts": [],
+        "chart_patterns": [],
+        "frame_analyses": [],
+    }
+    if enable_visual:
+        print(f"[4/4] Extracting visual content from video frames...", file=sys.stderr)
+        video_id = parse_video_id(url_or_id)
+        visual_content = extract_visual_content(
+            video_id, out, duration=result.duration,
+            cookies_file=cookies_file, cookies_from_browser=cookies_from_browser,
+            proxy=proxy, enable_visual=enable_visual,
+        )
+
     # Build the research package
     package = {
         "ok": True,
@@ -3537,6 +3696,9 @@ def prepare_deep_research(
             "paragraph_count": len(cleaned_body.split("\n\n")),
             "has_timestamps": len(segments) > 0,
             "segment_count": len(segments),
+            "auto_captioned": auto_captioned,
+            "punctuation_restored": auto_captioned,
+            "punctuation_method": "llm" if used_llm_punctuation else ("timing" if auto_captioned else "original"),
         },
         "extracted_claims": claims,
         "extracted_entities": entities,
@@ -3545,7 +3707,8 @@ def prepare_deep_research(
         "entity_count": sum(len(v) if isinstance(v, list) else 0 for v in entities.values()),
         "source_count": sum(len(v) if isinstance(v, list) else 0 for v in sources.values()),
         "timestamped_sentences": [s.to_dict() for s in ts_sentences] if ts_sentences else [],
-        "advanced_extraction": extract_all(extractor_body, ts_sentences or None),
+        "advanced_extraction": advanced,
+        "visual_extraction": visual_content,
         "schema": DEEP_RESEARCH_SCHEMA,
         "instructions": (
             "DEEP RESEARCH WORKFLOW — QUALITY OVER SPEED\n\n"
@@ -3599,6 +3762,310 @@ def prepare_deep_research(
     print(f"  Package saved:     {package_path}", file=sys.stderr)
 
     return package
+
+
+# ---------------------------------------------------------------- VISUAL EXTRACTION
+
+# Frame extraction interval (seconds). One frame every N seconds.
+_FRAME_INTERVAL = 60
+# Max frames to extract (cap for very long videos).
+_MAX_FRAMES = 60
+# Video download format — low quality, no audio, smallest possible.
+_VIDEO_FORMAT = "worst[ext=mp4]/worst"
+# Frames directory name within output dir.
+_FRAMES_SUBDIR = "_frames"
+
+
+def _download_video_low_quality(
+    video_id: str,
+    output_dir: Path,
+    cookies_file: str | None = None,
+    cookies_from_browser: str | None = None,
+    proxy: str | None = None,
+) -> Path | None:
+    """Download video in lowest quality for frame extraction.
+
+    Returns path to downloaded video file, or None on failure.
+    """
+    video_path = output_dir / f"{video_id}_video.mp4"
+    if video_path.exists() and video_path.stat().st_size > 1000:
+        return video_path  # already downloaded
+
+    opts: dict[str, Any] = {
+        "format": _VIDEO_FORMAT,
+        "outtmpl": str(video_path),
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": False,
+    }
+    if cookies_file:
+        opts["cookiefile"] = cookies_file
+    if cookies_from_browser:
+        opts["cookiesfrombrowser"] = (cookies_from_browser,)
+    if proxy:
+        opts["proxy"] = proxy
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([video_id])
+        if video_path.exists() and video_path.stat().st_size > 1000:
+            return video_path
+    except Exception as e:
+        print(f"  [visual] Video download failed: {e}", file=sys.stderr)
+    return None
+
+
+def _extract_frames(
+    video_path: Path,
+    output_dir: Path,
+    interval: int = _FRAME_INTERVAL,
+    max_frames: int = _MAX_FRAMES,
+) -> list[Path]:
+    """Extract frames from video at regular intervals using ffmpeg.
+
+    Returns list of frame file paths (PNG).
+    """
+    frames_dir = output_dir / _FRAMES_SUBDIR
+    frames_dir.mkdir(parents=True, exist_ok=True)
+
+    # Clear old frames
+    for old in frames_dir.glob("*.png"):
+        old.unlink()
+
+    frames: list[Path] = []
+    try:
+        # Get video duration
+        import subprocess
+        probe = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)],
+            capture_output=True, text=True, timeout=30,
+        )
+        duration = float(probe.stdout.strip()) if probe.stdout.strip() else 0
+        if duration <= 0:
+            return []
+
+        # Calculate frame timestamps
+        num_frames = min(max_frames, int(duration / interval))
+        if num_frames < 1:
+            num_frames = 1
+
+        for i in range(num_frames):
+            timestamp = i * interval
+            frame_path = frames_dir / f"frame_{i:04d}_{int(timestamp//60):02d}m{int(timestamp%60):02d}s.png"
+            subprocess.run(
+                ["ffmpeg", "-ss", str(timestamp), "-i", str(video_path),
+                 "-frames:v", "1", "-q:v", "2", "-y", str(frame_path)],
+                capture_output=True, timeout=30,
+            )
+            if frame_path.exists() and frame_path.stat().st_size > 1000:
+                frames.append(frame_path)
+
+    except Exception as e:
+        print(f"  [visual] Frame extraction failed: {e}", file=sys.stderr)
+
+    return frames
+
+
+def _analyze_frame_with_vision(
+    frame_path: Path,
+    timestamp: float,
+    api_key: str | None = None,
+) -> dict | None:
+    """Analyze a single video frame using OpenAI vision API.
+
+    Returns dict with: timestamp, on_screen_text, chart_patterns,
+    visual_content, description. Or None if API unavailable.
+    """
+    api_key = api_key or os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        return None
+
+    try:
+        import base64
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key, timeout=60)
+
+        # Encode image
+        with open(frame_path, "rb") as f:
+            img_data = base64.b64encode(f.read()).decode("utf-8")
+
+        # Determine mime type
+        ext = frame_path.suffix.lower()
+        mime = "image/png" if ext == ".png" else "image/jpeg"
+
+        timestamp_str = f"{int(timestamp // 60):02d}:{int(timestamp % 60):02d}"
+
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a visual content analyzer for educational/trading videos. "
+                        "Analyze the provided video frame and extract:\n"
+                        "1. on_screen_text: Any text visible on screen (indicator settings, "
+                        "price levels, labels, titles, bullet points, code snippets)\n"
+                        "2. chart_patterns: If this shows a financial chart, identify any "
+                        "visible patterns (head and shoulders, candlesticks, trendlines, "
+                        "support/resistance levels, indicators shown)\n"
+                        "3. visual_content: What's being shown (diagram, chart, slide, "
+                        "person talking, screen recording, demo, etc.)\n"
+                        "4. description: One-sentence summary of what's visible\n\n"
+                        "Respond as JSON with these exact keys."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"This frame is from timestamp {timestamp_str} in the video. Analyze it.",
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{mime};base64,{img_data}"},
+                        },
+                    ],
+                },
+            ],
+            temperature=0,
+            max_tokens=500,
+            response_format={"type": "json_object"},
+        )
+
+        result = json.loads(resp.choices[0].message.content)
+        result["timestamp"] = timestamp
+        result["timestamp_str"] = timestamp_str
+        result["frame_file"] = frame_path.name
+        return result
+
+    except Exception as e:
+        print(f"  [visual] Frame analysis failed for {frame_path.name}: {e}", file=sys.stderr)
+        return None
+
+
+def extract_visual_content(
+    video_id: str,
+    output_dir: Path,
+    duration: int = 0,
+    cookies_file: str | None = None,
+    cookies_from_browser: str | None = None,
+    proxy: str | None = None,
+    enable_visual: bool = True,
+) -> dict:
+    """Extract visual content from a YouTube video.
+
+    Downloads the video, extracts frames at intervals, and analyzes each
+    frame using OpenAI vision API. Returns a dict with visual extraction
+    results. If visual extraction is disabled or API unavailable, returns
+    empty results.
+
+    Returns:
+        {
+            "enabled": bool,
+            "video_downloaded": bool,
+            "frames_extracted": int,
+            "frames_analyzed": int,
+            "visual_claims": [...],  # claims derived from visual content
+            "on_screen_texts": [...],  # text seen on screen
+            "chart_patterns": [...],  # chart patterns identified
+            "frame_analyses": [...],  # full analysis per frame
+        }
+    """
+    result: dict[str, Any] = {
+        "enabled": enable_visual,
+        "video_downloaded": False,
+        "frames_extracted": 0,
+        "frames_analyzed": 0,
+        "visual_claims": [],
+        "on_screen_texts": [],
+        "chart_patterns": [],
+        "frame_analyses": [],
+    }
+
+    if not enable_visual:
+        return result
+
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        print("  [visual] No OPENAI_API_KEY — skipping visual extraction", file=sys.stderr)
+        return result
+
+    # Step 1: Download video
+    print("  [visual] Downloading video (low quality)...", file=sys.stderr)
+    video_path = _download_video_low_quality(
+        video_id, output_dir, cookies_file, cookies_from_browser, proxy,
+    )
+    if not video_path:
+        return result
+    result["video_downloaded"] = True
+
+    # Step 2: Extract frames
+    print("  [visual] Extracting frames...", file=sys.stderr)
+    frames = _extract_frames(video_path, output_dir)
+    result["frames_extracted"] = len(frames)
+    if not frames:
+        return result
+
+    # Step 3: Analyze each frame
+    print(f"  [visual] Analyzing {len(frames)} frames with vision AI...", file=sys.stderr)
+    on_screen_texts: list[dict] = []
+    chart_patterns: list[dict] = []
+    visual_claims: list[dict] = []
+    frame_analyses: list[dict] = []
+
+    for frame in frames:
+        # Parse timestamp from filename (frame_NNNN_MMmSSs.png)
+        match = re.search(r"(\d+)m(\d+)s", frame.name)
+        timestamp = int(match.group(1)) * 60 + int(match.group(2)) if match else 0
+
+        analysis = _analyze_frame_with_vision(frame, timestamp, api_key)
+        if analysis:
+            frame_analyses.append(analysis)
+            result["frames_analyzed"] += 1
+
+            # Collect on-screen text
+            ost = analysis.get("on_screen_text", "")
+            if ost and len(ost) > 3:
+                on_screen_texts.append({
+                    "timestamp": timestamp,
+                    "timestamp_str": analysis.get("timestamp_str", ""),
+                    "text": ost,
+                })
+
+            # Collect chart patterns
+            cp = analysis.get("chart_patterns", "")
+            if cp and len(cp) > 3:
+                chart_patterns.append({
+                    "timestamp": timestamp,
+                    "timestamp_str": analysis.get("timestamp_str", ""),
+                    "patterns": cp,
+                })
+
+            # Generate visual claims from description
+            desc = analysis.get("description", "")
+            if desc:
+                visual_claims.append({
+                    "timestamp": timestamp,
+                    "timestamp_str": analysis.get("timestamp_str", ""),
+                    "claim": desc,
+                    "source": "visual",
+                    "type": "visual_observation",
+                })
+
+    result["on_screen_texts"] = on_screen_texts
+    result["chart_patterns"] = chart_patterns
+    result["visual_claims"] = visual_claims
+    result["frame_analyses"] = frame_analyses
+
+    # Clean up video file to save space (keep frames)
+    try:
+        video_path.unlink()
+    except Exception:
+        pass
+
+    return result
 
 
 # ---------------------------------------------------------------- TEXT-TO-SPEECH (TTS)
@@ -4983,6 +5450,7 @@ def main() -> int:
     sp_dr.add_argument("--retries", type=int, default=DEFAULT_RETRIES, help="Max retries on network errors")
     sp_dr.add_argument("--output", default="", help="Custom output directory")
     sp_dr.add_argument("--json", action="store_true", help="Output as JSON (default: human-readable)")
+    sp_dr.add_argument("--visual", action="store_true", help="Extract visual content from video frames (requires OpenAI API key)")
 
     sp_read = sub.add_parser("read", help="Read a research report aloud as MP3 (text-to-speech)")
     sp_read.add_argument("report", help="Path to report JSON (_research.json or _deep_research.json)")
@@ -5180,6 +5648,7 @@ def main() -> int:
             cookies_from_browser=cookies_browser,
             proxy=proxy,
             retries=retries,
+            enable_visual=getattr(args, "visual", False),
         )
         if not result.get("ok"):
             print(f"FAILED: {result.get('error', 'unknown error')}", file=sys.stderr)
@@ -5233,6 +5702,20 @@ def main() -> int:
                 for p in src["people"][:5]:
                     print(f"    - {p}")
             print(f"{'─' * 70}")
+            # Visual extraction summary
+            ve = result.get("visual_extraction", {})
+            if ve.get("enabled"):
+                print(f"  VISUAL EXTRACTION")
+                print(f"  Video downloaded: {ve.get('video_downloaded', False)}")
+                print(f"  Frames extracted: {ve.get('frames_extracted', 0)}")
+                print(f"  Frames analyzed:  {ve.get('frames_analyzed', 0)}")
+                if ve.get("on_screen_texts"):
+                    print(f"  On-screen texts:  {len(ve['on_screen_texts'])}")
+                if ve.get("chart_patterns"):
+                    print(f"  Chart patterns:   {len(ve['chart_patterns'])}")
+                if ve.get("visual_claims"):
+                    print(f"  Visual claims:    {len(ve['visual_claims'])}")
+                print(f"{'─' * 70}")
             print(f"  Research package: {result['research_package_path']}")
             print(f"{'─' * 70}")
             print(f"  NEXT STEP: Deep Research Phase 2 — Devin executes:")

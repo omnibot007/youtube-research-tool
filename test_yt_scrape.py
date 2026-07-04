@@ -25,6 +25,11 @@ from yt_scrape import (
     prepare_light_research,
     LIGHT_RESEARCH_SCHEMA,
     VideoInfo,
+    TranscriptSegment,
+    _group_segments_by_pauses,
+    restore_punctuation,
+    extract_visual_content,
+    _analyze_frame_with_vision,
 )
 
 
@@ -1982,3 +1987,191 @@ class TestExtractAll:
         ]
         result = extract_all("RSI is a momentum indicator. If RSI is below 30, buy.", sentences)
         assert len(result["definitions"]) >= 1 or len(result["rules"]) >= 1
+
+
+# === PUNCTUATION RESTORATION ===
+class TestGroupSegmentsByPauses:
+    def test_empty_segments(self):
+        assert _group_segments_by_pauses([]) == []
+
+    def test_single_segment(self):
+        segs = [TranscriptSegment(text="hello world", start=0.0, end=2.0)]
+        result = _group_segments_by_pauses(segs)
+        assert len(result) == 1
+        assert result[0][0] == "hello world"
+
+    def test_groups_by_pause(self):
+        """Segments with a gap >= 0.8s become separate sentences."""
+        segs = [
+            TranscriptSegment(text="this is the first part", start=0.0, end=2.0),
+            TranscriptSegment(text="this is the second part", start=3.0, end=5.0),  # 1.0s gap
+        ]
+        result = _group_segments_by_pauses(segs)
+        assert len(result) == 2
+        assert "first part" in result[0][0]
+        assert "second part" in result[1][0]
+
+    def test_inserts_comma_for_short_gap(self):
+        """Segments with a gap >= 0.3s but < 0.8s get a comma."""
+        segs = [
+            TranscriptSegment(text="this is clause one", start=0.0, end=2.0),
+            TranscriptSegment(text="this is clause two", start=2.4, end=4.0),  # 0.4s gap
+        ]
+        result = _group_segments_by_pauses(segs)
+        assert len(result) == 1  # still one sentence
+        assert "," in result[0][0]
+
+    def test_no_gap_stays_together(self):
+        """Segments with no gap stay in the same sentence."""
+        segs = [
+            TranscriptSegment(text="word one", start=0.0, end=1.0),
+            TranscriptSegment(text="word two", start=1.0, end=2.0),
+            TranscriptSegment(text="word three", start=2.0, end=3.0),
+        ]
+        result = _group_segments_by_pauses(segs)
+        assert len(result) == 1
+        assert "word one" in result[0][0]
+        assert "word two" in result[0][0]
+        assert "word three" in result[0][0]
+
+    def test_preserves_timestamps(self):
+        segs = [
+            TranscriptSegment(text="first sentence", start=1.5, end=3.0),
+            TranscriptSegment(text="second sentence", start=5.0, end=7.0),
+        ]
+        result = _group_segments_by_pauses(segs)
+        assert result[0][1] == 1.5  # start
+        assert result[0][2] == 3.0  # end
+        assert result[1][1] == 5.0
+        assert result[1][2] == 7.0
+
+    def test_skips_empty_segments(self):
+        segs = [
+            TranscriptSegment(text="real text", start=0.0, end=1.0),
+            TranscriptSegment(text="", start=1.0, end=1.5),
+            TranscriptSegment(text="more text", start=1.5, end=2.5),  # 0.5s gap from prev_end=1.0
+        ]
+        result = _group_segments_by_pauses(segs)
+        # Empty segment skipped; gap from first end (1.0) to third start (1.5) = 0.5s < 0.8s
+        assert len(result) == 1
+        assert "real text" in result[0][0]
+        assert "more text" in result[0][0]
+
+
+class TestRestorePunctuation:
+    def test_already_punctuated_unchanged(self):
+        """Text with enough punctuation should not be touched."""
+        text = "This is a sentence. This is another. And a third one! Is this a question?"
+        result, used_llm = restore_punctuation(text, [])
+        assert result == text
+        assert used_llm is False
+
+    def test_short_text_unchanged(self):
+        """Short text should not be processed."""
+        text = "no punctuation here"
+        result, used_llm = restore_punctuation(text, [])
+        assert result == text
+
+    def test_timing_fallback_adds_periods(self):
+        """Without LLM, timing-based fallback should add periods."""
+        text = "this is the first sentence this is the second sentence" + " word" * 200
+        segs = [
+            TranscriptSegment(text="this is the first sentence", start=0.0, end=2.0),
+            TranscriptSegment(text="this is the second sentence", start=3.0, end=5.0),
+        ] + [TranscriptSegment(text=f"word{i}", start=5.0 + i, end=5.5 + i) for i in range(200)]
+        # Mock LLM to return None (no API key)
+        with patch("yt_scrape._restore_punctuation_llm", return_value=None):
+            result, used_llm = restore_punctuation(text, segs)
+        assert used_llm is False
+        assert "." in result  # timing fallback added periods
+        assert result[0].isupper()  # capitalized
+
+    def test_llm_punctuation_used_when_available(self):
+        """When LLM returns text, it should be used."""
+        text = "this is unpunctuated text " + "word " * 200
+        segs = [TranscriptSegment(text="test", start=0.0, end=1.0)]
+        llm_result = "This is unpunctuated text. " + "word. " * 200
+        with patch("yt_scrape._restore_punctuation_llm", return_value=llm_result):
+            result, used_llm = restore_punctuation(text, segs)
+        assert used_llm is True
+        assert result == llm_result
+
+    def test_llm_failure_falls_back_to_timing(self):
+        """If LLM returns None, should fall back to timing."""
+        text = "first part second part" + " word" * 200
+        segs = [
+            TranscriptSegment(text="first part", start=0.0, end=2.0),
+            TranscriptSegment(text="second part", start=3.0, end=5.0),
+        ] + [TranscriptSegment(text=f"word{i}", start=5.0 + i, end=5.5 + i) for i in range(200)]
+        with patch("yt_scrape._restore_punctuation_llm", return_value=None):
+            result, used_llm = restore_punctuation(text, segs)
+        assert used_llm is False
+        assert "." in result
+
+    def test_no_segments_returns_original(self):
+        """With no segments and no LLM, should return original text."""
+        text = "no punctuation at all " + "word " * 200
+        with patch("yt_scrape._restore_punctuation_llm", return_value=None):
+            result, used_llm = restore_punctuation(text, [])
+        assert result == text
+        assert used_llm is False
+
+
+# === VISUAL EXTRACTION ===
+class TestExtractVisualContent:
+    def test_disabled_returns_empty(self):
+        """When enable_visual=False, should return empty results."""
+        result = extract_visual_content("test_id", Path("/tmp"), enable_visual=False)
+        assert result["enabled"] is False
+        assert result["frames_extracted"] == 0
+        assert result["visual_claims"] == []
+
+    def test_no_api_key_returns_empty(self):
+        """When no OPENAI_API_KEY, should return empty results."""
+        with patch.dict(os.environ, {}, clear=True):
+            result = extract_visual_content("test_id", Path("/tmp"), enable_visual=True)
+        assert result["enabled"] is True
+        assert result["video_downloaded"] is False
+        assert result["frames_analyzed"] == 0
+
+
+class TestAnalyzeFrameWithVision:
+    def test_no_api_key_returns_none(self):
+        """When no API key, should return None."""
+        with patch.dict(os.environ, {}, clear=True):
+            result = _analyze_frame_with_vision(Path("/tmp/fake.png"), 0.0)
+        assert result is None
+
+    def test_mocked_api_call(self):
+        """When API returns JSON, should parse it correctly."""
+        from pathlib import Path as P
+        import base64
+        # Create a fake image file
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+            f.write(b"fake_png_data")
+            frame_path = P(f.name)
+
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = json.dumps({
+            "on_screen_text": "RSI: 14",
+            "chart_patterns": "Bullish divergence",
+            "visual_content": "Trading chart",
+            "description": "Chart showing RSI indicator with bullish divergence",
+        })
+
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test_key"}):
+            with patch("openai.OpenAI") as mock_openai:
+                mock_client = MagicMock()
+                mock_client.chat.completions.create.return_value = mock_response
+                mock_openai.return_value = mock_client
+                result = _analyze_frame_with_vision(frame_path, 120.0, "test_key")
+
+        assert result is not None
+        assert result["timestamp"] == 120.0
+        assert result["on_screen_text"] == "RSI: 14"
+        assert result["chart_patterns"] == "Bullish divergence"
+        assert result["timestamp_str"] == "02:00"
+
+        # Cleanup
+        frame_path.unlink(missing_ok=True)
