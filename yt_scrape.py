@@ -1563,6 +1563,16 @@ _PERSON_BLACKLIST = frozenset({
     "YouTube Channel", "Social Media", "Web Site",
     "Thank You", "Good Morning", "Good Evening", "Good Night",
     "White House", "Red Sea", "Black Sea",
+    # Book titles commonly mistaken for people
+    "Dopamine Nation", "Growth Mindset", "Rich Dad", "Poor Dad",
+    "Market Wizards", "Trading View", "Trading Course",
+    # Concept/jargon commonly mistaken for people
+    "Macuna Pruriens", "Mucuna Pruriens",  # plant, not person
+    "Cell Press", "Nature Reviews", "National Academy",
+    "Applied Physiology", "Clinical Endocrinology",
+    "European Journal", "Stanford School", "Huberman Lab",
+    "Cold Exposure", "Cold Shower", "Ice Bath",
+    "Growth Hormone", "Blood Flow",
 })
 
 # --- Organizations ---
@@ -1588,7 +1598,13 @@ _RE_TOOLS = re.compile(
     r"Excel|Google\s+Sheets|Python|R\s+Studio|Jupyter|"
     r"ChatGPT|Claude|Gemini|Copilot|Midjourney|Stable\s+Diffusion|"
     r"Notion|Obsidian|Roam|Linear|GitHub|GitLab|Bitbucket|"
-    r"Photoshop|Illustrator|Figma|Sketch|After\s+Effects|Premiere)\b",
+    r"Photoshop|Illustrator|Figma|Sketch|After\s+Effects|Premiere|"
+    # Health/wellness tools
+    r"Headspace|Calm|Whoop|Oura\s+Ring|Eight\s+Sleep|"
+    r"Oura|Levels|Dexcom|Veri|Nutrisense|"
+    r"ROKA|Roka|Athletic\s+Greens|AG1|"
+    r"Theragun|Hyperice|Sauna\s+Space|"
+    r"InsideTracker|Function\s+Health)\b",
 )
 
 # --- Financial / Technical Metrics ---
@@ -2049,6 +2065,26 @@ _ANTONYM_PAIRS = [
 ]
 
 # Negation flip: if one claim is negated and the other isn't, that's a contradiction
+def _subjects_match(subj_a: str, subj_b: str) -> bool:
+    """Check if two subjects are the same (fuzzy matching)."""
+    if not subj_a or not subj_b:
+        return False
+    # Exact match
+    if subj_a == subj_b:
+        return True
+    # One is substring of the other
+    if subj_a in subj_b or subj_b in subj_a:
+        return True
+    # Shared key word (both contain a significant word)
+    words_a = set(subj_a.split()) - {"the", "a", "an", "is", "are", "was", "were", "this", "that", "it"}
+    words_b = set(subj_b.split()) - {"the", "a", "an", "is", "are", "was", "were", "this", "that", "it"}
+    shared = words_a & words_b
+    # If they share a significant word (3+ chars), they're related
+    if any(len(w) >= 3 for w in shared):
+        return True
+    return False
+
+
 def _claims_contradict(claim_a: dict, claim_b: dict) -> tuple[bool, str]:
     """Check if two claims contradict each other.
 
@@ -2072,17 +2108,20 @@ def _claims_contradict(claim_a: dict, claim_b: dict) -> tuple[bool, str]:
 
         # A says positive, B says negative (or vice versa)
         if (a_pos and b_neg) or (a_neg and b_pos):
-            # If they share a subject, strong contradiction
-            if subj_a and subj_b and subj_a == subj_b:
-                return True, f"Same subject '{subj_a}' with opposite polarity"
-            # If subjects overlap partially
-            if subj_a and subj_b and (subj_a in subj_b or subj_b in subj_a):
+            # Use fuzzy subject matching
+            if _subjects_match(subj_a, subj_b):
                 return True, f"Related subject with opposite polarity"
 
     # Negation flip: A says X, B says NOT X (about same subject)
-    if subj_a and subj_b and subj_a == subj_b:
+    if _subjects_match(subj_a, subj_b):
         if neg_a != neg_b:
-            return True, f"Same subject '{subj_a}' with negation flip"
+            return True, f"Same subject with negation flip"
+
+    # Also check: same sentence text with negation flip (no subject needed)
+    if sent_a and sent_b and neg_a != neg_b:
+        # If sentences are very similar (same claim, different polarity)
+        if subj_a and subj_b and _subjects_match(subj_a, subj_b):
+            return True, f"Negation flip on same subject"
 
     return False, ""
 
@@ -2168,7 +2207,21 @@ _RE_AFFILIATE = re.compile(
     r"link\s+below|"
     r"promo\s+code|coupon\s+code|discount\s+code|"
     r"sponsored\s+by|brought\s+to\s+you\s+by|"
-    r"partner|partnership)\b",
+    r"partner|partnership|"
+    # Sponsor read patterns (common in podcasts/YouTube)
+    r"today.s\s+(?:episode|video)\s+is\s+(?:sponsored|brought\s+to\s+you)|"
+    r"this\s+(?:episode|video)\s+is\s+(?:sponsored|brought\s+to\s+you)|"
+    r"our\s+sponsor|"
+    r"check\s+out\s+(?:our\s+)?sponsor|"
+    r"special\s+thanks\s+to\s+(?:our\s+)?sponsor|"
+    r"use\s+code\s+\w+|"
+    r"visit\s+\w+\.com|"
+    r"go\s+to\s+\w+\.com|"
+    r"head\s+over\s+to\s+\w+\.com|"
+    r"if\s+you.d\s+like\s+to\s+try\s+\w+|"
+    r"if\s+you.re\s+(?:interested|looking)\s+in\s+\w+.{0,30}(?:link|code|below)|"
+    r"discount\s+at\s+\w+|"
+    r"special\s+(?:offer|deal|price)\s+for\s+(?:you|our|the)\s+(?:viewers?|listeners?|audience))\b",
     re.I,
 )
 
@@ -2425,9 +2478,32 @@ def extract_rules(text: str) -> list[dict]:
         # Common non-trading phrases to filter out
         non_rule_phrases = {"want to", "pause", "watch", "learn", "understand",
                            "take a look", "look at", "see", "find", "notice",
-                           "know", "think", "remember", "forget"}
+                           "know", "think", "remember", "forget",
+                           "love", "like", "enjoy", "prefer", "feel",
+                           "hope", "wish", "believe", "guess",
+                           "talk", "discuss", "explain", "describe",
+                           "show", "demonstrate", "illustrate",
+                           "give", "offer", "provide", "share",
+                           "try", "attempt", "consider"}
+        # Trading-relevant keywords — at least one must appear in condition or action
+        # Use specific compound terms to avoid false positives from ambiguous words
+        trading_keywords = {"rsi", "macd", "bollinger", "moving average", "stochastic",
+                           "atr", "adx", "ema", "sma", "indicator", "signal",
+                           "buy", "sell", "bullish", "bearish",
+                           "stop loss", "take profit", "risk reward", "leverage",
+                           "position size", "trade", "trading", "entry", "exit",
+                           "support level", "resistance level", "breakout", "reversal",
+                           "candlestick", "chart pattern", "price action", "volume",
+                           "overbought", "oversold", "divergence",
+                           "portfolio", "invest", "asset", "stock", "crypto",
+                           "forex", "futures", "options", "margin call",
+                           # Health/science rules — specific terms only
+                           "dose", "supplement", "sleep", "exercise", "diet",
+                           "intermittent fasting", "cold exposure", "cold shower",
+                           "ice bath", "sauna", "protocol", "prescription"}
         action_lower = action.lower()
         condition_lower = condition.lower()
+        combined_lower = condition_lower + " " + action_lower
 
         # Skip if the action is just "look at" or "take a look" — not a rule
         if any(nrp in action_lower for nrp in non_rule_phrases):
@@ -2435,7 +2511,12 @@ def extract_rules(text: str) -> list[dict]:
         # Skip if condition is too generic ("you guys", "you have", "we take")
         if condition_lower in {"you guys", "you have", "we take", "you want",
                                "we have", "you can", "we can", "you need",
-                               "we need", "you see", "we see"}:
+                               "we need", "you see", "we see", "i work",
+                               "i drive", "there are", "there is", "it is",
+                               "this is", "that is", "here is"}:
+            continue
+        # Require at least one trading/health keyword in the rule
+        if not any(kw in combined_lower for kw in trading_keywords):
             continue
         if not any(av in action_lower for av in action_verbs):
             continue
@@ -2926,8 +3007,10 @@ def extract_definitions(text: str) -> list[dict]:
         period_ratio = 0
     # Real punctuation: ~1 period per 15-20 words. Fake: ~1 per 5-8.
     # Only apply ratio check for longer texts (transcripts, not test sentences)
+    # Note: auto-captioned videos rebuilt from VTT segments have ~1 period
+    # per 8-12 words (shorter sentences), so use a more lenient threshold
     if word_count > 100:
-        has_real_punctuation = punct_count > 10 and period_ratio < 0.1
+        has_real_punctuation = punct_count > 10 and period_ratio < 0.15
     else:
         has_real_punctuation = punct_count > 0
     if not has_real_punctuation:
@@ -2942,13 +3025,23 @@ def extract_definitions(text: str) -> list[dict]:
         # Filter out non-terms (pronouns, common words, phrases)
         _NON_TERMS = {"this", "that", "it", "here", "there", "what", "when", "why", "how",
                       "look at what", "words what", "works so this", "let's", "now",
-                      "so", "but", "and", "or", "the", "a", "an"}
+                      "so", "but", "and", "or", "the", "a", "an",
+                      "question what", "fast", "mement right here", "right here",
+                      "trends", "time and this", "the first one", "the second one",
+                      "the last one", "the next one"}
         if term_lower in _NON_TERMS:
             continue
         # Skip if term starts with a common non-term word
-        if any(term_lower.startswith(w + " ") for w in {"look", "let", "now", "so", "but", "and", "or", "what", "words", "works", "this", "that", "here", "there", "when", "why", "how", "good", "okay", "well"}):
+        if any(term_lower.startswith(w + " ") for w in {"look", "let", "now", "so", "but", "and", "or", "what", "words", "works", "this", "that", "here", "there", "when", "why", "how", "good", "okay", "well",
+                                                          "question", "fast", "mement", "right", "trends", "time", "the"}):
             continue
+        # Term must start with an uppercase letter that's a real term
+        # (not a fragment from auto-caption segment boundary)
         if len(term) < 3 or len(definition) < 10:
+            continue
+        # Definition must contain actual content words (not just fragments)
+        def_words = definition.split()
+        if len(def_words) < 3:
             continue
 
         if term_lower in seen_terms:
@@ -2958,7 +3051,7 @@ def extract_definitions(text: str) -> list[dict]:
         definitions.append({
             "term": term,
             "definition": definition,
-            "sentence": text[max(0, m.start()-5):min(len(text), m.end()+5)].strip(),
+            "sentence": _extract_sentence(text, m.start(), m.end()),
         })
 
     # Pattern 2: "is called X" / "known as X"
@@ -2981,7 +3074,7 @@ def extract_definitions(text: str) -> list[dict]:
         definitions.append({
             "term": term,
             "definition": subject,
-            "sentence": text[max(0, m.start()-50):min(len(text), m.end()+10)].strip(),
+            "sentence": _extract_sentence(text, m.start(), m.end()),
         })
 
     # Pattern 3: "X means Y" / "X refers to Y"
@@ -3127,6 +3220,36 @@ _RE_HISTORICAL = re.compile(
     r"(?:ancient|medieval|classical)\s+(?:greeks?|romans?|egyptians?|chinese?|indians?|civilization))\b",
     re.I,
 )
+# Prediction claims: "will go up", "going to crash", "expected to"
+_RE_PREDICTION = re.compile(
+    r"\b(?:will\s+(?:go\s+(?:up|down|higher|lower)|rise|fall|crash|drop|surge|climb|plunge|collapse)|"
+    r"going\s+to\s+(?:go\s+(?:up|down)|rise|fall|crash|drop|surge|climb|plunge|collapse)|"
+    r"expected\s+to\s+(?:rise|fall|increase|decrease|grow|shrink|crash|drop)|"
+    r"predicted\s+to\s+(?:rise|fall|increase|decrease|grow|shrink)|"
+    r"(?:bullish|bearish)\s+(?:on|outlook|forecast|prediction)|"
+    r"(?:price|market|stock)\s+(?:will|is\s+going\s+to|should)\s+(?:rise|fall|go\s+(?:up|down))|"
+    r"(?:next|coming)\s+(?:year|month|week|decade).{0,30}(?:rise|fall|crash|drop|surge|boom|bust))\b",
+    re.I,
+)
+# Numerical assertions: "studies show X%", "research indicates", "data suggests"
+_RE_NUMERICAL_ASSERT = re.compile(
+    r"\b(?:studies\s+show|research\s+(?:shows|indicates|suggests|demonstrates)|"
+    r"data\s+(?:shows|suggests|indicates)|"
+    r"evidence\s+(?:shows|suggests)|"
+    r"results\s+show|findings\s+(?:show|indicate|suggest)|"
+    r"experiments?\s+show|tests?\s+show|"
+    r"it\s+has\s+been\s+(?:shown|proven|demonstrated)|"
+    r"proven\s+to\s+(?:work|increase|decrease|improve|reduce|boost|enhance)|"
+    r"demonstrated\s+to\s+(?:work|increase|decrease|improve))\b",
+    re.I,
+)
+# Definition-as-fact: "X is the best Y", "X is the most Y"
+_RE_DEFINITION_FACT = re.compile(
+    r"\b(?:is\s+the\s+(?:best|worst|most|least|fastest|slowest|biggest|smallest|"
+    r"most\s+(?:important|effective|powerful|reliable|accurate|dangerous)|"
+    r"key\s+to|secret\s+to|reason\s+(?:for|why)))\b",
+    re.I,
+)
 
 
 def _extract_sentence(text: str, match_start: int, match_end: int) -> str:
@@ -3174,6 +3297,9 @@ def extract_claims(text: str) -> list[dict]:
         ("scientific", _RE_SCIENTIFIC),
         ("comparative", _RE_COMPARATIVE),
         ("historical", _RE_HISTORICAL),
+        ("prediction", _RE_PREDICTION),
+        ("numerical_assertion", _RE_NUMERICAL_ASSERT),
+        ("definition_fact", _RE_DEFINITION_FACT),
     ]
 
     seen_sentences: set[str] = set()
@@ -3339,6 +3465,27 @@ def prepare_deep_research(
         cleaned_body = clean_transcript_text(raw_body)
         auto_captioned = True  # we added fake paragraph breaks
 
+    # Build a properly-punctuated version for extractors that need
+    # real sentence boundaries (definitions, rules, questions).
+    # When auto-captioned, use VTT segment boundaries as sentence boundaries.
+    extractor_body = cleaned_body
+    if auto_captioned and segments:
+        # Each VTT segment is roughly one phrase/sentence.
+        # Build text with real periods at segment boundaries.
+        seg_sentences: list[str] = []
+        for seg in segments:
+            text = seg.text.strip()
+            if not text:
+                continue
+            # Ensure it ends with punctuation
+            if text[-1] not in ".!?":
+                text += "."
+            # Capitalize first letter
+            if text:
+                text = text[0].upper() + text[1:]
+            seg_sentences.append(text)
+        extractor_body = " ".join(seg_sentences)
+
     cleaned_path = _write_cleaned_transcript(result, cleaned_body, out)
 
     # Convert segments to timestamped sentences
@@ -3360,11 +3507,11 @@ def prepare_deep_research(
     claims = extract_claims_enriched(cleaned_body, ts_sentences)
 
     # Extract entities (people, orgs, tools, metrics, concepts)
-    # When auto-captioned (fake punctuation), don't trust two-word capitalization
-    entities = extract_entities(cleaned_body, trust_punctuation=not auto_captioned)
+    # Use extractor_body (with real sentence boundaries) when available
+    entities = extract_entities(extractor_body, trust_punctuation=not auto_captioned)
 
     # Extract sources from cleaned transcript + description
-    sources = extract_sources(cleaned_body, description)
+    sources = extract_sources(extractor_body, description)
 
     # Build the research package
     package = {
@@ -3398,7 +3545,7 @@ def prepare_deep_research(
         "entity_count": sum(len(v) if isinstance(v, list) else 0 for v in entities.values()),
         "source_count": sum(len(v) if isinstance(v, list) else 0 for v in sources.values()),
         "timestamped_sentences": [s.to_dict() for s in ts_sentences] if ts_sentences else [],
-        "advanced_extraction": extract_all(cleaned_body, ts_sentences or None),
+        "advanced_extraction": extract_all(extractor_body, ts_sentences or None),
         "schema": DEEP_RESEARCH_SCHEMA,
         "instructions": (
             "DEEP RESEARCH WORKFLOW — QUALITY OVER SPEED\n\n"
