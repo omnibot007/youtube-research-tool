@@ -99,6 +99,48 @@ The research package includes:
 
 Output saved as `<video_id>_deep_research.json`.
 
+### Visual Content Extraction (`--visual`)
+
+Add `--visual` to extract on-screen content from video frames — text, charts, slides, indicator settings that the transcript misses entirely.
+
+```bash
+python yt_scrape.py deep-research <URL> --visual
+```
+
+**Pipeline (OCR-first, no API key required):**
+1. Downloads video in lowest quality (smallest bandwidth)
+2. Extracts frames at chapter boundaries (or 60s intervals if no chapters)
+3. **Deduplicates** similar frames (skips consecutive identical slides)
+4. **OCR (Tesseract)** runs on every unique frame — free, local, always works
+5. **Optional LLM** analyzes frames for chart patterns — auto-detects provider:
+   - OpenAI / 9router (`OPENAI_API_KEY`, optional `OPENAI_BASE_URL`)
+   - Anthropic (`ANTHROPIC_API_KEY`)
+   - Ollama (local, no API key — `ollama serve` running)
+6. Parses OCR text into structured visual claims
+
+**Visual claim types extracted:**
+- `bullet_point` — slide list items (e.g., "1. What is the RSI?")
+- `indicator_setting` — RSI: 14, MA = 200, Length: 9
+- `indicator_threshold` — "RSI above 70", "RSI below 30"
+- `visual_definition` — "Momentum = Speed & Direction"
+- `price_level` — $100, €50, £75
+- `percentage` — 70%, 30%
+- `visual_description` — LLM-generated frame summary (if LLM available)
+
+**Requirements:**
+- **Tesseract OCR** (primary, free): `winget install UB-Mannheim.TesseractOCR` on Windows, or `apt install tesseract-ocr` on Linux
+- **ffmpeg/ffprobe** (already installed for Whisper)
+- **Pillow + pytesseract**: `pip install Pillow pytesseract`
+- LLM is **optional** — OCR works standalone. LLM only adds chart pattern analysis.
+
+**What you get:**
+- `on_screen_texts` — full OCR text per frame with confidence scores
+- `chart_patterns` — LLM-identified chart patterns (if LLM available)
+- `visual_claims` — structured claims parsed from OCR + LLM
+- `frame_analyses` — per-frame breakdown with OCR text, lines, word counts
+
+**No API key?** OCR still extracts all on-screen text. LLM chart pattern analysis is skipped gracefully.
+
 **Claim types extracted:**
 - `win_rate` — win/success rate claims
 - `statistical` — percentages, proportions
@@ -219,7 +261,10 @@ Common errors are mapped to clear messages with `error_type`:
 
 - `yt-dlp` (pip install yt-dlp) — already installed on this machine
 - `faster-whisper` (pip install faster-whisper) — optional, only for --whisper
-- `ffmpeg` — already installed, required for Whisper fallback
+- `ffmpeg` / `ffprobe` — already installed, required for Whisper fallback and visual frame extraction
+- `Pillow` + `pytesseract` (pip install Pillow pytesseract) — optional, for visual OCR extraction
+- **Tesseract OCR binary** — optional, for visual extraction. Windows: `winget install UB-Mannheim.TesseractOCR`. Linux: `apt install tesseract-ocr`
+- `openai` / `anthropic` / `ollama` — optional, for LLM-enhanced chart pattern analysis (auto-detected)
 - Python 3.10+ (uses `|` type unions)
 
 ## Light Research Workflow
@@ -265,3 +310,6 @@ Deep Research brief includes:
 - "I need timestamps in the transcript"
 - "Scrape this age-restricted video" (with cookies)
 - "This video is region-locked — use a proxy"
+- "Extract the charts and on-screen text from this video" (with --visual)
+- "What indicators are shown in this trading video" (with --visual)
+- "Get the slide content from this presentation video" (with --visual)

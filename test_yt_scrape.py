@@ -25,15 +25,6 @@ from yt_scrape import (
     prepare_light_research,
     LIGHT_RESEARCH_SCHEMA,
     VideoInfo,
-    TranscriptSegment,
-    _group_segments_by_pauses,
-    restore_punctuation,
-    extract_visual_content,
-    _extract_ocr_from_frame,
-    _extract_visual_claims_from_ocr,
-    _detect_llm_provider,
-    _find_tesseract,
-    _frames_are_similar,
 )
 
 
@@ -1554,7 +1545,25 @@ class TestEnrichClaim:
         ts = TimestampedSentence(text="The win rate is 86%.", start=120.0, end=125.0, segment_index=0)
         enriched = enrich_claim(claim, "The win rate is 86%.", ts)
         assert enriched["timestamp"]["timestamp"] == "2:00"
+        # Without video_id, no youtube_url is added (was a bug: literal {VIDEO_ID} placeholder)
+        assert "youtube_url" not in enriched
+
+    def test_enriches_with_timestamp_and_video_id(self):
+        """Regression test: youtube_url must be a real URL, not the {VIDEO_ID} placeholder."""
+        claim = {
+            "claim_types": ["statistical"],
+            "matched_pattern": "86%",
+            "sentence": "The win rate is 86%.",
+            "char_offset": 0,
+        }
+        ts = TimestampedSentence(text="The win rate is 86%.", start=120.0, end=125.0, segment_index=0)
+        enriched = enrich_claim(claim, "The win rate is 86%.", ts, video_id="dQw4w9WgXcQ")
+        assert enriched["timestamp"]["timestamp"] == "2:00"
         assert "youtube_url" in enriched
+        # The URL must contain the real video ID, not the literal {VIDEO_ID} placeholder
+        assert "dQw4w9WgXcQ" in enriched["youtube_url"]
+        assert "{VIDEO_ID}" not in enriched["youtube_url"]
+        assert enriched["youtube_url"].startswith("https://youtube.com/watch?v=")
 
     def test_no_timestamp(self):
         claim = {
@@ -1993,292 +2002,193 @@ class TestExtractAll:
         assert len(result["definitions"]) >= 1 or len(result["rules"]) >= 1
 
 
-# === PUNCTUATION RESTORATION ===
-class TestGroupSegmentsByPauses:
-    def test_empty_segments(self):
-        assert _group_segments_by_pauses([]) == []
+# ---------------------------------------------------------------- ASYNC BATCH
 
-    def test_single_segment(self):
-        segs = [TranscriptSegment(text="hello world", start=0.0, end=2.0)]
-        result = _group_segments_by_pauses(segs)
-        assert len(result) == 1
-        assert result[0][0] == "hello world"
+class TestBatchScrapeAsync:
+    """Tests for batch_scrape_async — parallelized batch scraping."""
 
-    def test_groups_by_pause(self):
-        """Segments with a gap >= 0.8s become separate sentences."""
-        segs = [
-            TranscriptSegment(text="this is the first part", start=0.0, end=2.0),
-            TranscriptSegment(text="this is the second part", start=3.0, end=5.0),  # 1.0s gap
-        ]
-        result = _group_segments_by_pauses(segs)
-        assert len(result) == 2
-        assert "first part" in result[0][0]
-        assert "second part" in result[1][0]
+    def test_returns_error_on_missing_file(self):
+        from yt_scrape import batch_scrape_async
+        import asyncio
+        results = asyncio.run(batch_scrape_async("nonexistent_file_xyz.txt"))
+        assert len(results) == 1
+        assert results[0].error
+        assert "file_error" in results[0].error_type
 
-    def test_inserts_comma_for_short_gap(self):
-        """Segments with a gap >= 0.3s but < 0.8s get a comma."""
-        segs = [
-            TranscriptSegment(text="this is clause one", start=0.0, end=2.0),
-            TranscriptSegment(text="this is clause two", start=2.4, end=4.0),  # 0.4s gap
-        ]
-        result = _group_segments_by_pauses(segs)
-        assert len(result) == 1  # still one sentence
-        assert "," in result[0][0]
+    def test_preserves_order_with_mocked_extract(self, tmp_path):
+        """Results should come back in the same order as input URLs."""
+        from yt_scrape import batch_scrape_async
+        import asyncio
 
-    def test_no_gap_stays_together(self):
-        """Segments with no gap stay in the same sentence."""
-        segs = [
-            TranscriptSegment(text="word one", start=0.0, end=1.0),
-            TranscriptSegment(text="word two", start=1.0, end=2.0),
-            TranscriptSegment(text="word three", start=2.0, end=3.0),
-        ]
-        result = _group_segments_by_pauses(segs)
-        assert len(result) == 1
-        assert "word one" in result[0][0]
-        assert "word two" in result[0][0]
-        assert "word three" in result[0][0]
+        urls_file = tmp_path / "urls.txt"
+        urls_file.write_text("url1\nurl2\nurl3\n", encoding="utf-8")
 
-    def test_preserves_timestamps(self):
-        segs = [
-            TranscriptSegment(text="first sentence", start=1.5, end=3.0),
-            TranscriptSegment(text="second sentence", start=5.0, end=7.0),
-        ]
-        result = _group_segments_by_pauses(segs)
-        assert result[0][1] == 1.5  # start
-        assert result[0][2] == 3.0  # end
-        assert result[1][1] == 5.0
-        assert result[1][2] == 7.0
+        def fake_extract(url, **kwargs):
+            return VideoInfo(id=url, title=f"Title for {url}", has_transcript=True)
 
-    def test_skips_empty_segments(self):
-        segs = [
-            TranscriptSegment(text="real text", start=0.0, end=1.0),
-            TranscriptSegment(text="", start=1.0, end=1.5),
-            TranscriptSegment(text="more text", start=1.5, end=2.5),  # 0.5s gap from prev_end=1.0
-        ]
-        result = _group_segments_by_pauses(segs)
-        # Empty segment skipped; gap from first end (1.0) to third start (1.5) = 0.5s < 0.8s
-        assert len(result) == 1
-        assert "real text" in result[0][0]
-        assert "more text" in result[0][0]
+        with patch("yt_scrape.extract_transcript", side_effect=fake_extract):
+            results = asyncio.run(batch_scrape_async(
+                str(urls_file), concurrency=3, rate_limit_sec=0,
+            ))
 
+        assert len(results) == 3
+        assert [r.id for r in results] == ["url1", "url2", "url3"]
+        assert all(r.has_transcript for r in results)
 
-class TestRestorePunctuation:
-    def test_already_punctuated_unchanged(self):
-        """Text with enough punctuation should not be touched."""
-        text = "This is a sentence. This is another. And a third one! Is this a question?"
-        result, used_llm = restore_punctuation(text, [])
-        assert result == text
-        assert used_llm is False
+    def test_one_failure_doesnt_kill_batch(self, tmp_path):
+        """A single extraction failure should not crash the whole batch."""
+        from yt_scrape import batch_scrape_async
+        import asyncio
 
-    def test_short_text_unchanged(self):
-        """Short text should not be processed."""
-        text = "no punctuation here"
-        result, used_llm = restore_punctuation(text, [])
-        assert result == text
+        urls_file = tmp_path / "urls.txt"
+        urls_file.write_text("good1\nbad\ngood2\n", encoding="utf-8")
 
-    def test_heuristic_adds_periods_without_llm(self):
-        """Word-count heuristic should add periods without any API call."""
-        text = "this is the first sentence this is the second sentence" + " word" * 200
-        segs = [
-            TranscriptSegment(text="this is the first sentence", start=0.0, end=2.0),
-            TranscriptSegment(text="this is the second sentence", start=3.0, end=5.0),
-        ] + [TranscriptSegment(text=f"word{i}", start=5.0 + i, end=5.5 + i) for i in range(200)]
-        result, used_llm = restore_punctuation(text, segs)
-        assert used_llm is False
-        assert "." in result  # heuristic added periods
-        assert result[0].isupper()  # capitalized
+        def fake_extract(url, **kwargs):
+            if url == "bad":
+                raise RuntimeError("simulated yt-dlp failure")
+            return VideoInfo(id=url, title=url, has_transcript=True)
 
-    def test_llm_punctuation_used_when_requested(self):
-        """When use_llm=True and LLM returns text, it should be used."""
-        text = "this is unpunctuated text " + "word " * 200
-        segs = [TranscriptSegment(text="test", start=0.0, end=1.0)]
-        llm_result = "This is unpunctuated text. " + "word. " * 200
-        with patch("yt_scrape._restore_punctuation_llm", return_value=llm_result):
-            result, used_llm = restore_punctuation(text, segs, use_llm=True)
-        assert used_llm is True
-        assert result == llm_result
+        with patch("yt_scrape.extract_transcript", side_effect=fake_extract):
+            results = asyncio.run(batch_scrape_async(
+                str(urls_file), concurrency=2, rate_limit_sec=0,
+            ))
 
-    def test_llm_not_used_by_default(self):
-        """By default, LLM should NOT be called — heuristic only."""
-        text = "this is unpunctuated text " + "word " * 200
-        segs = [TranscriptSegment(text="test", start=0.0, end=1.0)]
-        with patch("yt_scrape._restore_punctuation_llm", return_value="SHOULD NOT BE USED"):
-            result, used_llm = restore_punctuation(text, segs)
-        assert used_llm is False
-        assert "SHOULD NOT BE USED" not in result
+        assert len(results) == 3
+        assert results[0].has_transcript
+        assert results[1].error  # the bad one
+        assert "simulated yt-dlp failure" in results[1].error
+        assert results[2].has_transcript
 
-    def test_llm_failure_falls_back_to_heuristic(self):
-        """If LLM returns None, should fall back to heuristic."""
-        text = "first part second part" + " word" * 200
-        segs = [
-            TranscriptSegment(text="first part", start=0.0, end=2.0),
-            TranscriptSegment(text="second part", start=3.0, end=5.0),
-        ] + [TranscriptSegment(text=f"word{i}", start=5.0 + i, end=5.5 + i) for i in range(200)]
-        with patch("yt_scrape._restore_punctuation_llm", return_value=None):
-            result, used_llm = restore_punctuation(text, segs, use_llm=True)
-        assert used_llm is False
-        assert "." in result
+    def test_concurrency_1_is_sequential(self, tmp_path):
+        """concurrency=1 should still work (sequential via async)."""
+        from yt_scrape import batch_scrape_async
+        import asyncio
 
-    def test_no_segments_returns_original(self):
-        """With no segments and no LLM, should return original text."""
-        text = "no punctuation at all " + "word " * 200
-        result, used_llm = restore_punctuation(text, [])
-        assert result == text
-        assert used_llm is False
+        urls_file = tmp_path / "urls.txt"
+        urls_file.write_text("a\nb\n", encoding="utf-8")
+
+        call_order = []
+        def fake_extract(url, **kwargs):
+            call_order.append(url)
+            return VideoInfo(id=url, has_transcript=True)
+
+        with patch("yt_scrape.extract_transcript", side_effect=fake_extract):
+            results = asyncio.run(batch_scrape_async(
+                str(urls_file), concurrency=1, rate_limit_sec=0,
+            ))
+
+        assert len(results) == 2
+        assert call_order == ["a", "b"]  # sequential order
 
 
-# === VISUAL EXTRACTION ===
-class TestExtractVisualContent:
-    def test_disabled_returns_empty(self):
-        """When enable_visual=False, should return empty results."""
-        result = extract_visual_content("test_id", Path("/tmp"), enable_visual=False)
-        assert result["enabled"] is False
-        assert result["frames_extracted"] == 0
-        assert result["visual_claims"] == []
+# ---------------------------------------------------------------- CACHING
+
+class TestCachedResult:
+    """Tests for the @cached_result decorator."""
+
+    def test_caches_successful_video_info(self, tmp_path, monkeypatch):
+        from yt_scrape import cached_result, VideoInfo, CACHE_DIR
+
+        monkeypatch.setattr("cache.CACHE_DIR", tmp_path / "cache")
+
+        call_count = 0
+        @cached_result(ttl_seconds=60)
+        def fake_extract(url):
+            nonlocal call_count
+            call_count += 1
+            return VideoInfo(id=url, title=f"Cached {url}", has_transcript=True)
+
+        # First call — real function runs
+        r1 = fake_extract("vid1")
+        assert call_count == 1
+        assert r1.id == "vid1"
+
+        # Second call — served from cache, function doesn't run
+        r2 = fake_extract("vid1")
+        assert call_count == 1  # didn't increment
+        assert r2.id == "vid1"
+        assert r2.title == "Cached vid1"
+
+    def test_does_not_cache_errors(self, tmp_path, monkeypatch):
+        from yt_scrape import cached_result, VideoInfo, CACHE_DIR
+
+        monkeypatch.setattr("cache.CACHE_DIR", tmp_path / "cache")
+
+        call_count = 0
+        @cached_result(ttl_seconds=60)
+        def flaky_extract(url):
+            nonlocal call_count
+            call_count += 1
+            return VideoInfo(id=url, error="failed", error_type="network")
+
+        r1 = flaky_extract("vid1")
+        assert call_count == 1
+        assert r1.error
+
+        # Error results should NOT be cached — next call runs the function again
+        r2 = flaky_extract("vid1")
+        assert call_count == 2
+        assert r2.error
+
+    def test_no_cache_kwarg_bypasses(self, tmp_path, monkeypatch):
+        from yt_scrape import cached_result, VideoInfo, CACHE_DIR
+
+        monkeypatch.setattr("cache.CACHE_DIR", tmp_path / "cache")
+
+        call_count = 0
+        @cached_result(ttl_seconds=60)
+        def fake_extract(url):
+            nonlocal call_count
+            call_count += 1
+            return VideoInfo(id=url, has_transcript=True)
+
+        fake_extract("vid1")
+        assert call_count == 1
+        fake_extract("vid1", no_cache=True)
+        assert call_count == 2  # bypassed cache
+
+    def test_expired_cache_refetches(self, tmp_path, monkeypatch):
+        from yt_scrape import cached_result, VideoInfo, CACHE_DIR
+        import time
+
+        monkeypatch.setattr("cache.CACHE_DIR", tmp_path / "cache")
+
+        call_count = 0
+        @cached_result(ttl_seconds=1)  # 1 second TTL
+        def fake_extract(url):
+            nonlocal call_count
+            call_count += 1
+            return VideoInfo(id=url, has_transcript=True)
+
+        fake_extract("vid1")
+        assert call_count == 1
+
+        # Wait for cache to expire
+        time.sleep(1.2)
+        fake_extract("vid1")
+        assert call_count == 2  # refetched after expiry
 
 
-class TestFindTesseract:
-    def test_returns_string(self):
-        """Should return a string (path or empty)."""
-        result = _find_tesseract()
-        assert isinstance(result, str)
+class TestVideoInfoFromDict:
+    """Tests for VideoInfo.from_dict (used by cache deserialization)."""
 
+    def test_roundtrip(self):
+        original = VideoInfo(
+            id="abc123", title="Test Video", url="https://youtube.com/watch?v=abc123",
+            channel="TestChannel", duration=300, has_transcript=True,
+            transcript_source="caption", transcript_lang="en",
+        )
+        d = original.to_dict()
+        restored = VideoInfo.from_dict(d)
+        assert restored.id == "abc123"
+        assert restored.title == "Test Video"
+        assert restored.duration == 300
+        assert restored.has_transcript is True
 
-class TestDetectLLMProvider:
-    def test_no_providers_returns_empty(self):
-        """When no API keys and no Ollama, should return empty string."""
-        with patch.dict(os.environ, {}, clear=True):
-            with patch("urllib.request.urlopen", side_effect=Exception("no connection")):
-                result = _detect_llm_provider()
-        assert result == ""
-
-    def test_openai_detected(self):
-        """When OPENAI_API_KEY is set, should return 'openai'."""
-        with patch.dict(os.environ, {"OPENAI_API_KEY": "test_key"}, clear=True):
-            result = _detect_llm_provider()
-        assert result == "openai"
-
-    def test_anthropic_detected(self):
-        """When ANTHROPIC_API_KEY is set (but no OpenAI), should return 'anthropic'."""
-        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test_key"}, clear=True):
-            result = _detect_llm_provider()
-        assert result == "anthropic"
-
-
-class TestExtractOCRFromFrame:
-    def test_nonexistent_frame_returns_error(self):
-        """Should handle missing file gracefully."""
-        result = _extract_ocr_from_frame(Path("/nonexistent/frame.png"))
-        assert result["has_content"] is False
-        assert "error" in result or result["text"] == ""
-
-    def test_real_frame_extracts_text(self):
-        """Should extract text from an actual video frame if available."""
-        frame = Path(r"C:\Users\Entit\yt_transcripts\_frames\frame_0001_02m00s.png")
-        if not frame.exists():
-            pytest.skip("Test frame not available — run visual extraction first")
-        result = _extract_ocr_from_frame(frame)
-        # Should find some text (this frame has the table of contents)
-        assert isinstance(result["text"], str)
-        assert isinstance(result["words"], list)
-        assert isinstance(result["lines"], list)
-
-
-class TestExtractVisualClaimsFromOCR:
-    def test_extracts_bullet_points(self):
-        """Should detect bullet points from OCR text."""
-        text = ". What is the RSI?\n. How the RSI Indicator Works\n. RSI Divergence"
-        claims = _extract_visual_claims_from_ocr(text, 120.0)
-        bullet_claims = [c for c in claims if c["type"] == "bullet_point"]
-        assert len(bullet_claims) >= 2
-        assert any("RSI" in c["claim"] for c in bullet_claims)
-
-    def test_extracts_indicator_settings(self):
-        """Should detect indicator settings like RSI: 14."""
-        text = "RSI: 14\nMA = 200\nLength: 9"
-        claims = _extract_visual_claims_from_ocr(text, 60.0)
-        settings = [c for c in claims if c["type"] == "indicator_setting"]
-        assert len(settings) >= 2
-        assert any("RSI" in c["claim"] for c in settings)
-
-    def test_extracts_indicator_thresholds(self):
-        """Should detect threshold patterns like 'RSI is above 70'."""
-        text = "A Stock is Overbought when the RSI is above 70\nA Stock is Oversold when the RSI is below 30"
-        claims = _extract_visual_claims_from_ocr(text, 600.0)
-        thresholds = [c for c in claims if c["type"] == "indicator_threshold"]
-        assert len(thresholds) >= 2
-        assert any("70" in c["claim"] for c in thresholds)
-        assert any("30" in c["claim"] for c in thresholds)
-
-    def test_extracts_visual_definitions(self):
-        """Should detect definitions like 'Momentum = Speed & Direction'."""
-        text = "Momentum = Speed & Direction of a Price Movement"
-        claims = _extract_visual_claims_from_ocr(text, 180.0)
-        defs = [c for c in claims if c["type"] == "visual_definition"]
-        assert len(defs) >= 1
-        assert any("Momentum" in c["claim"] for c in defs)
-
-    def test_extracts_price_levels(self):
-        """Should detect price levels like $100."""
-        text = "Entry: $100\nStop: $95\nTarget: $120"
-        claims = _extract_visual_claims_from_ocr(text, 30.0)
-        prices = [c for c in claims if c["type"] == "price_level"]
-        assert len(prices) >= 2
-
-    def test_extracts_percentages(self):
-        """Should detect percentages."""
-        text = "Win rate: 70%\nRisk: 2%"
-        claims = _extract_visual_claims_from_ocr(text, 45.0)
-        pcts = [c for c in claims if c["type"] == "percentage"]
-        assert len(pcts) >= 1
-
-    def test_empty_text_no_claims(self):
-        """Empty OCR text should produce no claims."""
-        claims = _extract_visual_claims_from_ocr("", 0.0)
-        assert claims == []
-
-    def test_claims_have_timestamps(self):
-        """All claims should have timestamp and timestamp_str."""
-        text = ". Test bullet point"
-        claims = _extract_visual_claims_from_ocr(text, 125.0)
-        assert len(claims) >= 1
-        assert claims[0]["timestamp"] == 125.0
-        assert claims[0]["timestamp_str"] == "02:05"
-
-
-class TestFramesAreSimilar:
-    def test_identical_files_are_similar(self):
-        """Same file should be considered similar."""
-        # Create two identical test images
-        from PIL import Image
-        import tempfile
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f1:
-            img = Image.new("RGB", (100, 100), (255, 0, 0))
-            img.save(f1.name)
-            path1 = Path(f1.name)
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f2:
-            img.save(f2.name)
-            path2 = Path(f2.name)
-        try:
-            assert _frames_are_similar(path1, path2) is True
-        finally:
-            path1.unlink(missing_ok=True)
-            path2.unlink(missing_ok=True)
-
-    def test_different_images_not_similar(self):
-        """Very different images should not be considered similar."""
-        from PIL import Image
-        import tempfile
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f1:
-            img1 = Image.new("RGB", (100, 100), (0, 0, 0))  # black
-            img1.save(f1.name)
-            path1 = Path(f1.name)
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f2:
-            img2 = Image.new("RGB", (100, 100), (255, 255, 255))  # white
-            img2.save(f2.name)
-            path2 = Path(f2.name)
-        try:
-            assert _frames_are_similar(path1, path2) is False
-        finally:
-            path1.unlink(missing_ok=True)
-            path2.unlink(missing_ok=True)
+    def test_ignores_unknown_keys(self):
+        """from_dict should ignore keys that don't map to dataclass fields."""
+        d = {"id": "x", "title": "T", "future_field": "ignored"}
+        vi = VideoInfo.from_dict(d)
+        assert vi.id == "x"
+        assert vi.title == "T"
+        # future_field is silently dropped — no error

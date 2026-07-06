@@ -32,6 +32,7 @@ import argparse
 import asyncio
 import datetime as dt
 import functools
+import threading
 import glob
 import json
 import os
@@ -62,51 +63,25 @@ DEFAULT_LANGS = ["en", "en-US", "en-GB"]
 DEFAULT_RATE_LIMIT = 2  # seconds between requests
 DEFAULT_RETRIES = 3
 
+# ---------------------------------------------------------------- CACHING + MODELS
+# Extracted to separate modules for modularity (Phase 1b).
+# Re-exported here so `from yt_scrape import VideoInfo, cached_result` still works.
+from models import (
+    VideoInfo,
+    TranscriptSegment,
+    TimestampedSentence,
+)
+from cache import (
+    CACHE_DIR,
+    CACHE_TTL_METADATA,
+    CACHE_TTL_TRANSCRIPT,
+    _cache_key,
+    _cache_path,
+    cached_result,
+)
+
 
 # ---------------------------------------------------------------- DATA MODEL
-
-@dataclass
-class VideoInfo:
-    id: str = ""
-    title: str = ""
-    url: str = ""
-    channel: str = ""
-    duration: int = 0
-    upload_date: str = ""
-    view_count: int = 0
-    like_count: int = 0
-    transcript_path: str = ""
-    transcript_chars: int = 0
-    has_transcript: bool = False
-    transcript_source: str = ""  # "caption" | "whisper" | ""
-    transcript_lang: str = ""
-    timestamped_path: str = ""   # .tsv file path if --timestamps
-    segments: list = field(default_factory=list)  # TranscriptSegment list (not serialized by asdict if we exclude)
-    error: str = ""
-    error_type: str = ""         # "no_subtitles" | "private" | "age_restricted" | "region_locked" | "rate_limited" | "network" | "unknown"
-
-    def to_dict(self) -> dict:
-        d = asdict(self)
-        # Don't serialize segments in the dict (they're internal)
-        d.pop("segments", None)
-        return d
-
-
-@dataclass
-class TranscriptSegment:
-    """One segment of a transcript with timing info."""
-    text: str
-    start: float
-    end: float
-
-    def format_timestamped(self) -> str:
-        """Format as [HH:MM:SS --> HH:MM:SS] text."""
-        def fmt(sec: float) -> str:
-            h = int(sec // 3600)
-            m = int((sec % 3600) // 60)
-            s = int(sec % 60)
-            return f"{h:02d}:{m:02d}:{s:02d}"
-        return f"[{fmt(self.start)} --> {fmt(self.end)}] {self.text}"
 
 
 # ---------------------------------------------------------------- URL PARSING
@@ -234,7 +209,7 @@ def parse_vtt(vtt_path: str) -> tuple[str | None, list[TranscriptSegment]]:
     except Exception:
         return None, []
 
-    lines = content.split("\n")
+    lines = content.splitlines()
     text_lines: list[str] = []
     segments: list[TranscriptSegment] = []
     prev_line = ""
@@ -260,15 +235,10 @@ def parse_vtt(vtt_path: str) -> tuple[str | None, list[TranscriptSegment]]:
                 ))
                 current_texts = []
 
-            # Parse new timestamps — strip extra metadata (align:start, position:0%, etc.)
+            # Parse new timestamps
             times = line.split("-->")
             current_start = _parse_vtt_time(times[0].strip())
-            if len(times) > 1:
-                # End time may have "align:start position:0%" after it
-                end_str = times[1].strip().split()[0]  # take first whitespace-delimited token
-                current_end = _parse_vtt_time(end_str)
-            else:
-                current_end = None
+            current_end = _parse_vtt_time(times[1].strip()) if len(times) > 1 else None
             continue
 
         # Text line
@@ -311,6 +281,7 @@ def _parse_vtt_time(time_str: str) -> float:
 # ---------------------------------------------------------------- WHISPER FALLBACK
 
 _WHISPER_MODEL_CACHE: dict[str, Any] = {}
+_WHISPER_MODEL_LOCK = threading.Lock()
 
 
 def _check_ffmpeg() -> bool:
@@ -319,14 +290,19 @@ def _check_ffmpeg() -> bool:
 
 
 def _get_whisper_model(model_name: str, device: str, compute_type: str) -> Any:
-    """Lazy-load and cache a faster-whisper model."""
+    """Lazy-load and cache a faster-whisper model (thread-safe via double-checked locking)."""
     key = f"{model_name}|{device}|{compute_type}"
-    if key not in _WHISPER_MODEL_CACHE:
-        try:
-            from faster_whisper import WhisperModel
-        except ImportError:
-            raise RuntimeError("faster-whisper not installed. Run: pip install faster-whisper")
-        _WHISPER_MODEL_CACHE[key] = WhisperModel(model_name, device=device, compute_type=compute_type)
+    # Fast path — no lock once cached
+    if key in _WHISPER_MODEL_CACHE:
+        return _WHISPER_MODEL_CACHE[key]
+    with _WHISPER_MODEL_LOCK:
+        # Re-check under lock — another thread may have loaded it
+        if key not in _WHISPER_MODEL_CACHE:
+            try:
+                from faster_whisper import WhisperModel
+            except ImportError:
+                raise RuntimeError("faster-whisper not installed. Run: pip install faster-whisper")
+            _WHISPER_MODEL_CACHE[key] = WhisperModel(model_name, device=device, compute_type=compute_type)
     return _WHISPER_MODEL_CACHE[key]
 
 
@@ -400,215 +376,6 @@ def transcribe_with_whisper(
     if not transcript:
         raise RuntimeError(f"Whisper produced empty transcript for {video_id}")
     return transcript, segments
-
-
-# ---------------------------------------------------------------- PUNCTUATION RESTORATION
-
-# Speech-pause thresholds (seconds) for timing-based sentence detection.
-_PAUSE_SENTENCE = 0.8   # gap >= this → sentence boundary (period)
-_PAUSE_COMMA = 0.3      # gap >= this → clause boundary (comma)
-# Group segments into chunks of ~this many words before sending to LLM.
-_LLM_CHUNK_WORDS = 400
-# Fallback: target word count per sentence when timing gaps are absent.
-_SENTENCE_WORD_TARGET = 20
-_SENTENCE_WORD_MIN = 10
-
-
-def _group_segments_by_pauses(
-    segments: list[TranscriptSegment],
-) -> list[tuple[str, float, float]]:
-    """Group VTT segments into sentence-like units using speech pauses.
-
-    Returns list of (text, start, end) tuples. Each tuple is one probable
-    sentence. Uses two signals:
-      1. Timing gaps (>= _PAUSE_SENTENCE → new sentence, >= _PAUSE_COMMA → comma)
-      2. Word count heuristic (if no timing gaps, split at ~_SENTENCE_WORD_TARGET words)
-    """
-    if not segments:
-        return []
-    sentences: list[tuple[str, float, float]] = []
-    current_words: list[str] = []
-    current_start = segments[0].start
-    current_end = segments[0].end
-    prev_end = segments[0].end
-
-    # Check if we have meaningful timing gaps
-    has_gaps = False
-    for i in range(1, len(segments)):
-        gap = segments[i].start - segments[i - 1].end
-        if gap >= _PAUSE_COMMA:
-            has_gaps = True
-            break
-
-    for i, seg in enumerate(segments):
-        text = seg.text.strip()
-        if not text:
-            continue
-        gap = seg.start - prev_end if i > 0 else 0.0
-        word_count = len(current_words)
-
-        # Start new sentence on: long pause OR word count target (when no gaps)
-        should_break = False
-        if gap >= _PAUSE_SENTENCE and current_words:
-            should_break = True
-        elif not has_gaps and word_count >= _SENTENCE_WORD_TARGET and current_words:
-            should_break = True
-        elif gap >= _PAUSE_COMMA and current_words and has_gaps:
-            current_words.append(",")
-
-        if should_break:
-            sentences.append((" ".join(current_words), current_start, current_end))
-            current_words = []
-            current_start = seg.start
-
-        current_words.extend(text.split())
-        current_end = seg.end
-        prev_end = seg.end
-
-    if current_words:
-        sentences.append((" ".join(current_words), current_start, current_end))
-    return sentences
-
-
-def _restore_punctuation_llm(text: str, provider: str | None = None) -> str | None:
-    """Use an LLM to restore punctuation and capitalization.
-
-    Optional enhancement — the word-count heuristic in restore_punctuation()
-    already produces good results without any API call. This function is only
-    called when use_llm=True is passed to restore_punctuation().
-
-    Supports multiple providers (auto-detected):
-      - OpenAI / 9router (OPENAI_API_KEY, optionally OPENAI_BASE_URL)
-      - Anthropic (ANTHROPIC_API_KEY)
-      - Ollama (local, no API key, needs ollama running)
-
-    Returns punctuated text, or None if no provider available or call fails.
-    """
-    provider = provider or _detect_llm_provider()
-    if not provider:
-        return None
-
-    # Chunk the text for API limits
-    words = text.split()
-    chunks: list[str] = []
-    for i in range(0, len(words), _LLM_CHUNK_WORDS):
-        chunk = " ".join(words[i : i + _LLM_CHUNK_WORDS])
-        chunks.append(chunk)
-
-    system_msg = (
-        "You are a punctuation restoration tool. Add periods, "
-        "commas, question marks, and capitalization to the "
-        "following auto-generated transcript text. Preserve "
-        "the original words exactly — only add punctuation and "
-        "fix capitalization. Do not add or remove words."
-    )
-
-    try:
-        results: list[str] = []
-
-        if provider == "openai":
-            from openai import OpenAI
-            api_key = os.environ.get("OPENAI_API_KEY", "")
-            client_kwargs: dict[str, Any] = {"api_key": api_key, "timeout": 60}
-            base_url = os.environ.get("OPENAI_BASE_URL")
-            if base_url:
-                client_kwargs["base_url"] = base_url
-            client = OpenAI(**client_kwargs)
-            for chunk in chunks:
-                resp = client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[
-                        {"role": "system", "content": system_msg},
-                        {"role": "user", "content": chunk},
-                    ],
-                    temperature=0,
-                    max_tokens=2000,
-                )
-                results.append(resp.choices[0].message.content.strip())
-
-        elif provider == "anthropic":
-            import anthropic
-            client = anthropic.Anthropic(
-                api_key=os.environ.get("ANTHROPIC_API_KEY", ""), timeout=60,
-            )
-            for chunk in chunks:
-                resp = client.messages.create(
-                    model="claude-sonnet-4-20250514",
-                    max_tokens=2000,
-                    system=system_msg,
-                    messages=[{"role": "user", "content": chunk}],
-                )
-                text_out = resp.content[0].text if resp.content else chunk
-                results.append(text_out.strip())
-
-        elif provider == "ollama":
-            import ollama
-            for chunk in chunks:
-                resp = ollama.chat(
-                    model="llama3.2",
-                    messages=[
-                        {"role": "system", "content": system_msg},
-                        {"role": "user", "content": chunk},
-                    ],
-                )
-                text_out = resp.get("message", {}).get("content", chunk)
-                results.append(text_out.strip())
-
-        else:
-            return None
-
-        return " ".join(results)
-
-    except Exception:
-        return None
-
-
-def restore_punctuation(
-    text: str,
-    segments: list[TranscriptSegment],
-    use_llm: bool = False,
-) -> tuple[str, bool]:
-    """Restore punctuation to unpunctuated auto-caption text.
-
-    Primary method: word-count heuristic + timing-based sentence boundaries
-    from VTT segments. This requires NO API key and works offline.
-
-    Optional enhancement: if use_llm=True, tries an LLM (OpenAI/Anthropic/
-    Ollama, auto-detected) for better quality. This costs ~$0.01/video with
-    cloud providers, or is free with local Ollama.
-
-    Returns (punctuated_text, used_llm) tuple.
-    """
-    # Already punctuated? Don't touch it.
-    period_count = text.count(".") + text.count("?") + text.count("!")
-    if period_count > 5 or len(text) < 200:
-        return text, False
-
-    # Primary: timing-based / word-count heuristic (always works, no API)
-    grouped = _group_segments_by_pauses(segments)
-    if grouped:
-        sentences: list[str] = []
-        for raw, _start, _end in grouped:
-            s = raw.strip().rstrip(",").strip()
-            if not s:
-                continue
-            # Capitalize first letter
-            s = s[0].upper() + s[1:] if s else s
-            # Ensure terminal punctuation
-            if s[-1] not in ".!?":
-                s += "."
-            sentences.append(s)
-        heuristic_result = " ".join(sentences)
-    else:
-        heuristic_result = text
-
-    # Optional: LLM enhancement (only if explicitly requested)
-    if use_llm:
-        llm_result = _restore_punctuation_llm(text)
-        if llm_result and len(llm_result) > len(text) * 0.5:
-            return llm_result, True
-
-    return heuristic_result, False
 
 
 # ---------------------------------------------------------------- YT-DLP OPTIONS BUILDER
@@ -778,6 +545,7 @@ def extract_metadata(
         return {"error": err_msg, "error_type": err_type, "url": url}
 
 
+@cached_result(ttl_seconds=CACHE_TTL_TRANSCRIPT)
 def extract_transcript(
     url_or_id: str,
     langs: list[str] | None = None,
@@ -814,6 +582,11 @@ def extract_transcript(
 
     info = VideoInfo(id=vid_id, url=url)
 
+    # Initialize lang_found before the try block — the except handler may fall
+    # through to the VTT-parsing section (Whisper fallback path) where lang_found
+    # is referenced. Without this, an exception before line 622 causes UnboundLocalError.
+    lang_found = ""
+
     # --- ATTEMPT 1: YouTube captions ---
     try:
         retry_decorator = with_retry(max_retries=retries)
@@ -833,7 +606,7 @@ def extract_transcript(
         auto = data.get("automatic_captions", {})
 
         # Determine which language we got
-        lang_found = ""
+        # (lang_found initialized before try block — see comment above)
         if all_langs:
             # Download all available languages
             available_langs = list(subs.keys()) + list(auto.keys())
@@ -1149,6 +922,62 @@ def batch_scrape(
         results.append(vid)
         time.sleep(rate_limit_sec)
     return results
+
+
+async def batch_scrape_async(
+    file_path: str,
+    transcripts: bool = True,
+    langs: list[str] | None = None,
+    concurrency: int = 3,
+    rate_limit_sec: float = DEFAULT_RATE_LIMIT,
+    output_dir: Path | None = None,
+    timestamps: bool = False,
+    whisper: bool = False,
+    cookies_file: str | None = None,
+    cookies_from_browser: str | None = None,
+    proxy: str | None = None,
+    retries: int = DEFAULT_RETRIES,
+) -> list[VideoInfo]:
+    """Async batch scrape — parallelizes yt-dlp calls with a semaphore.
+
+    yt-dlp is blocking/CPU-bound, so each call runs in a thread executor.
+    The semaphore caps concurrent calls to respect YouTube's rate limits.
+    Results are returned in the same order as the input URLs.
+
+    Set concurrency=1 to fall back to sequential behavior (with async sleep).
+    """
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            urls = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+    except Exception as exc:
+        return [VideoInfo(error=f"Cannot read file: {exc}", error_type="file_error")]
+
+    sem = asyncio.Semaphore(max(1, concurrency))
+    loop = asyncio.get_event_loop()
+
+    async def fetch_one(url: str) -> VideoInfo:
+        async with sem:
+            try:
+                vid = await loop.run_in_executor(
+                    None,
+                    lambda: extract_transcript(
+                        url, langs=langs, output_dir=output_dir,
+                        timestamps=timestamps, whisper=whisper,
+                        cookies_file=cookies_file, cookies_from_browser=cookies_from_browser,
+                        proxy=proxy, retries=retries,
+                    ),
+                )
+            except Exception as exc:
+                vid = VideoInfo(error=f"{type(exc).__name__}: {exc}", error_type="extract_error")
+            # Respect rate limit between releases (only when concurrency=1;
+            # with higher concurrency the semaphore + YouTube's own throttling
+            # is sufficient and a global sleep would serialize unnecessarily).
+            if concurrency <= 1:
+                await asyncio.sleep(rate_limit_sec)
+            return vid
+
+    tasks = [fetch_one(url) for url in urls]
+    return list(await asyncio.gather(*tasks))
 
 
 def list_saved_transcripts(output_dir: Path | None = None) -> list[dict]:
@@ -1552,34 +1381,7 @@ DEEP_RESEARCH_SCHEMA = {
 
 # ---------------------------------------------------------------- TIMESTAMPED SEGMENT PIPELINE
 
-@dataclass
-class TimestampedSentence:
-    """A sentence extracted from a transcript segment, preserving timing."""
-    text: str
-    start: float       # seconds from video start
-    end: float         # seconds from video start
-    segment_index: int # which segment this came from
-
-    @property
-    def timestamp_str(self) -> str:
-        """Human-readable timestamp like '3:42'."""
-        s = int(self.start)
-        if s >= 3600:
-            return f"{s // 3600}:{(s % 3600) // 60:02d}:{s % 60:02d}"
-        return f"{s // 60}:{s % 60:02d}"
-
-    @property
-    def youtube_url(self) -> str:
-        """YouTube URL that jumps to this timestamp."""
-        return f"&t={int(self.start)}s"
-
-    def to_dict(self) -> dict:
-        return {
-            "text": self.text,
-            "start": round(self.start, 2),
-            "end": round(self.end, 2),
-            "timestamp": self.timestamp_str,
-        }
+# TimestampedSentence is now imported from models.py (Phase 1b split).
 
 
 # ---------------------------------------------------------------- SENTENCE SEGMENTATION
@@ -2179,6 +1981,7 @@ def enrich_claim(
     claim: dict,
     sentence: str,
     timestamp: TimestampedSentence | None = None,
+    video_id: str = "",
 ) -> dict:
     """Enrich a raw claim dict with additional metadata.
 
@@ -2187,7 +1990,7 @@ def enrich_claim(
     - negated: whether the claim is negated
     - strength: high | moderate | low | opinion
     - timestamp: {start, end, timestamp_str} if available
-    - youtube_url: clickable URL to the moment in the video
+    - youtube_url: clickable URL to the moment in the video (requires video_id)
     """
     claim_type = claim.get("claim_types", ["unknown"])[0] if isinstance(claim.get("claim_types"), list) else "unknown"
     matched = claim.get("matched_pattern", "")
@@ -2199,7 +2002,8 @@ def enrich_claim(
 
     if timestamp:
         enriched["timestamp"] = timestamp.to_dict()
-        enriched["youtube_url"] = f"https://youtube.com/watch?v={{VIDEO_ID}}{timestamp.youtube_url}"
+        if video_id:
+            enriched["youtube_url"] = f"https://youtube.com/watch?v={video_id}{timestamp.youtube_url}"
 
     return enriched
 
@@ -2207,6 +2011,7 @@ def enrich_claim(
 def extract_claims_enriched(
     text: str,
     sentences: list[TimestampedSentence] | None = None,
+    video_id: str = "",
 ) -> list[dict]:
     """Extract and enrich claims from text, with optional timestamp mapping.
 
@@ -2215,10 +2020,12 @@ def extract_claims_enriched(
     - Negation detection
     - Strength assessment (high/moderate/low/opinion)
     - Timestamp mapping (if sentences provided)
+    - youtube_url (requires video_id)
 
     Args:
         text: The transcript text
         sentences: Pre-split timestamped sentences. If None, uses plain text.
+        video_id: YouTube video ID for building clickable timestamp URLs.
 
     Returns:
         List of enriched claim dicts.
@@ -2228,7 +2035,7 @@ def extract_claims_enriched(
 
     if not sentences:
         # No timestamps — just enrich without timing
-        return [enrich_claim(c, c.get("sentence", "")) for c in raw_claims]
+        return [enrich_claim(c, c.get("sentence", ""), video_id=video_id) for c in raw_claims]
 
     # Build a position → timestamp mapping
     # For each raw claim, find which timestamped sentence it belongs to
@@ -2254,9 +2061,38 @@ def extract_claims_enriched(
                     best_ts = ts_sent
                     best_score = overlap
 
-        enriched.append(enrich_claim(claim, claim_sentence, best_ts))
+        enriched.append(enrich_claim(claim, claim_sentence, best_ts, video_id=video_id))
 
     return enriched
+
+
+def extract_claims_for_video(
+    video: VideoInfo,
+    include_citation_urls: bool = True,
+) -> list[dict]:
+    """Extract enriched claims from a VideoInfo with full timestamp + citation support.
+
+    This is the convenience wrapper for the Open Notebook integration: it converts
+    the video's segments into timestamped sentences, extracts claims with proper
+    video_id, and each claim gets a clickable youtube_url with timestamp.
+
+    Args:
+        video: A VideoInfo with .segments and .id populated.
+        include_citation_urls: If True, each claim gets a youtube_url with &t=N.
+
+    Returns:
+        List of enriched claim dicts, each with:
+        - claim: the claim text
+        - subject, negated, strength
+        - timestamp: {start, end, timestamp_str}
+        - youtube_url: clickable URL to the moment in the video (if include_citation_urls)
+    """
+    if not video.segments:
+        return []
+    sentences = segments_to_sentences(video.segments)
+    full_text = " ".join(seg.text for seg in video.segments if seg.text.strip())
+    video_id = video.id if include_citation_urls else ""
+    return extract_claims_enriched(full_text, sentences=sentences, video_id=video_id)
 
 
 # ---------------------------------------------------------------- ADVANCED EXTRACTION (10 FEATURES)
@@ -3609,7 +3445,6 @@ def prepare_deep_research(
     cookies_from_browser: str | None = None,
     proxy: str | None = None,
     retries: int = DEFAULT_RETRIES,
-    enable_visual: bool = False,
 ) -> dict:
     """Fetch transcript, clean it, extract claims + sources, and prepare
     a comprehensive research package for Deep Research analysis.
@@ -3620,10 +3455,6 @@ def prepare_deep_research(
        maps arguments, assesses bias, cross-references, produces deep research brief
 
     Quality over speed — no caps on claims. Every significant claim gets verified.
-
-    If enable_visual is True, also downloads the video and extracts visual
-    content (on-screen text, chart patterns) using OCR (Tesseract, free, local)
-    as the primary method, with optional LLM analysis for chart patterns.
     """
     # Step 1: Fetch transcript
     print(f"[1/3] Fetching transcript for: {url_or_id}", file=sys.stderr)
@@ -3660,24 +3491,50 @@ def prepare_deep_research(
     print(f"[3/4] Extracting entities and enriched claims...", file=sys.stderr)
     segments: list[TranscriptSegment] = result.segments if hasattr(result, 'segments') else []
 
-    # If text has no punctuation (common in auto-captions), restore it.
+    # If text has no punctuation (common in auto-captions), use segment
+    # boundaries to insert paragraph breaks before cleaning
     period_count = raw_body.count(".") + raw_body.count("?") + raw_body.count("!")
-    auto_captioned = False  # track whether we restored punctuation
-    used_llm_punctuation = False
+    auto_captioned = False  # track whether we added fake punctuation
     if segments and period_count < 5 and len(raw_body) > 1000:
-        # Restore punctuation using word-count heuristic (no API needed)
-        # LLM enhancement is optional and only used if use_llm=True
-        restored, used_llm_punctuation = restore_punctuation(raw_body, segments)
-        if restored != raw_body:
-            raw_body = restored
-            cleaned_body = clean_transcript_text(raw_body)
-            auto_captioned = True
+        # Rebuild text with segment boundaries as paragraph breaks
+        seg_texts = [seg.text.strip() for seg in segments if seg.text.strip()]
+        # Group segments into paragraphs by timing gaps (2+ second pauses)
+        paragraphs: list[str] = []
+        current_para: list[str] = []
+        prev_end = 0.0
+        for seg, text in zip(segments, seg_texts):
+            if current_para and seg.start - prev_end > 2.0:
+                paragraphs.append(" ".join(current_para))
+                current_para = []
+            current_para.append(text)
+            prev_end = seg.end
+        if current_para:
+            paragraphs.append(" ".join(current_para))
+        raw_body = "\n\n".join(paragraphs)
+        # Re-clean with proper paragraph breaks
+        cleaned_body = clean_transcript_text(raw_body)
+        auto_captioned = True  # we added fake paragraph breaks
 
-    # extractor_body is the properly-punctuated text for sentence-dependent
-    # extractors (definitions, rules, questions). For auto-captioned videos
-    # we already restored punctuation above, so it matches cleaned_body.
-    # For human-captioned videos, cleaned_body already has real punctuation.
+    # Build a properly-punctuated version for extractors that need
+    # real sentence boundaries (definitions, rules, questions).
+    # When auto-captioned, use VTT segment boundaries as sentence boundaries.
     extractor_body = cleaned_body
+    if auto_captioned and segments:
+        # Each VTT segment is roughly one phrase/sentence.
+        # Build text with real periods at segment boundaries.
+        seg_sentences: list[str] = []
+        for seg in segments:
+            text = seg.text.strip()
+            if not text:
+                continue
+            # Ensure it ends with punctuation
+            if text[-1] not in ".!?":
+                text += "."
+            # Capitalize first letter
+            if text:
+                text = text[0].upper() + text[1:]
+            seg_sentences.append(text)
+        extractor_body = " ".join(seg_sentences)
 
     cleaned_path = _write_cleaned_transcript(result, cleaned_body, out)
 
@@ -3697,7 +3554,7 @@ def prepare_deep_research(
         pass
 
     # Extract enriched claims (with subject, negation, strength, timestamps)
-    claims = extract_claims_enriched(cleaned_body, ts_sentences)
+    claims = extract_claims_enriched(cleaned_body, ts_sentences, video_id=result.id)
 
     # Extract entities (people, orgs, tools, metrics, concepts)
     # Use extractor_body (with real sentence boundaries) when available
@@ -3705,39 +3562,6 @@ def prepare_deep_research(
 
     # Extract sources from cleaned transcript + description
     sources = extract_sources(extractor_body, description)
-
-    # Extract advanced content (contradictions, marketing, rules, etc.)
-    advanced = extract_all(extractor_body, ts_sentences or None)
-
-    # Extract visual content (frames + OCR + optional LLM analysis)
-    visual_content: dict[str, Any] = {
-        "enabled": enable_visual,
-        "ocr_available": False,
-        "llm_provider": "",
-        "video_downloaded": False,
-        "frames_extracted": 0,
-        "frames_after_dedup": 0,
-        "frames_analyzed_ocr": 0,
-        "frames_analyzed_llm": 0,
-        "visual_claims": [],
-        "on_screen_texts": [],
-        "chart_patterns": [],
-        "frame_analyses": [],
-    }
-    if enable_visual:
-        print(f"[4/4] Extracting visual content from video frames...", file=sys.stderr)
-        video_id = parse_video_id(url_or_id)
-        # Use chapter boundaries for smart frame sampling
-        chapter_ts: list[float] | None = None
-        chapters = advanced.get("chapters", [])
-        if chapters:
-            chapter_ts = [c.get("start", 0) for c in chapters if c.get("start", 0) > 0]
-        visual_content = extract_visual_content(
-            video_id, out, duration=result.duration,
-            cookies_file=cookies_file, cookies_from_browser=cookies_from_browser,
-            proxy=proxy, enable_visual=enable_visual,
-            chapter_timestamps=chapter_ts,
-        )
 
     # Build the research package
     package = {
@@ -3763,9 +3587,6 @@ def prepare_deep_research(
             "paragraph_count": len(cleaned_body.split("\n\n")),
             "has_timestamps": len(segments) > 0,
             "segment_count": len(segments),
-            "auto_captioned": auto_captioned,
-            "punctuation_restored": auto_captioned,
-            "punctuation_method": "llm" if used_llm_punctuation else ("timing" if auto_captioned else "original"),
         },
         "extracted_claims": claims,
         "extracted_entities": entities,
@@ -3774,8 +3595,7 @@ def prepare_deep_research(
         "entity_count": sum(len(v) if isinstance(v, list) else 0 for v in entities.values()),
         "source_count": sum(len(v) if isinstance(v, list) else 0 for v in sources.values()),
         "timestamped_sentences": [s.to_dict() for s in ts_sentences] if ts_sentences else [],
-        "advanced_extraction": advanced,
-        "visual_extraction": visual_content,
+        "advanced_extraction": extract_all(extractor_body, ts_sentences or None),
         "schema": DEEP_RESEARCH_SCHEMA,
         "instructions": (
             "DEEP RESEARCH WORKFLOW — QUALITY OVER SPEED\n\n"
@@ -3829,823 +3649,6 @@ def prepare_deep_research(
     print(f"  Package saved:     {package_path}", file=sys.stderr)
 
     return package
-
-
-# ---------------------------------------------------------------- VISUAL EXTRACTION
-
-# Frame extraction interval (seconds). One frame every N seconds.
-_FRAME_INTERVAL = 60
-# Max frames to extract (cap for very long videos).
-_MAX_FRAMES = 60
-# Video download format — low quality, no audio, smallest possible.
-_VIDEO_FORMAT = "worst[ext=mp4]/worst"
-# Frames directory name within output dir.
-_FRAMES_SUBDIR = "_frames"
-# Tesseract binary path (auto-detected, fallback to PATH).
-_TESSERACT_CMD = ""
-# Minimum OCR confidence to keep a word (0-100).
-_OCR_MIN_CONFIDENCE = 50
-# Minimum OCR text length to consider a frame "has content".
-_OCR_MIN_TEXT_LEN = 5
-# Frame deduplication: skip if image hash matches previous (perceptual diff threshold).
-_FRAME_DEDUP_THRESHOLD = 0.95
-
-
-def _find_tesseract() -> str:
-    """Find the Tesseract binary path. Caches result."""
-    global _TESSERACT_CMD
-    if _TESSERACT_CMD:
-        return _TESSERACT_CMD
-    # Check common Windows install locations
-    candidates = [
-        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-    ]
-    for c in candidates:
-        if Path(c).exists():
-            _TESSERACT_CMD = c
-            return c
-    # Check PATH
-    found = shutil.which("tesseract")
-    if found:
-        _TESSERACT_CMD = found
-        return found
-    return ""
-
-
-def _download_video_low_quality(
-    video_id: str,
-    output_dir: Path,
-    cookies_file: str | None = None,
-    cookies_from_browser: str | None = None,
-    proxy: str | None = None,
-) -> Path | None:
-    """Download video in lowest quality for frame extraction.
-
-    Returns path to downloaded video file, or None on failure.
-    """
-    video_path = output_dir / f"{video_id}_video.mp4"
-    if video_path.exists() and video_path.stat().st_size > 1000:
-        return video_path  # already downloaded
-
-    opts: dict[str, Any] = {
-        "format": _VIDEO_FORMAT,
-        "outtmpl": str(video_path),
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": False,
-    }
-    if cookies_file:
-        opts["cookiefile"] = cookies_file
-    if cookies_from_browser:
-        opts["cookiesfrombrowser"] = (cookies_from_browser,)
-    if proxy:
-        opts["proxy"] = proxy
-
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([video_id])
-        if video_path.exists() and video_path.stat().st_size > 1000:
-            return video_path
-    except Exception as e:
-        print(f"  [visual] Video download failed: {e}", file=sys.stderr)
-    return None
-
-
-def _extract_frames(
-    video_path: Path,
-    output_dir: Path,
-    interval: int = _FRAME_INTERVAL,
-    max_frames: int = _MAX_FRAMES,
-    timestamps: list[float] | None = None,
-) -> list[Path]:
-    """Extract frames from video at regular intervals or specific timestamps.
-
-    Args:
-        video_path: Path to the video file.
-        output_dir: Directory for the _frames subdirectory.
-        interval: Seconds between frames (ignored if timestamps given).
-        max_frames: Maximum number of frames to extract.
-        timestamps: Optional list of specific timestamps (seconds) to extract.
-                     If provided, overrides interval-based extraction.
-
-    Returns list of frame file paths (PNG).
-    """
-    frames_dir = output_dir / _FRAMES_SUBDIR
-    frames_dir.mkdir(parents=True, exist_ok=True)
-
-    # Clear old frames
-    for old in frames_dir.glob("*.png"):
-        old.unlink()
-
-    frames: list[Path] = []
-    try:
-        import subprocess
-
-        if timestamps:
-            # Extract at specific timestamps (e.g., chapter boundaries)
-            ts_list = timestamps[:max_frames]
-        else:
-            # Get video duration for interval-based extraction
-            probe = subprocess.run(
-                ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
-                 "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)],
-                capture_output=True, text=True, timeout=30,
-            )
-            duration = float(probe.stdout.strip()) if probe.stdout.strip() else 0
-            if duration <= 0:
-                return []
-            num_frames = min(max_frames, int(duration / interval))
-            if num_frames < 1:
-                num_frames = 1
-            ts_list = [i * interval for i in range(num_frames)]
-
-        for i, timestamp in enumerate(ts_list):
-            frame_path = frames_dir / f"frame_{i:04d}_{int(timestamp//60):02d}m{int(timestamp%60):02d}s.png"
-            subprocess.run(
-                ["ffmpeg", "-ss", str(timestamp), "-i", str(video_path),
-                 "-frames:v", "1", "-q:v", "2", "-y", str(frame_path)],
-                capture_output=True, timeout=30,
-            )
-            if frame_path.exists() and frame_path.stat().st_size > 1000:
-                frames.append(frame_path)
-
-    except Exception as e:
-        print(f"  [visual] Frame extraction failed: {e}", file=sys.stderr)
-
-    return frames
-
-
-def _extract_ocr_from_frame(frame_path: Path) -> dict:
-    """Extract text from a video frame using Tesseract OCR.
-
-    This is the primary visual extraction method — free, local, no API needed.
-    Returns dict with:
-        - text: Full OCR text
-        - words: List of (word, confidence) tuples
-        - lines: List of text lines
-        - has_content: bool, whether meaningful text was found
-    """
-    tess_path = _find_tesseract()
-    if not tess_path:
-        return {"text": "", "words": [], "lines": [], "has_content": False,
-                "error": "Tesseract not found"}
-
-    try:
-        import pytesseract
-        from PIL import Image
-        pytesseract.pytesseract.tesseract_cmd = tess_path
-
-        img = Image.open(frame_path)
-
-        # Full text extraction
-        full_text = pytesseract.image_to_string(img)
-
-        # Word-level data with confidence scores
-        data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
-
-        words: list[tuple[str, int]] = []
-        for w, conf in zip(data["text"], data["conf"]):
-            w = w.strip()
-            if w and conf != "-1":
-                try:
-                    c = int(conf)
-                    if c >= _OCR_MIN_CONFIDENCE:
-                        words.append((w, c))
-                except (ValueError, TypeError):
-                    pass
-
-        # Lines (grouped by line number)
-        lines_dict: dict[int, list[str]] = {}
-        for i, line_num in enumerate(data["line_num"]):
-            if line_num == 0:
-                continue
-            w = data["text"][i].strip()
-            if w:
-                lines_dict.setdefault(line_num, []).append(w)
-        lines = [" ".join(ws) for ws in lines_dict.values()]
-
-        # Clean text
-        clean_text = full_text.strip()
-        # Remove excessive whitespace
-        clean_text = re.sub(r"\n{3,}", "\n\n", clean_text)
-
-        has_content = len(clean_text) >= _OCR_MIN_TEXT_LEN
-
-        return {
-            "text": clean_text,
-            "words": words,
-            "lines": lines,
-            "has_content": has_content,
-        }
-
-    except Exception as e:
-        return {"text": "", "words": [], "lines": [], "has_content": False,
-                "error": str(e)}
-
-
-def _frames_are_similar(frame1: Path, frame2: Path) -> bool:
-    """Check if two frames are visually similar (for deduplication).
-
-    Uses a simple histogram comparison. Returns True if frames are
-    nearly identical (e.g., same slide with minor changes).
-    """
-    try:
-        from PIL import Image
-        import struct
-
-        img1 = Image.open(frame1).convert("L").resize((64, 64))
-        img2 = Image.open(frame2).convert("L").resize((64, 64))
-
-        # Simple pixel difference
-        pixels1 = list(img1.getpixel((x, y)) for y in range(64) for x in range(64))
-        pixels2 = list(img2.getpixel((x, y)) for y in range(64) for x in range(64))
-
-        if len(pixels1) != len(pixels2):
-            return False
-
-        diff = sum(abs(a - b) for a, b in zip(pixels1, pixels2))
-        max_diff = 255 * len(pixels1)
-        similarity = 1 - (diff / max_diff)
-        return similarity >= _FRAME_DEDUP_THRESHOLD
-
-    except Exception:
-        return False
-
-
-def _deduplicate_frames(frames: list[Path]) -> list[Path]:
-    """Remove consecutive duplicate frames. Keeps first occurrence.
-
-    Returns filtered list of frame paths.
-    """
-    if len(frames) <= 1:
-        return frames
-
-    result: list[Path] = [frames[0]]
-    for i in range(1, len(frames)):
-        if not _frames_are_similar(frames[i], frames[i - 1]):
-            result.append(frames[i])
-        else:
-            # Remove the duplicate frame file
-            try:
-                frames[i].unlink()
-            except Exception:
-                pass
-    return result
-
-
-# --- Pluggable LLM backend for chart pattern analysis ---
-
-def _llm_analyze_frame_openai(
-    frame_path: Path,
-    timestamp: float,
-    api_key: str,
-    base_url: str | None = None,
-) -> dict | None:
-    """Analyze frame using OpenAI-compatible vision API (OpenAI, 9router, etc.)."""
-    try:
-        import base64
-        from openai import OpenAI
-
-        client_kwargs: dict[str, Any] = {"api_key": api_key, "timeout": 60}
-        if base_url:
-            client_kwargs["base_url"] = base_url
-        client = OpenAI(**client_kwargs)
-
-        with open(frame_path, "rb") as f:
-            img_data = base64.b64encode(f.read()).decode("utf-8")
-
-        ext = frame_path.suffix.lower()
-        mime = "image/png" if ext == ".png" else "image/jpeg"
-        timestamp_str = f"{int(timestamp // 60):02d}:{int(timestamp % 60):02d}"
-
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a visual content analyzer for educational/trading videos. "
-                        "Analyze the provided video frame and extract:\n"
-                        "1. chart_patterns: If this shows a financial chart, identify any "
-                        "visible patterns (head and shoulders, candlesticks, trendlines, "
-                        "support/resistance levels, indicators shown)\n"
-                        "2. visual_content: What's being shown (diagram, chart, slide, "
-                        "person talking, screen recording, demo, etc.)\n"
-                        "3. description: One-sentence summary of what's visible\n\n"
-                        "Respond as JSON with these exact keys."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": f"Frame from timestamp {timestamp_str}. Analyze it.",
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:{mime};base64,{img_data}"},
-                        },
-                    ],
-                },
-            ],
-            temperature=0,
-            max_tokens=400,
-            response_format={"type": "json_object"},
-        )
-
-        result = json.loads(resp.choices[0].message.content)
-        result["timestamp"] = timestamp
-        result["timestamp_str"] = timestamp_str
-        result["frame_file"] = frame_path.name
-        result["llm_provider"] = "openai"
-        return result
-
-    except Exception as e:
-        print(f"  [visual] OpenAI analysis failed: {e}", file=sys.stderr)
-        return None
-
-
-def _llm_analyze_frame_anthropic(
-    frame_path: Path,
-    timestamp: float,
-    api_key: str,
-) -> dict | None:
-    """Analyze frame using Anthropic Claude vision API."""
-    try:
-        import base64
-        import anthropic
-
-        client = anthropic.Anthropic(api_key=api_key, timeout=60)
-
-        with open(frame_path, "rb") as f:
-            img_data = base64.b64encode(f.read()).decode("utf-8")
-
-        ext = frame_path.suffix.lower()
-        media_type = "image/png" if ext == ".png" else "image/jpeg"
-        timestamp_str = f"{int(timestamp // 60):02d}:{int(timestamp % 60):02d}"
-
-        resp = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=400,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": media_type,
-                                "data": img_data,
-                            },
-                        },
-                        {
-                            "type": "text",
-                            "text": (
-                                f"Frame from timestamp {timestamp_str} in an educational video. "
-                                "Analyze this frame and respond as JSON with these keys: "
-                                "chart_patterns (visible chart patterns, indicators, price levels), "
-                                "visual_content (what's being shown), "
-                                "description (one-sentence summary)."
-                            ),
-                        },
-                    ],
-                },
-            ],
-        )
-
-        text = resp.content[0].text if resp.content else ""
-        # Try to parse JSON from response
-        try:
-            result = json.loads(text)
-        except json.JSONDecodeError:
-            # Extract JSON from markdown code blocks
-            match = re.search(r"\{[^}]+\}", text, re.DOTALL)
-            if match:
-                result = json.loads(match.group())
-            else:
-                result = {"description": text, "chart_patterns": "", "visual_content": ""}
-
-        result["timestamp"] = timestamp
-        result["timestamp_str"] = timestamp_str
-        result["frame_file"] = frame_path.name
-        result["llm_provider"] = "anthropic"
-        return result
-
-    except Exception as e:
-        print(f"  [visual] Anthropic analysis failed: {e}", file=sys.stderr)
-        return None
-
-
-def _llm_analyze_frame_ollama(
-    frame_path: Path,
-    timestamp: float,
-    model: str = "llama3.2-vision",
-) -> dict | None:
-    """Analyze frame using local Ollama vision model. No API key needed."""
-    try:
-        import ollama
-
-        timestamp_str = f"{int(timestamp // 60):02d}:{int(timestamp % 60):02d}"
-
-        resp = ollama.chat(
-            model=model,
-            messages=[{
-                "role": "user",
-                "content": (
-                    f"Frame from timestamp {timestamp_str} in an educational video. "
-                    "Analyze this frame and respond as JSON with these keys: "
-                    "chart_patterns, visual_content, description."
-                ),
-                "images": [str(frame_path)],
-            }],
-        )
-
-        text = resp.get("message", {}).get("content", "")
-        try:
-            result = json.loads(text)
-        except json.JSONDecodeError:
-            match = re.search(r"\{[^}]+\}", text, re.DOTALL)
-            if match:
-                result = json.loads(match.group())
-            else:
-                result = {"description": text, "chart_patterns": "", "visual_content": ""}
-
-        result["timestamp"] = timestamp
-        result["timestamp_str"] = timestamp_str
-        result["frame_file"] = frame_path.name
-        result["llm_provider"] = "ollama"
-        return result
-
-    except Exception as e:
-        print(f"  [visual] Ollama analysis failed: {e}", file=sys.stderr)
-        return None
-
-
-def _detect_llm_provider() -> str:
-    """Auto-detect which LLM provider is available.
-
-    Priority: OPENAI_API_KEY (or 9router) > ANTHROPIC_API_KEY > Ollama running.
-    Returns: "openai" | "anthropic" | "ollama" | ""
-    """
-    # Check for OpenAI (includes 9router which uses OpenAI-compatible API)
-    if os.environ.get("OPENAI_API_KEY"):
-        return "openai"
-    # Check for Anthropic
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        return "anthropic"
-    # Check if Ollama is running locally
-    try:
-        import urllib.request
-        req = urllib.request.Request("http://localhost:11434/api/tags", method="GET")
-        urllib.request.urlopen(req, timeout=2)
-        return "ollama"
-    except Exception:
-        pass
-    return ""
-
-
-def _analyze_frame_with_llm(
-    frame_path: Path,
-    timestamp: float,
-    provider: str | None = None,
-) -> dict | None:
-    """Analyze a frame using the best available LLM provider.
-
-    This is OPTIONAL — OCR runs first and always. LLM adds chart pattern
-    analysis and visual context that OCR can't provide.
-
-    Args:
-        frame_path: Path to the frame image.
-        timestamp: Timestamp in seconds.
-        provider: Force a specific provider ("openai" | "anthropic" | "ollama").
-                  If None, auto-detects.
-
-    Returns dict with chart_patterns, visual_content, description, or None.
-    """
-    provider = provider or _detect_llm_provider()
-
-    if provider == "openai":
-        api_key = os.environ.get("OPENAI_API_KEY", "")
-        base_url = os.environ.get("OPENAI_BASE_URL")  # 9router uses this
-        return _llm_analyze_frame_openai(frame_path, timestamp, api_key, base_url)
-
-    elif provider == "anthropic":
-        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-        return _llm_analyze_frame_anthropic(frame_path, timestamp, api_key)
-
-    elif provider == "ollama":
-        return _llm_analyze_frame_ollama(frame_path, timestamp)
-
-    return None
-
-
-def _extract_visual_claims_from_ocr(
-    ocr_text: str,
-    timestamp: float,
-) -> list[dict]:
-    """Parse OCR text into structured visual claims.
-
-    Detects:
-    - Bullet points / numbered lists (slide content)
-    - Indicator settings (RSI: 14, MA: 200, etc.)
-    - Price levels ($100, €50, etc.)
-    - Percentages (70%, 30%)
-    - Definitions (X = Y, X is Y)
-    """
-    claims: list[dict] = []
-    timestamp_str = f"{int(timestamp // 60):02d}:{int(timestamp % 60):02d}"
-    lines = [l.strip() for l in ocr_text.split("\n") if l.strip()]
-
-    # Detect bullet points / list items
-    for line in lines:
-        # Bullet point: ". Item" or "• Item" or "1. Item"
-        bullet_match = re.match(r"^[.•\-\*]\s*(.+)", line) or re.match(r"^\d+[.)]\s*(.+)", line)
-        if bullet_match:
-            content = bullet_match.group(1).strip()
-            if len(content) > 3:
-                claims.append({
-                    "timestamp": timestamp,
-                    "timestamp_str": timestamp_str,
-                    "claim": content,
-                    "source": "visual_ocr",
-                    "type": "bullet_point",
-                })
-
-    # Detect indicator settings: "RSI: 14", "MA = 200", "Length: 9"
-    for line in lines:
-        setting_match = re.search(
-            r"(?i)\b(RSI|RSI length|MA|SMA|EMA|MACD|Stochastic|ATR|Bollinger|"
-            r"Length|Period|Standard Deviation|Risk Reward|Stop Loss|Take Profit)"
-            r"\s*[:=]\s*(\d+(?:\.\d+)?)",
-            line,
-        )
-        if setting_match:
-            claims.append({
-                "timestamp": timestamp,
-                "timestamp_str": timestamp_str,
-                "claim": f"{setting_match.group(1)} = {setting_match.group(2)}",
-                "source": "visual_ocr",
-                "type": "indicator_setting",
-            })
-
-    # Detect threshold patterns: "RSI is above 70", "RSI is below 30"
-    for line in lines:
-        threshold_match = re.search(
-            r"(?i)\b(RSI|MACD|Stochastic|ATR|MA|SMA|EMA|OBV|ADX)"
-            r"\s+(?:is\s+)?(above|below|over|under|>|<)\s*(\d+(?:\.\d+)?)",
-            line,
-        )
-        if threshold_match:
-            indicator = threshold_match.group(1)
-            direction = threshold_match.group(2)
-            value = threshold_match.group(3)
-            claims.append({
-                "timestamp": timestamp,
-                "timestamp_str": timestamp_str,
-                "claim": f"{indicator} {direction} {value}",
-                "source": "visual_ocr",
-                "type": "indicator_threshold",
-            })
-
-    # Detect definitions on slides: "X = Y" or "X is Y"
-    for line in lines:
-        def_match = re.search(
-            r"(?i)\b(Momentum|Divergence|Overbought|Oversold|Bullish|Bearish|"
-            r"Support|Resistance|Trendline|Breakout|Reversal)"
-            r"\s*[=:]\s*(.{5,80})",
-            line,
-        )
-        if def_match:
-            term = def_match.group(1)
-            definition = def_match.group(2).strip().rstrip(".,;|")
-            if len(definition) > 5:
-                claims.append({
-                    "timestamp": timestamp,
-                    "timestamp_str": timestamp_str,
-                    "claim": f"{term} = {definition}",
-                    "source": "visual_ocr",
-                    "type": "visual_definition",
-                })
-
-    # Detect price levels: $100, €50, £75
-    for line in lines:
-        for m in re.finditer(r"[$€£]\s*(\d+(?:,\d{3})*(?:\.\d+)?)", line):
-            claims.append({
-                "timestamp": timestamp,
-                "timestamp_str": timestamp_str,
-                "claim": f"Price level: {m.group(0)}",
-                "source": "visual_ocr",
-                "type": "price_level",
-            })
-
-    # Detect percentages
-    for line in lines:
-        for m in re.finditer(r"(\d+(?:\.\d+)?)\s*%", line):
-            pct = m.group(0)
-            # Avoid double-counting with indicator settings
-            if not any(c["claim"].endswith(pct) for c in claims if c["type"] == "indicator_setting"):
-                claims.append({
-                    "timestamp": timestamp,
-                    "timestamp_str": timestamp_str,
-                    "claim": f"Percentage shown: {pct}",
-                    "source": "visual_ocr",
-                    "type": "percentage",
-                })
-
-    return claims
-
-
-def extract_visual_content(
-    video_id: str,
-    output_dir: Path,
-    duration: int = 0,
-    cookies_file: str | None = None,
-    cookies_from_browser: str | None = None,
-    proxy: str | None = None,
-    enable_visual: bool = True,
-    llm_provider: str | None = None,
-    chapter_timestamps: list[float] | None = None,
-) -> dict:
-    """Extract visual content from a YouTube video.
-
-    Pipeline:
-      1. Download video in lowest quality
-      2. Extract frames at intervals (or chapter boundaries if provided)
-      3. Deduplicate similar frames
-      4. Run OCR (Tesseract) on each frame — ALWAYS, free, local
-      5. Optionally run LLM vision analysis for chart patterns — pluggable
-      6. Parse OCR text into structured claims
-
-    OCR is the primary method and requires no API key.
-    LLM analysis is optional and auto-detects the best available provider
-    (OpenAI/9router, Anthropic, or local Ollama).
-
-    Returns:
-        {
-            "enabled": bool,
-            "ocr_available": bool,
-            "llm_provider": str,  # "" if none
-            "video_downloaded": bool,
-            "frames_extracted": int,
-            "frames_after_dedup": int,
-            "frames_analyzed_ocr": int,
-            "frames_analyzed_llm": int,
-            "visual_claims": [...],
-            "on_screen_texts": [...],
-            "chart_patterns": [...],
-            "frame_analyses": [...],
-        }
-    """
-    result: dict[str, Any] = {
-        "enabled": enable_visual,
-        "ocr_available": bool(_find_tesseract()),
-        "llm_provider": "",
-        "video_downloaded": False,
-        "frames_extracted": 0,
-        "frames_after_dedup": 0,
-        "frames_analyzed_ocr": 0,
-        "frames_analyzed_llm": 0,
-        "visual_claims": [],
-        "on_screen_texts": [],
-        "chart_patterns": [],
-        "frame_analyses": [],
-    }
-
-    if not enable_visual:
-        return result
-
-    # Detect LLM provider (for optional chart pattern analysis)
-    provider = llm_provider or _detect_llm_provider()
-    result["llm_provider"] = provider
-
-    # Check OCR availability
-    if not result["ocr_available"]:
-        print("  [visual] Tesseract OCR not found — install: winget install UB-Mannheim.TesseractOCR",
-              file=sys.stderr)
-        # Still try LLM-only if available
-        if not provider:
-            print("  [visual] No OCR and no LLM — cannot do visual extraction", file=sys.stderr)
-            return result
-
-    # Step 1: Download video
-    print("  [visual] Downloading video (low quality)...", file=sys.stderr)
-    video_path = _download_video_low_quality(
-        video_id, output_dir, cookies_file, cookies_from_browser, proxy,
-    )
-    if not video_path:
-        return result
-    result["video_downloaded"] = True
-
-    # Step 2: Extract frames
-    print("  [visual] Extracting frames...", file=sys.stderr)
-    frames = _extract_frames(
-        video_path, output_dir,
-        timestamps=chapter_timestamps if chapter_timestamps else None,
-    )
-    result["frames_extracted"] = len(frames)
-    if not frames:
-        return result
-
-    # Step 3: Deduplicate similar frames
-    frames = _deduplicate_frames(frames)
-    result["frames_after_dedup"] = len(frames)
-    print(f"  [visual] {len(frames)} unique frames after dedup", file=sys.stderr)
-
-    # Step 4: OCR on each frame (always runs if Tesseract available)
-    on_screen_texts: list[dict] = []
-    visual_claims: list[dict] = []
-    frame_analyses: list[dict] = []
-
-    if result["ocr_available"]:
-        print(f"  [visual] Running OCR on {len(frames)} frames...", file=sys.stderr)
-        for frame in frames:
-            # Parse timestamp from filename
-            match = re.search(r"(\d+)m(\d+)s", frame.name)
-            timestamp = int(match.group(1)) * 60 + int(match.group(2)) if match else 0
-            timestamp_str = f"{int(timestamp // 60):02d}:{int(timestamp % 60):02d}"
-
-            ocr_result = _extract_ocr_from_frame(frame)
-            if ocr_result.get("has_content"):
-                result["frames_analyzed_ocr"] += 1
-
-                # Store on-screen text
-                on_screen_texts.append({
-                    "timestamp": timestamp,
-                    "timestamp_str": timestamp_str,
-                    "text": ocr_result["text"],
-                    "word_count": len(ocr_result["words"]),
-                    "avg_confidence": (
-                        sum(c for _, c in ocr_result["words"]) / len(ocr_result["words"])
-                        if ocr_result["words"] else 0
-                    ),
-                })
-
-                # Extract structured claims from OCR text
-                ocr_claims = _extract_visual_claims_from_ocr(ocr_result["text"], timestamp)
-                visual_claims.extend(ocr_claims)
-
-                # Store frame analysis
-                frame_analyses.append({
-                    "timestamp": timestamp,
-                    "timestamp_str": timestamp_str,
-                    "frame_file": frame.name,
-                    "ocr_text": ocr_result["text"],
-                    "ocr_lines": ocr_result["lines"],
-                    "ocr_word_count": len(ocr_result["words"]),
-                    "ocr_avg_confidence": (
-                        sum(c for _, c in ocr_result["words"]) / len(ocr_result["words"])
-                        if ocr_result["words"] else 0
-                    ),
-                })
-
-    # Step 5: Optional LLM analysis for chart patterns
-    if provider:
-        print(f"  [visual] Running LLM analysis ({provider}) on frames with content...",
-              file=sys.stderr)
-        for fa in frame_analyses:
-            frame_path = output_dir / _FRAMES_SUBDIR / fa["frame_file"]
-            if not frame_path.exists():
-                continue
-            llm_result = _analyze_frame_with_llm(frame_path, fa["timestamp"], provider)
-            if llm_result:
-                result["frames_analyzed_llm"] += 1
-                fa["llm_analysis"] = llm_result
-
-                # Collect chart patterns
-                cp = llm_result.get("chart_patterns", "")
-                if cp and len(cp) > 3:
-                    result["chart_patterns"].append({
-                        "timestamp": fa["timestamp"],
-                        "timestamp_str": fa["timestamp_str"],
-                        "patterns": cp,
-                        "provider": provider,
-                    })
-
-                # Add visual description as a claim
-                desc = llm_result.get("description", "")
-                if desc:
-                    visual_claims.append({
-                        "timestamp": fa["timestamp"],
-                        "timestamp_str": fa["timestamp_str"],
-                        "claim": desc,
-                        "source": f"visual_llm_{provider}",
-                        "type": "visual_description",
-                    })
-
-    result["on_screen_texts"] = on_screen_texts
-    result["visual_claims"] = visual_claims
-    result["frame_analyses"] = frame_analyses
-
-    # Clean up video file to save space (keep frames)
-    try:
-        video_path.unlink()
-    except Exception:
-        pass
-
-    return result
 
 
 # ---------------------------------------------------------------- TEXT-TO-SPEECH (TTS)
@@ -4962,6 +3965,26 @@ def _format_report_for_tts(report: dict) -> str:
     return _format_light_research_for_tts(report)
 
 
+def _run_async(coro) -> None:
+    """Run a coroutine, safe to call from inside an already-running event loop.
+
+    asyncio.run() raises RuntimeError("This event loop is already running") when
+    called from Jupyter, FastAPI, or any async host. This helper detects that
+    case and runs the coroutine in a fresh thread's event loop instead.
+    """
+    try:
+        asyncio.get_running_loop()
+        in_loop = True
+    except RuntimeError:
+        in_loop = False
+    if in_loop:
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(asyncio.run, coro).result()
+    else:
+        asyncio.run(coro)
+
+
 async def _generate_speech(
     text: str,
     output_path: Path,
@@ -5028,8 +4051,11 @@ def read_report(
     audio_path = out / f"{stem}_audio.mp3"
 
     # Generate speech
+    # Use _run_async() instead of asyncio.run() so this works inside Jupyter /
+    # FastAPI / any async host. asyncio.run() raises RuntimeError if an event
+    # loop is already running.
     try:
-        asyncio.run(_generate_speech(script, audio_path, voice, rate, volume))
+        _run_async(_generate_speech(script, audio_path, voice, rate, volume))
     except Exception as e:
         return {"ok": False, "error": f"TTS generation failed: {e}"}
 
@@ -5999,6 +5025,9 @@ def main() -> int:
     sp_b = sub.add_parser("batch", help="Batch scrape from a file")
     sp_b.add_argument("file", help="File with one URL/ID per line")
     sp_b.add_argument("--transcripts", action="store_true", help="Download transcripts (default: on)")
+    sp_b.add_argument("--concurrency", type=int, default=1,
+                      help="Parallel workers (1=sequential, 3-5=recommended for speed, >5=risky)")
+    sp_b.add_argument("--no-cache", action="store_true", help="Bypass transcript cache (re-download)")
     sp_b.set_defaults(transcripts=True)
     add_common_opts(sp_b)
 
@@ -6030,7 +5059,6 @@ def main() -> int:
     sp_dr.add_argument("--retries", type=int, default=DEFAULT_RETRIES, help="Max retries on network errors")
     sp_dr.add_argument("--output", default="", help="Custom output directory")
     sp_dr.add_argument("--json", action="store_true", help="Output as JSON (default: human-readable)")
-    sp_dr.add_argument("--visual", action="store_true", help="Extract visual content from video frames (OCR-first, no API key needed. Optional LLM for chart patterns.)")
 
     sp_read = sub.add_parser("read", help="Read a research report aloud as MP3 (text-to-speech)")
     sp_read.add_argument("report", help="Path to report JSON (_research.json or _deep_research.json)")
@@ -6047,6 +5075,97 @@ def main() -> int:
     sp_web.add_argument("report", help="Path to report JSON (_research.json or _deep_research.json)")
     sp_web.add_argument("--output", default="", help="Custom output path for HTML file")
     sp_web.add_argument("--open", action="store_true", help="Open in browser after generating")
+
+    sp_push = sub.add_parser("push", help="Push a YouTube transcript to Open Notebook")
+    sp_push.add_argument("url", help="YouTube URL or 11-char video ID")
+    sp_push.add_argument("--notebook", required=True,
+                         help="Notebook ID (e.g. notebook:abc123) or notebook name")
+    sp_push.add_argument("--notebook-by-name", action="store_true",
+                         help="Treat --notebook as a name to look up via the API")
+    sp_push.add_argument("--with-claims", action="store_true",
+                         help="Extract enriched claims and include in metadata footer")
+    sp_push.add_argument("--diarize", action="store_true",
+                         help="Label transcript segments with speaker IDs (pyannote or heuristic)")
+    sp_push.add_argument("--diarize-method", choices=["auto", "pyannote", "heuristic"],
+                         default="auto", help="Diarization method (default: auto)")
+    sp_push.add_argument("--include-comments", action="store_true",
+                         help="Also extract and push video comments as a separate source")
+    sp_push.add_argument("--max-comments", type=int, default=100,
+                         help="Max comments to fetch (default: 100)")
+    sp_push.add_argument("--embed", action="store_true", default=True,
+                         help="Embed transcript for vector search (default: on)")
+    sp_push.add_argument("--no-embed", dest="embed", action="store_false",
+                         help="Skip embedding (faster, but not searchable)")
+    sp_push.add_argument("--async", dest="async_processing", action="store_true",
+                         help="Process asynchronously (fire-and-forget; default: sync)")
+    sp_push.add_argument("--wait", action="store_true",
+                         help="Wait for async processing to complete (polls status)")
+    sp_push.add_argument("--wait-timeout", type=int, default=300,
+                         help="Max seconds to wait for processing (default: 300)")
+    sp_push.add_argument("--open-notebook-url", default="",
+                         help="Open Notebook base URL (default: $OPEN_NOTEBOOK_URL or http://localhost:5055)")
+    sp_push.add_argument("--open-notebook-key", default="",
+                         help="Open Notebook API key (default: $OPEN_NOTEBOOK_API_KEY)")
+    sp_push.add_argument("--cookies", default="", help="Cookies file path")
+    sp_push.add_argument("--cookies-from-browser", default="", help="Browser for cookies")
+    sp_push.add_argument("--proxy", default="", help="Proxy URL")
+    sp_push.add_argument("--retries", type=int, default=DEFAULT_RETRIES, help="Max retries")
+    sp_push.add_argument("--output", default="", help="Custom transcripts directory")
+    sp_push.add_argument("--json", action="store_true", help="Output as JSON")
+
+    sp_chpush = sub.add_parser("channel-push",
+                               help="Scrape a YouTube channel and push all videos to Open Notebook")
+    sp_chpush.add_argument("channel", help="YouTube channel URL or ID")
+    sp_chpush.add_argument("--notebook", required=True,
+                           help="Notebook ID (e.g. notebook:abc123) or notebook name")
+    sp_chpush.add_argument("--notebook-by-name", action="store_true",
+                           help="Treat --notebook as a name to look up via the API")
+    sp_chpush.add_argument("--limit", type=int, default=10,
+                           help="Max videos to scrape (default: 10)")
+    sp_chpush.add_argument("--concurrency", type=int, default=3,
+                           help="Parallel workers for transcript extraction (default: 3)")
+    sp_chpush.add_argument("--with-claims", action="store_true",
+                           help="Extract enriched claims for each video")
+    sp_chpush.add_argument("--no-embed", action="store_true",
+                           help="Skip embedding (faster, but not searchable)")
+    sp_chpush.add_argument("--async", dest="async_processing", action="store_true",
+                           help="Process each source asynchronously (fire-and-forget; default: sync)")
+    sp_chpush.add_argument("--open-notebook-url", default="",
+                           help="Open Notebook base URL (default: $OPEN_NOTEBOOK_URL or http://localhost:5055)")
+    sp_chpush.add_argument("--open-notebook-key", default="",
+                           help="Open Notebook API key (default: $OPEN_NOTEBOOK_API_KEY)")
+    sp_chpush.add_argument("--cookies", default="", help="Cookies file path")
+    sp_chpush.add_argument("--cookies-from-browser", default="", help="Browser for cookies")
+    sp_chpush.add_argument("--proxy", default="", help="Proxy URL")
+    sp_chpush.add_argument("--retries", type=int, default=DEFAULT_RETRIES, help="Max retries")
+    sp_chpush.add_argument("--rate-limit", type=float, default=DEFAULT_RATE_LIMIT,
+                           help="Seconds between requests")
+    sp_chpush.add_argument("--output", default="", help="Custom transcripts directory")
+    sp_chpush.add_argument("--json", action="store_true", help="Output as JSON")
+
+    sp_cluster = sub.add_parser("cluster",
+                                help="Cluster videos from a channel by topic (BERTopic/sklearn/keyword)")
+    sp_cluster.add_argument("channel", help="YouTube channel URL or ID")
+    sp_cluster.add_argument("--limit", type=int, default=20,
+                            help="Max videos to scrape (default: 20)")
+    sp_cluster.add_argument("--n-topics", type=int, default=5,
+                            help="Target number of topics (default: 5)")
+    sp_cluster.add_argument("--method", choices=["auto", "bertopic", "sklearn", "keyword"],
+                            default="auto", help="Clustering method (default: auto)")
+    sp_cluster.add_argument("--push-to", default="",
+                            help="Notebook ID to push the topic map to (Open Notebook)")
+    sp_cluster.add_argument("--open-notebook-url", default="",
+                            help="Open Notebook base URL (default: $OPEN_NOTEBOOK_URL)")
+    sp_cluster.add_argument("--open-notebook-key", default="",
+                            help="Open Notebook API key (default: $OPEN_NOTEBOOK_API_KEY)")
+    sp_cluster.add_argument("--cookies", default="", help="Cookies file path")
+    sp_cluster.add_argument("--cookies-from-browser", default="", help="Browser for cookies")
+    sp_cluster.add_argument("--proxy", default="", help="Proxy URL")
+    sp_cluster.add_argument("--retries", type=int, default=DEFAULT_RETRIES, help="Max retries")
+    sp_cluster.add_argument("--rate-limit", type=float, default=DEFAULT_RATE_LIMIT,
+                            help="Seconds between requests")
+    sp_cluster.add_argument("--output", default="", help="Custom transcripts directory")
+    sp_cluster.add_argument("--json", action="store_true", help="Output as JSON")
 
     args = p.parse_args()
 
@@ -6144,13 +5263,24 @@ def main() -> int:
         return 0
 
     if args.cmd == "batch":
-        results = batch_scrape(
-            args.file, transcripts=args.transcripts, langs=langs,
-            rate_limit_sec=rate_limit, output_dir=out_dir,
-            timestamps=timestamps, whisper=whisper,
-            cookies_file=cookies_file, cookies_from_browser=cookies_browser,
-            proxy=proxy, retries=retries,
-        )
+        concurrency = getattr(args, "concurrency", 1) or 1
+        no_cache = getattr(args, "no_cache", False)
+        if concurrency > 1:
+            results = asyncio.run(batch_scrape_async(
+                args.file, transcripts=args.transcripts, langs=langs,
+                concurrency=concurrency, rate_limit_sec=rate_limit,
+                output_dir=out_dir, timestamps=timestamps, whisper=whisper,
+                cookies_file=cookies_file, cookies_from_browser=cookies_browser,
+                proxy=proxy, retries=retries,
+            ))
+        else:
+            results = batch_scrape(
+                args.file, transcripts=args.transcripts, langs=langs,
+                rate_limit_sec=rate_limit, output_dir=out_dir,
+                timestamps=timestamps, whisper=whisper,
+                cookies_file=cookies_file, cookies_from_browser=cookies_browser,
+                proxy=proxy, retries=retries,
+            )
         if args.json:
             print(json.dumps([r.to_dict() for r in results], ensure_ascii=False, indent=2))
         else:
@@ -6228,7 +5358,6 @@ def main() -> int:
             cookies_from_browser=cookies_browser,
             proxy=proxy,
             retries=retries,
-            enable_visual=getattr(args, "visual", False),
         )
         if not result.get("ok"):
             print(f"FAILED: {result.get('error', 'unknown error')}", file=sys.stderr)
@@ -6282,26 +5411,6 @@ def main() -> int:
                 for p in src["people"][:5]:
                     print(f"    - {p}")
             print(f"{'─' * 70}")
-            # Visual extraction summary
-            ve = result.get("visual_extraction", {})
-            if ve.get("enabled"):
-                print(f"  VISUAL EXTRACTION")
-                print(f"  OCR available:    {ve.get('ocr_available', False)}")
-                llm_prov = ve.get("llm_provider", "")
-                print(f"  LLM provider:     {llm_prov or 'none (OCR only)'}")
-                print(f"  Video downloaded: {ve.get('video_downloaded', False)}")
-                print(f"  Frames extracted: {ve.get('frames_extracted', 0)}")
-                print(f"  After dedup:      {ve.get('frames_after_dedup', 0)}")
-                print(f"  OCR analyzed:     {ve.get('frames_analyzed_ocr', 0)}")
-                if llm_prov:
-                    print(f"  LLM analyzed:     {ve.get('frames_analyzed_llm', 0)}")
-                if ve.get("on_screen_texts"):
-                    print(f"  On-screen texts:  {len(ve['on_screen_texts'])}")
-                if ve.get("chart_patterns"):
-                    print(f"  Chart patterns:   {len(ve['chart_patterns'])}")
-                if ve.get("visual_claims"):
-                    print(f"  Visual claims:    {len(ve['visual_claims'])}")
-                print(f"{'─' * 70}")
             print(f"  Research package: {result['research_package_path']}")
             print(f"{'─' * 70}")
             print(f"  NEXT STEP: Deep Research Phase 2 — Devin executes:")
@@ -6430,6 +5539,231 @@ def main() -> int:
         else:
             print(f"  Open with: --open flag or double-click the HTML file")
         print(f"{'=' * 70}")
+        return 0
+
+    if args.cmd == "push":
+        from open_notebook import (
+            OpenNotebookClient, OpenNotebookConfig, OpenNotebookError,
+        )
+        base_url = args.open_notebook_url or os.getenv("OPEN_NOTEBOOK_URL", "http://localhost:5055")
+        api_key = args.open_notebook_key or os.getenv("OPEN_NOTEBOOK_API_KEY", "")
+        config = OpenNotebookConfig(base_url=base_url, api_key=api_key)
+        client = OpenNotebookClient(config=config)
+
+        # Resolve notebook ID (look up by name if requested)
+        notebook_id = args.notebook
+        if args.notebook_by_name:
+            try:
+                nb = client.find_notebook_by_name(args.notebook)
+            except OpenNotebookError as exc:
+                print(f"ERROR looking up notebook: {exc}", file=sys.stderr)
+                return 1
+            if not nb:
+                print(f"ERROR: No notebook named '{args.notebook}' found.", file=sys.stderr)
+                return 1
+            notebook_id = nb.get("id") or nb.get("name") or args.notebook
+            print(f"  Resolved notebook '{args.notebook}' -> {notebook_id}")
+
+        # Scrape the video
+        print(f"  Scraping {args.url}...", file=sys.stderr)
+        video = extract_transcript(
+            args.url, langs=langs, output_dir=out_dir,
+            cookies_file=cookies_file, cookies_from_browser=cookies_browser,
+            proxy=proxy, retries=retries,
+        )
+        if video.error:
+            print(f"ERROR: Failed to scrape video: {video.error}", file=sys.stderr)
+            return 1
+
+        # Optional: extract enriched claims with citation URLs
+        claims: list[dict] = []
+        if args.with_claims and video.segments:
+            print(f"  Extracting claims with citation URLs...", file=sys.stderr)
+            try:
+                claims = extract_claims_for_video(video) or []
+            except Exception as exc:
+                print(f"  WARN: claim extraction failed: {exc}", file=sys.stderr)
+
+        # Optional: diarize segments (label with speaker IDs)
+        extra_content = ""
+        if args.diarize and video.segments:
+            from diarize import diarize_segments, format_diarized_transcript
+            print(f"  Diarizing segments (method: {args.diarize_method})...", file=sys.stderr)
+            try:
+                dia_result = diarize_segments(video.segments, method=args.diarize_method)
+                extra_content = (
+                    f"--- DIARIZATION ({dia_result.method}, "
+                    f"{dia_result.speaker_count} speakers) ---\n"
+                    f"{format_diarized_transcript(dia_result)}"
+                )
+            except Exception as exc:
+                print(f"  WARN: diarization failed: {exc}", file=sys.stderr)
+
+        # Push to Open Notebook
+        print(f"  Pushing to Open Notebook at {base_url}...", file=sys.stderr)
+        try:
+            result = client.push_video(
+                video, video.segments, claims=claims,
+                notebook_id=notebook_id,
+                embed=args.embed,
+                async_processing=args.async_processing,
+                extra_content=extra_content,
+            )
+        except OpenNotebookError as exc:
+            print(f"ERROR: Push failed: {exc}", file=sys.stderr)
+            return 1
+
+        source_id = result.get("id", "?")
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            print(f"  Pushed: {source_id}")
+            print(f"  Title:  {result.get('title', video.title)}")
+            if args.async_processing:
+                print(f"  Status: processing (async)")
+                if args.wait:
+                    print(f"  Waiting for completion (timeout: {args.wait_timeout}s)...", file=sys.stderr)
+                    try:
+                        final = client.wait_for_source(source_id, timeout=args.wait_timeout)
+                        print(f"  Final status: {final.get('status', 'unknown')}")
+                    except OpenNotebookError as exc:
+                        print(f"  WARN: {exc}", file=sys.stderr)
+                        return 1
+            else:
+                print(f"  Status: ready (sync — fully processed)")
+
+        # Optional: extract and push comments as a separate source
+        if args.include_comments:
+            from comments import extract_comments, comments_to_source_payload
+            print(f"  Extracting comments (max: {args.max_comments})...", file=sys.stderr)
+            try:
+                comments = extract_comments(
+                    args.url, max_comments=args.max_comments,
+                    cookies_file=cookies_file, cookies_from_browser=cookies_browser,
+                    proxy=proxy,
+                )
+                if comments:
+                    comment_payload = comments_to_source_payload(
+                        comments, video, notebook_id=notebook_id, embed=args.embed,
+                    )
+                    comment_result = client.create_source(comment_payload)
+                    comment_id = comment_result.get("id", "?")
+                    if args.json:
+                        print(json.dumps({"comment_source": comment_result}, ensure_ascii=False))
+                    else:
+                        print(f"  Pushed comments: {comment_id} ({len(comments)} threads)")
+                else:
+                    print(f"  No comments found (or comments disabled).", file=sys.stderr)
+            except Exception as exc:
+                print(f"  WARN: comment extraction failed: {exc}", file=sys.stderr)
+
+        return 0
+
+    if args.cmd == "channel-push":
+        from open_notebook import (
+            OpenNotebookClient, OpenNotebookConfig, OpenNotebookError,
+        )
+        base_url = args.open_notebook_url or os.getenv("OPEN_NOTEBOOK_URL", "http://localhost:5055")
+        api_key = args.open_notebook_key or os.getenv("OPEN_NOTEBOOK_API_KEY", "")
+        config = OpenNotebookConfig(base_url=base_url, api_key=api_key)
+        client = OpenNotebookClient(config=config)
+
+        # Resolve notebook ID (look up by name if requested)
+        notebook_id = args.notebook
+        if args.notebook_by_name:
+            try:
+                nb = client.find_notebook_by_name(args.notebook)
+            except OpenNotebookError as exc:
+                print(f"ERROR looking up notebook: {exc}", file=sys.stderr)
+                return 1
+            if not nb:
+                print(f"ERROR: No notebook named '{args.notebook}' found.", file=sys.stderr)
+                return 1
+            notebook_id = nb.get("id") or nb.get("name") or args.notebook
+            print(f"  Resolved notebook '{args.notebook}' -> {notebook_id}")
+
+        def on_progress(p):
+            status_icon = {"pushed": "+", "failed": "x", "skipped": "-"}.get(p["status"], "?")
+            print(f"  [{p['done']}/{p['total']}] {status_icon} {p.get('video_id', '?')} — {p['status']}", file=sys.stderr)
+
+        print(f"  Scraping channel {args.channel} (limit: {args.limit})...", file=sys.stderr)
+        try:
+            summary = client.push_channel(
+                args.channel, notebook_id,
+                limit=args.limit,
+                concurrency=args.concurrency,
+                with_claims=args.with_claims,
+                embed=not args.no_embed,
+                async_processing=args.async_processing,
+                langs=langs,
+                cookies_file=cookies_file,
+                cookies_from_browser=cookies_browser,
+                proxy=proxy,
+                retries=retries,
+                rate_limit_sec=rate_limit,
+                on_progress=on_progress,
+            )
+        except OpenNotebookError as exc:
+            print(f"ERROR: Channel push failed: {exc}", file=sys.stderr)
+            return 1
+
+        if args.json:
+            print(json.dumps(summary, ensure_ascii=False, indent=2))
+        else:
+            print(f"\nDone: {summary['pushed']} pushed, {summary['failed']} failed, {summary['total']} total")
+            if summary["errors"]:
+                print(f"\nErrors:")
+                for e in summary["errors"][:10]:
+                    print(f"  {e['video_id']}: {e['error']}")
+        return 0
+
+    if args.cmd == "cluster":
+        from clustering import cluster_videos, format_clustering_summary
+        print(f"  Scraping channel {args.channel} (limit: {args.limit})...", file=sys.stderr)
+        videos = scrape_channel(
+            args.channel, limit=args.limit, transcripts=True, langs=langs,
+            cookies_file=cookies_file, cookies_from_browser=cookies_browser,
+            proxy=proxy, retries=retries, rate_limit_sec=rate_limit,
+        )
+        print(f"  Scraped {len(videos)} videos. Clustering (method: {args.method})...", file=sys.stderr)
+        result = cluster_videos(videos, n_topics=args.n_topics, method=args.method)
+
+        if args.json:
+            import dataclasses as _dc
+            print(json.dumps(_dc.asdict(result), ensure_ascii=False, indent=2))
+        else:
+            print(format_clustering_summary(result))
+
+        # Optional: push topic map to Open Notebook as a synthetic source
+        if args.push_to:
+            if result.confidence == "low":
+                print(
+                    f"  WARN: Refusing to push topic map — clustering used the keyword "
+                    f"fallback (confidence='low'), which produces unreliable groupings. "
+                    f"Install bertopic or scikit-learn for pushable clusters.",
+                    file=sys.stderr,
+                )
+            else:
+                from open_notebook import (
+                    OpenNotebookClient, OpenNotebookConfig, OpenNotebookError,
+                )
+                base_url = args.open_notebook_url or os.getenv("OPEN_NOTEBOOK_URL", "http://localhost:5055")
+                api_key = args.open_notebook_key or os.getenv("OPEN_NOTEBOOK_API_KEY", "")
+                client = OpenNotebookClient(config=OpenNotebookConfig(base_url=base_url, api_key=api_key))
+                summary_text = format_clustering_summary(result)
+                payload = {
+                    "type": "text",
+                    "title": f"Topic Map: {args.channel} [{len(videos)} videos]",
+                    "content": summary_text,
+                    "embed": True,
+                    "async_processing": False,
+                    "notebooks": [args.push_to],
+                }
+                try:
+                    created = client.create_source(payload)
+                    print(f"\n  Pushed topic map to Open Notebook: {created.get('id', '?')}", file=sys.stderr)
+                except OpenNotebookError as exc:
+                    print(f"  WARN: Failed to push topic map: {exc}", file=sys.stderr)
         return 0
 
     return 1
