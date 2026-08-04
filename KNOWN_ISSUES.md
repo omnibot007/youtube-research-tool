@@ -93,3 +93,35 @@ escaping. The actual POST body may slightly exceed the 128KB intent. Still
 well under FastAPI's 1MB default, so not a live bug.
 **Fix:** Recalculate against post-JSON-encoding payload size if precision
 matters.
+
+## Sentence integrity (punctuation restoration)
+
+### `deepmultilingualpunctuation` breaks on transformers >= 5
+**File:** `yt_sentences.py:_get_model()`
+**Impact:** The library calls `pipeline("ner", ..., grouped_entities=False)`.
+transformers 5.x removed that kwarg, so model load raises `TypeError`. The
+caller swallows all exceptions by design (a bad model must never kill a
+scrape), so restoration silently no-ops: transcripts stay unpunctuated
+while the run still exits 0.
+**Status:** Worked around in-repo. `_get_model()` catches `TypeError` and
+rebuilds the pipeline with `aggregation_strategy="none"` (the modern
+spelling), grafting it onto the model object.
+**Detection:** `deep-research --json` reports `transcript.restoration_applied`.
+If that is `false` on auto-caption input, restoration is failing silently.
+**Verified:** transformers 5.14.1, torch 2.13.0, Python 3.12.10.
+
+### Paragraph disk cache can mask a broken model
+**File:** `yt_sentences.py:_restore_paragraph()`
+**Impact:** The cache is checked *before* the model loads, so a warm cache
+returns restored text without ever exercising the model. A model-load
+regression can therefore pass a green test suite.
+**Status:** `TestModelRestoration` isolates `CACHE_DIR` to a pytest
+`tmp_path` and resets `_model`, forcing a cold load (~13s) every run.
+
+### Metadata once described pre-restoration text
+**File:** `yt_scrape.py:prepare_deep_research()`
+**Impact:** `cleaned_chars`/`reduction_pct` were computed before restoration
+ran, so the package described text that was never written to disk. This made
+a working feature look broken during review.
+**Status:** Fixed. Metrics are computed after restoration, and
+`restoration_applied` + `sentence_mode` are now reported per run.

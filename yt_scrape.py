@@ -313,6 +313,7 @@ def _extract_audio(video_id: str, dest_dir: Path, opts: dict | None = None) -> P
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
+        "noprogress": True,  # progress bars must never touch stdout (--json stays parseable)
         "format": "bestaudio/best",
         "outtmpl": out_template,
         "noplaylist": True,
@@ -392,6 +393,7 @@ def _make_ydl_opts(
     opts: dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
+        "noprogress": True,  # progress bars must never touch stdout (--json stays parseable)
         "writesubtitles": True,
         "writeautomaticsub": True,
         "subtitlesformat": "vtt",
@@ -428,6 +430,7 @@ def _make_ydl_opts_no_sub(
     opts: dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
+        "noprogress": True,  # progress bars must never touch stdout (--json stays parseable)
         "skip_download": True,
         "extract_flat": False,
     }
@@ -1126,6 +1129,31 @@ def _collapse_repeats(text: str) -> str:
     return text
 
 
+# ------------------------------------------------------------ SENTENCE INTEGRITY
+
+# Mode for the optional sentence-integrity layer (yt_sentences.py).
+# Default "off" at import time so library callers and the existing test
+# suite see byte-identical behavior; main() sets it from --sentences.
+SENTENCE_MODE = "off"
+
+
+def _maybe_restore_sentences(text: str) -> str:
+    """Apply the sentence-integrity layer when enabled.
+
+    Never raises: on any failure (missing deps, model download error) the
+    input is returned unchanged (same object), which callers may use to
+    detect that restoration did not run.
+    """
+    if SENTENCE_MODE == "off" or not text:
+        return text
+    try:
+        from yt_sentences import restore_text
+        return restore_text(text, mode=SENTENCE_MODE)
+    except Exception as e:
+        print(f"[sentences] restoration skipped: {e}", file=sys.stderr)
+        return text
+
+
 def clean_transcript_text(raw: str) -> str:
     """Full cleanup pipeline for auto-generated transcript text.
 
@@ -1276,7 +1304,7 @@ def prepare_light_research(
     header_end = raw_text.find("=" * 20)
     raw_body = raw_text[header_end:].lstrip("=\n").strip() if header_end != -1 else raw_text
 
-    cleaned_body = clean_transcript_text(raw_body)
+    cleaned_body = _maybe_restore_sentences(clean_transcript_text(raw_body))
     raw_chars = len(raw_body)
     cleaned_chars = len(cleaned_body)
     reduction = ((raw_chars - cleaned_chars) / raw_chars * 100) if raw_chars > 0 else 0
@@ -3300,26 +3328,54 @@ _RE_DEFINITION_FACT = re.compile(
     r"key\s+to|secret\s+to|reason\s+(?:for|why)))\b",
     re.I,
 )
+# Threshold claims: "overbought at 70", "oversold at the 30 level", "support at 4200"
+_RE_THRESHOLD = re.compile(
+    r"\b(?:overbought|oversold|support|resistance|stop\s*loss|take\s*profit|target)\s+"
+    r"(?:is\s+|was\s+|gets?\s+|sits?\s+)?at\s+(?:the\s+)?\d+(?:\.\d+)?(?:\s+level)?\b",
+    re.I,
+)
+# Bare definition claims: "RSI is a momentum indicator", "MACD is an oscillator"
+_RE_IS_A_DEFN = re.compile(
+    r"\b(?:is|are)\s+(?:a|an)\s+(?:\w+\s+){0,2}?"
+    r"(?:indicator|oscillator|strategy|pattern|signal|metric|measure|tool|system|method|technique)s?\b",
+    re.I,
+)
+
+# Max chars to walk from a match when hunting sentence boundaries. Auto-caption
+# transcripts often have no punctuation for hundreds of words; without this cap
+# a single "sentence" can swallow half the video.
+_MAX_SENT_RADIUS = 240
 
 
 def _extract_sentence(text: str, match_start: int, match_end: int) -> str:
     """Extract the full sentence containing a regex match."""
+    window_start = max(0, match_start - _MAX_SENT_RADIUS)
+    window_end = min(len(text), match_end + _MAX_SENT_RADIUS)
     # Find sentence start (previous . ! ? or start of text/paragraph)
     sent_start = match_start
-    for i in range(match_start - 1, -1, -1):
+    for i in range(match_start - 1, window_start - 1, -1):
         if text[i] in ".!?\n":
             sent_start = i + 1
             break
     else:
-        sent_start = 0
+        sent_start = window_start
     # Find sentence end (next . ! ? or end of text/paragraph)
     sent_end = match_end
-    for i in range(match_end, len(text)):
+    for i in range(match_end, window_end):
         if text[i] in ".!?\n":
             sent_end = i + 1
             break
     else:
-        sent_end = len(text)
+        sent_end = window_end
+    # If clamped mid-word, snap the cut edges to word boundaries.
+    if sent_start == window_start and window_start > 0:
+        sp = text.find(" ", sent_start, match_start)
+        if sp != -1:
+            sent_start = sp + 1
+    if sent_end == window_end and window_end < len(text):
+        sp = text.rfind(" ", match_end, sent_end)
+        if sp != -1:
+            sent_end = sp
     return text[sent_start:sent_end].strip()
 
 
@@ -3350,18 +3406,23 @@ def extract_claims(text: str) -> list[dict]:
         ("prediction", _RE_PREDICTION),
         ("numerical_assertion", _RE_NUMERICAL_ASSERT),
         ("definition_fact", _RE_DEFINITION_FACT),
+        ("threshold", _RE_THRESHOLD),
+        ("definition_fact", _RE_IS_A_DEFN),
     ]
 
-    seen_sentences: set[str] = set()
+    seen_keys: set[str] = set()
 
     for claim_type, pattern in patterns:
         for match in pattern.finditer(text):
             sentence = _extract_sentence(text, match.start(), match.end())
             if not sentence or len(sentence) < 10:
                 continue
-            # Deduplicate by sentence (a sentence might match multiple patterns)
+            # Deduplicate by sentence (a sentence might match multiple patterns).
+            # The clamped window in _extract_sentence gives distinct claims in
+            # long unpunctuated caption text their own sentence fragments, so
+            # they no longer collapse into a single entry here.
             key = sentence.lower()[:100]
-            if key in seen_sentences:
+            if key in seen_keys:
                 # Add the claim type to the existing entry
                 for c in claims:
                     if c["sentence"] == sentence:
@@ -3369,7 +3430,7 @@ def extract_claims(text: str) -> list[dict]:
                             c["claim_types"].append(claim_type)
                         break
                 continue
-            seen_sentences.add(key)
+            seen_keys.add(key)
             claims.append({
                 "claim_types": [claim_type],
                 "matched_pattern": match.group(),
@@ -3473,6 +3534,15 @@ def prepare_deep_research(
 
     # Step 2: Clean transcript
     print(f"[2/4] Cleaning transcript + extracting claims...", file=sys.stderr)
+    # A fetch can report success yet write no file (e.g. captions listed but
+    # not served). Fail with a clean JSON error instead of a traceback.
+    if not result.transcript_path or not Path(result.transcript_path).exists():
+        return {
+            "ok": False,
+            "error": "Transcript file was not written (no usable captions were served)",
+            "error_type": "no_transcript",
+            "video": result.to_dict(),
+        }
     raw_path = Path(result.transcript_path)
     raw_text = raw_path.read_text(encoding="utf-8", errors="replace")
     header_end = raw_text.find("=" * 20)
@@ -3480,8 +3550,6 @@ def prepare_deep_research(
 
     cleaned_body = clean_transcript_text(raw_body)
     raw_chars = len(raw_body)
-    cleaned_chars = len(cleaned_body)
-    reduction = ((raw_chars - cleaned_chars) / raw_chars * 100) if raw_chars > 0 else 0
 
     # Save cleaned transcript
     out = output_dir or OUTPUT_DIR
@@ -3515,11 +3583,24 @@ def prepare_deep_research(
         cleaned_body = clean_transcript_text(raw_body)
         auto_captioned = True  # we added fake paragraph breaks
 
+    # Sentence-integrity layer (Tier 1): restore real punctuation before
+    # extraction. If it runs, it supersedes the fake-period fallback below.
+    _restored_body = _maybe_restore_sentences(cleaned_body)
+    _restoration_applied = _restored_body is not cleaned_body
+    cleaned_body = _restored_body
+
+    # Metrics must describe the text actually written to disk, which is
+    # the post-restoration body. Computing them before restoration
+    # reported the pre-restoration length, making a working restoration
+    # look like a no-op in the package metadata.
+    cleaned_chars = len(cleaned_body)
+    reduction = ((raw_chars - cleaned_chars) / raw_chars * 100) if raw_chars > 0 else 0
+
     # Build a properly-punctuated version for extractors that need
     # real sentence boundaries (definitions, rules, questions).
     # When auto-captioned, use VTT segment boundaries as sentence boundaries.
     extractor_body = cleaned_body
-    if auto_captioned and segments:
+    if auto_captioned and segments and not _restoration_applied:
         # Each VTT segment is roughly one phrase/sentence.
         # Build text with real periods at segment boundaries.
         seg_sentences: list[str] = []
@@ -3584,6 +3665,8 @@ def prepare_deep_research(
             "raw_chars": raw_chars,
             "cleaned_chars": cleaned_chars,
             "reduction_pct": round(reduction, 1),
+            "restoration_applied": _restoration_applied,
+            "sentence_mode": SENTENCE_MODE,
             "paragraph_count": len(cleaned_body.split("\n\n")),
             "has_timestamps": len(segments) > 0,
             "segment_count": len(segments),
@@ -5008,6 +5091,8 @@ def main() -> int:
 
     sp_t = sub.add_parser("transcript", help="Get transcript for a single video")
     sp_t.add_argument("url", help="YouTube URL or 11-char video ID")
+    sp_t.add_argument("--sentences", choices=["model", "off"], default="model",
+                      help="Sentence restoration for --clean output (model=local punctuation model, off=legacy heuristics)")
     add_common_opts(sp_t)
 
     sp_s = sub.add_parser("search", help="Search YouTube")
@@ -5050,6 +5135,8 @@ def main() -> int:
     sp_r.add_argument("--retries", type=int, default=DEFAULT_RETRIES, help="Max retries on network errors")
     sp_r.add_argument("--output", default="", help="Custom output directory")
     sp_r.add_argument("--json", action="store_true", help="Output as JSON (default: human-readable)")
+    sp_r.add_argument("--sentences", choices=["model", "off"], default="model",
+                      help="Sentence restoration for cleaned transcript (model=local punctuation model, off=legacy heuristics)")
 
     sp_dr = sub.add_parser("deep-research", help="Deep Research — fetch + clean + extract claims + sources, prepare for comprehensive analysis")
     sp_dr.add_argument("url", help="YouTube URL or 11-char video ID")
@@ -5059,6 +5146,8 @@ def main() -> int:
     sp_dr.add_argument("--retries", type=int, default=DEFAULT_RETRIES, help="Max retries on network errors")
     sp_dr.add_argument("--output", default="", help="Custom output directory")
     sp_dr.add_argument("--json", action="store_true", help="Output as JSON (default: human-readable)")
+    sp_dr.add_argument("--sentences", choices=["model", "off"], default="model",
+                      help="Sentence restoration for cleaned transcript (model=local punctuation model, off=legacy heuristics)")
 
     sp_read = sub.add_parser("read", help="Read a research report aloud as MP3 (text-to-speech)")
     sp_read.add_argument("report", help="Path to report JSON (_research.json or _deep_research.json)")
@@ -5169,6 +5258,11 @@ def main() -> int:
 
     args = p.parse_args()
 
+    # Sentence-integrity layer mode: CLI runs default to "model";
+    # library callers and tests (which never pass through main) stay "off".
+    global SENTENCE_MODE
+    SENTENCE_MODE = getattr(args, "sentences", "off") or "off"
+
     # Resolve common options
     out_dir = Path(args.output) if hasattr(args, "output") and args.output else None
     langs = _parse_langs(getattr(args, "lang", ""))
@@ -5198,7 +5292,7 @@ def main() -> int:
             raw = Path(result.transcript_path).read_text(encoding="utf-8", errors="replace")
             header_end = raw.find("=" * 20)
             raw_body = raw[header_end:].lstrip("=\n").strip() if header_end != -1 else raw
-            cleaned = clean_transcript_text(raw_body)
+            cleaned = _maybe_restore_sentences(clean_transcript_text(raw_body))
             out = out_dir or OUTPUT_DIR
             clean_path = _write_cleaned_transcript(result, cleaned, out)
         if args.json:

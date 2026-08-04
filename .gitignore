@@ -31,3 +31,14 @@ yt_transcripts/
 .env
 *.key
 cookies.txt
+
+# Proof/debug artifacts
+*_sentences_proof.json
+*.log
+*.bak
+*.bak[0-9]
+*.hbak
+*.progresspatched
+
+# Local paragraph cache for punctuation restoration
+.yt_sentences_cache/

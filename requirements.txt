@@ -3,3 +3,10 @@ edge-tts>=7.0.0
 # Optional: for Whisper fallback (no-caption videos)
 # faster-whisper>=1.0.0
 # ffmpeg required on PATH for Whisper
+
+# Sentence-integrity layer (punctuation restoration for auto-captions).
+# Without these, restoration silently no-ops and transcripts stay unpunctuated.
+deepmultilingualpunctuation>=1.0.1
+pysbd>=0.3.4
+transformers>=4.30
+torch>=2.0
