@@ -1857,6 +1857,60 @@ class TestDetectContradictions:
         assert contradictions[0]["confidence"] == "high"
 
 
+class TestContradictionFalsePositiveGuards:
+    """A real 91-min interview exposed loose pairing. These lock the fix:
+    different-event dollar figures and filler-word subjects must NOT pair,
+    while genuine same-metric numeric conflicts still fire."""
+
+    def test_different_event_dollar_amounts_do_not_pair(self):
+        claims = [
+            {"claim_types": ["financial"], "matched_pattern": "$10 million",
+             "subject": "year i made", "negated": False,
+             "sentence": "I had made this this particular year I made $10 million."},
+            {"claim_types": ["financial"], "matched_pattern": "$67,000",
+             "subject": "day i made", "negated": False,
+             "sentence": "For instance, this day I made $67,000 and I traded 60,000 contracts."},
+        ]
+        assert detect_contradictions(claims) == []
+
+    def test_filler_word_subjects_do_not_match(self):
+        from yt_scrape import _subjects_match
+        assert not _subjects_match("for So, it's", "again, it's")
+        assert not _subjects_match("and with", "Whether it's")
+        assert not _subjects_match("day I made", "year I made")
+
+    def test_content_word_subjects_still_match(self):
+        from yt_scrape import _subjects_match
+        assert _subjects_match("this strategy", "the strategy")
+        assert _subjects_match("rsi", "rsi")
+        assert _subjects_match("rsi overbought", "overbought")
+
+    def test_negation_flip_on_filler_subjects_does_not_pair(self):
+        claims = [
+            {"claim_types": ["financial"], "matched_pattern": "$50",
+             "subject": "for So, it's", "negated": False,
+             "sentence": "It's 1250 a tick for So, it's $50 a tick for a one lot."},
+            {"claim_types": ["financial"], "matched_pattern": "$1,000",
+             "subject": "again, it's", "negated": True,
+             "sentence": "Hopefully, it's not $700,000 in minutes."},
+        ]
+        assert detect_contradictions(claims) == []
+
+    def test_real_metric_numeric_conflict_still_fires(self):
+        claims = [
+            {"claim_types": ["threshold"], "matched_pattern": "overbought at 70 level",
+             "subject": "overbought", "negated": False,
+             "sentence": "The RSI is overbought at 70 level."},
+            {"claim_types": ["threshold"], "matched_pattern": "overbought at 76",
+             "subject": "overbought", "negated": False,
+             "sentence": "The RSI is extremely overbought at 76."},
+        ]
+        contras = detect_contradictions(claims)
+        assert len(contras) == 1
+        assert contras[0]["values"] == ["70", "76"]
+        assert contras[0]["confidence"] == "high"
+
+
 # === 2. MARKETING PRESSURE ===
 class TestDetectMarketingPressure:
     def test_detects_urgency(self):

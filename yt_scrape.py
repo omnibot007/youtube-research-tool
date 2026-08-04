@@ -2157,25 +2157,63 @@ _ANTONYM_PAIRS = [
     ({"recommend", "endorse", "support"}, {"avoid", "warn against", "oppose"}),
 ]
 
-# Negation flip: if one claim is negated and the other isn't, that's a contradiction
+# Function words, pronouns, auxiliaries, contractions, and common speech
+# verbs that must never stand in as the "subject" of a claim. Two claims that
+# share only one of these (e.g. "it's", "for", "made") are NOT about the same
+# thing; matching on them produced most of the false-positive contradictions
+# seen on real interview transcripts.
+_SUBJECT_STOPWORDS = {
+    "the", "a", "an", "and", "or", "but", "so", "if", "then", "than", "as",
+    "is", "are", "was", "were", "be", "been", "being", "am",
+    "this", "that", "these", "those", "it", "its",
+    "i", "he", "she", "you", "we", "they", "me", "him", "us", "them",
+    "my", "his", "her", "your", "our", "their", "mine", "yours",
+    "to", "of", "in", "on", "at", "up", "by", "with", "from", "for", "about",
+    "have", "has", "had", "do", "did", "does", "done",
+    "will", "would", "can", "could", "should", "may", "might", "must",
+    "not", "no", "yes", "just", "again", "very", "really", "also", "too",
+    "now", "when", "where", "why", "how", "what", "who", "whether",
+    "probably", "maybe", "there", "here", "over", "out", "into",
+    "made", "make", "makes", "lost", "lose", "paid", "pay", "got", "get",
+    "went", "go", "said", "say", "says", "sorry", "old", "time",
+    "it's", "that's", "there's", "here's", "what's", "i'm", "i've", "i'd",
+    "i'll", "he's", "she's", "you're", "we're", "they're", "don't", "didn't",
+    "doesn't", "isn't", "aren't", "wasn't", "weren't",
+}
+
+_RE_SUBJECT_WORD = re.compile(r"[a-z]+(?:'[a-z]+)?")
+
+
+def _content_words(subject: str) -> set:
+    """Content (non-filler) words in a subject phrase, lowercased."""
+    return {
+        w for w in _RE_SUBJECT_WORD.findall(subject.lower())
+        if w not in _SUBJECT_STOPWORDS
+    }
+
+
 def _subjects_match(subj_a: str, subj_b: str) -> bool:
-    """Check if two subjects are the same (fuzzy matching)."""
+    """Check if two subjects refer to the same thing.
+
+    Matching is done on *content* words only. Filler words (pronouns,
+    auxiliaries, prepositions, contractions, common speech verbs) are
+    stripped first, so two claims that merely share "it's" or "made" no
+    longer count as the same subject.
+    """
     if not subj_a or not subj_b:
         return False
-    # Exact match
-    if subj_a == subj_b:
+    a, b = subj_a.lower().strip(), subj_b.lower().strip()
+    if a == b:
         return True
-    # One is substring of the other
-    if subj_a in subj_b or subj_b in subj_a:
+    words_a, words_b = _content_words(a), _content_words(b)
+    if not words_a or not words_b:
+        return False
+    # One phrase's content words are a subset of the other's.
+    if words_a <= words_b or words_b <= words_a:
         return True
-    # Shared key word (both contain a significant word)
-    words_a = set(subj_a.split()) - {"the", "a", "an", "is", "are", "was", "were", "this", "that", "it"}
-    words_b = set(subj_b.split()) - {"the", "a", "an", "is", "are", "was", "were", "this", "that", "it"}
+    # Otherwise require a shared content word of real length.
     shared = words_a & words_b
-    # If they share a significant word (3+ chars), they're related
-    if any(len(w) >= 3 for w in shared):
-        return True
-    return False
+    return any(len(w) >= 3 for w in shared)
 
 
 # Indicator/metric tokens used as the fallback "subject" when subject
@@ -2202,11 +2240,11 @@ def _first_number_after(sentence: str, token: str, window: int = 40) -> str | No
 def _numeric_value_conflict(claim_a: dict, claim_b: dict) -> tuple[str, str, str] | None:
     """Detect same-metric numeric disagreement between two claims.
 
-    Returns (metric, value_a, value_b) when both claims share a claim type,
-    talk about the same thing (matching subjects, or -- when subjects are
-    empty -- the same indicator/metric token appearing in both sentences),
-    and pin DIFFERENT numbers to that metric (e.g. "overbought at 70" vs
-    "overbought at 76"). Returns None otherwise.
+    Returns (metric, value_a, value_b) only when both claims share a claim
+    type, are not clearly about different subjects, and pin DIFFERENT numbers
+    to the SAME known metric token (e.g. "overbought at 70" vs "overbought at
+    76"). Returns None otherwise. Arbitrary dollar amounts in a narrative are
+    deliberately NOT treated as metric conflicts -- see the note below.
     """
     types_a = set(claim_a.get("claim_types") or [])
     types_b = set(claim_b.get("claim_types") or [])
@@ -2235,14 +2273,14 @@ def _numeric_value_conflict(claim_a: dict, claim_b: dict) -> tuple[str, str, str
         if float(val_a) != float(val_b):
             return (token, val_a, val_b)
 
-    # No shared metric token gave two numbers, but the subjects themselves
-    # matched (non-empty): compare the numbers inside the matched patterns.
-    if subj_a and subj_b:
-        m_a = re.search(r"\d+(?:\.\d+)?", claim_a.get("matched_pattern", ""))
-        m_b = re.search(r"\d+(?:\.\d+)?", claim_b.get("matched_pattern", ""))
-        if m_a and m_b and float(m_a.group()) != float(m_b.group()):
-            return (subj_a, m_a.group(), m_b.group())
-
+    # NOTE: we intentionally do NOT fall back to comparing arbitrary numbers
+    # when only the subjects overlap. On real interview transcripts that
+    # fallback fired on different-event dollar figures ("made $10M a year" vs
+    # "made $67K that day") whose junk subjects shared a verb like "made",
+    # producing a flood of false positives. A numeric contradiction now
+    # requires a shared *known metric token* (RSI, overbought, win rate, ...)
+    # pinned to different values. Genuine same-event money conflicts would
+    # need event/time-qualifier matching -- left as future work, not guessed.
     return None
 
 
