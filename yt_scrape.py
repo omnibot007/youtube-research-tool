@@ -2002,6 +2002,16 @@ def _extract_subject(sentence: str, claim_type: str, matched: str) -> str:
                 if words:
                     return " ".join(words[-2:])
 
+    # For threshold claims, the metric being pinned is the leading token of
+    # the matched span ("overbought at 70 level" -> "overbought"), falling
+    # back to any known metric token in the sentence (e.g. "RSI"). Fixing
+    # this at the source means the contradiction detector's empty-subject
+    # metric fallback is defense-in-depth, not a requirement.
+    if claim_type == "threshold":
+        m = _RE_METRIC_TOKEN.search(matched) or _RE_METRIC_TOKEN.search(sentence)
+        if m:
+            return m.group(1).lower()
+
     return ""
 
 
@@ -2030,6 +2040,11 @@ def enrich_claim(
 
     if timestamp:
         enriched["timestamp"] = timestamp.to_dict()
+        # Flat span aliases + a clean shareable deep link (report citeability).
+        enriched["start_ts"] = round(timestamp.start, 2)
+        enriched["end_ts"] = round(timestamp.end, 2)
+        if video_id:
+            enriched["deep_link"] = ("https://youtu.be/" + video_id + "?t=" + str(int(timestamp.start)))
         if video_id:
             enriched["youtube_url"] = f"https://youtube.com/watch?v={video_id}{timestamp.youtube_url}"
 
@@ -2163,6 +2178,74 @@ def _subjects_match(subj_a: str, subj_b: str) -> bool:
     return False
 
 
+# Indicator/metric tokens used as the fallback "subject" when subject
+# extraction came up empty (threshold claims usually have no leading noun
+# phrase, so their subject is ""). Both sentences must mention the same
+# token for a numeric comparison to be meaningful.
+_RE_METRIC_TOKEN = re.compile(
+    r"(?i)\b(RSI|MACD|EMA|SMA|ATR|stochastic|bollinger|overbought|oversold|"
+    r"support|resistance|stop\s*loss|take\s*profit|win\s*rate|target)\b"
+)
+
+
+def _first_number_after(sentence: str, token: str, window: int = 40) -> str | None:
+    """Return the first number within `window` chars after `token`, or None."""
+    lower = sentence.lower()
+    idx = lower.find(token.lower())
+    if idx == -1:
+        return None
+    tail = sentence[idx + len(token): idx + len(token) + window]
+    m = re.search(r"\d+(?:\.\d+)?", tail)
+    return m.group() if m else None
+
+
+def _numeric_value_conflict(claim_a: dict, claim_b: dict) -> tuple[str, str, str] | None:
+    """Detect same-metric numeric disagreement between two claims.
+
+    Returns (metric, value_a, value_b) when both claims share a claim type,
+    talk about the same thing (matching subjects, or -- when subjects are
+    empty -- the same indicator/metric token appearing in both sentences),
+    and pin DIFFERENT numbers to that metric (e.g. "overbought at 70" vs
+    "overbought at 76"). Returns None otherwise.
+    """
+    types_a = set(claim_a.get("claim_types") or [])
+    types_b = set(claim_b.get("claim_types") or [])
+    if not types_a & types_b:
+        return None
+
+    sent_a = claim_a.get("sentence", "")
+    sent_b = claim_b.get("sentence", "")
+    if not sent_a or not sent_b or sent_a == sent_b:
+        return None
+
+    # If both claims have real subjects, they must be about the same thing.
+    # Empty subjects fall through to the metric-token match below.
+    subj_a = (claim_a.get("subject") or "").lower().strip()
+    subj_b = (claim_b.get("subject") or "").lower().strip()
+    if subj_a and subj_b and not _subjects_match(subj_a, subj_b):
+        return None
+
+    tokens_a = {m.group(1).lower() for m in _RE_METRIC_TOKEN.finditer(sent_a)}
+    tokens_b = {m.group(1).lower() for m in _RE_METRIC_TOKEN.finditer(sent_b)}
+    for token in sorted(tokens_a & tokens_b):
+        val_a = _first_number_after(sent_a, token)
+        val_b = _first_number_after(sent_b, token)
+        if val_a is None or val_b is None:
+            continue
+        if float(val_a) != float(val_b):
+            return (token, val_a, val_b)
+
+    # No shared metric token gave two numbers, but the subjects themselves
+    # matched (non-empty): compare the numbers inside the matched patterns.
+    if subj_a and subj_b:
+        m_a = re.search(r"\d+(?:\.\d+)?", claim_a.get("matched_pattern", ""))
+        m_b = re.search(r"\d+(?:\.\d+)?", claim_b.get("matched_pattern", ""))
+        if m_a and m_b and float(m_a.group()) != float(m_b.group()):
+            return (subj_a, m_a.group(), m_b.group())
+
+    return None
+
+
 def _claims_contradict(claim_a: dict, claim_b: dict) -> tuple[bool, str]:
     """Check if two claims contradict each other.
 
@@ -2204,6 +2287,16 @@ def _claims_contradict(claim_a: dict, claim_b: dict) -> tuple[bool, str]:
     return False, ""
 
 
+def _claim_ts_str(claim: dict) -> str:
+    """Best-available timestamp string for a claim ("" when untimed)."""
+    ts = claim.get("timestamp")
+    if isinstance(ts, dict):
+        return str(ts.get("timestamp") or ts.get("timestamp_str") or "")
+    if isinstance(ts, (int, float)):
+        return f"{int(ts // 60):02d}:{int(ts % 60):02d}"
+    return str(ts or "")
+
+
 def detect_contradictions(claims: list[dict]) -> list[dict]:
     """Detect contradictions between claims in the same video.
 
@@ -2211,29 +2304,58 @@ def detect_contradictions(claims: list[dict]) -> list[dict]:
     - Antonym pairs (works/fails, buy/sell, safe/risky)
     - Negation flips (same subject, opposite polarity)
     - Same subject, opposite strength (high vs contradicted)
+    - Numeric conflicts (same metric pinned to different values,
+      e.g. "overbought at 70" vs "overbought at 76")
 
     Returns list of contradiction dicts:
     - claim_a: first claim sentence
     - claim_b: second claim sentence
     - timestamp_a, timestamp_b: when each was said
     - reason: why they contradict
+    - values: [value_a, value_b] for numeric conflicts (None otherwise)
+    - confidence: "high" for explicit numeric conflicts, else "medium"
     """
     contradictions: list[dict] = []
+    seen_pairs: set[tuple[str, str, str]] = set()
     n = len(claims)
 
     for i in range(n):
         for j in range(i + 1, n):
             a, b = claims[i], claims[j]
+            values: list[str] | None = None
+            confidence = "medium"
+            subject_fallback = ""
             is_contra, reason = _claims_contradict(a, b)
-            if is_contra:
-                contradictions.append({
-                    "claim_a": a.get("sentence", ""),
-                    "claim_b": b.get("sentence", ""),
-                    "timestamp_a": a.get("timestamp", {}).get("timestamp", "") if isinstance(a.get("timestamp"), dict) else "",
-                    "timestamp_b": b.get("timestamp", {}).get("timestamp", "") if isinstance(b.get("timestamp"), dict) else "",
-                    "subject": a.get("subject", ""),
-                    "reason": reason,
-                })
+            if not is_contra:
+                conflict = _numeric_value_conflict(a, b)
+                if conflict is not None:
+                    metric, val_a, val_b = conflict
+                    is_contra = True
+                    reason = (f"Same metric '{metric}' pinned to different "
+                              f"values ({val_a} vs {val_b})")
+                    values = [val_a, val_b]
+                    confidence = "high"
+                    subject_fallback = metric
+            if not is_contra:
+                continue
+            # One sentence can carry several claim entries now; don't surface
+            # the same sentence pair + reason more than once.
+            pair_key = (a.get("sentence", ""), b.get("sentence", ""), reason)
+            if pair_key in seen_pairs:
+                continue
+            seen_pairs.add(pair_key)
+            contradictions.append({
+                "claim_a": a.get("sentence", ""),
+                "claim_b": b.get("sentence", ""),
+                "timestamp_a": _claim_ts_str(a),
+                "timestamp_b": _claim_ts_str(b),
+                "deep_link_a": a.get("deep_link", ""),
+                "deep_link_b": b.get("deep_link", ""),
+                "subject": a.get("subject", "") or subject_fallback,
+                "reason": reason,
+                "values": values,
+                "confidence": confidence,
+            })
 
     return contradictions
 
@@ -2405,6 +2527,31 @@ _RE_RANGE = re.compile(
     r"(\d+(?:\.\d+)?)\s*(?:to|-|–|until)\s*(\d+(?:\.\d+)?))\b",
     re.I,
 )
+
+
+def _link_claims_to_parameters(claims: list[dict], parameters: list[dict]) -> None:
+    """Cross-reference claim entries with parameter entries (in place).
+
+    When a claim's matched span carries the same metric name and value as a
+    parameters entry, the claim gains "parameter_key" ("overbought:70") and
+    the parameter entry gains "claim_sentence" -- two extractors, one linked
+    finding instead of two disconnected ones.
+    """
+    for p in parameters:
+        p_name = str(p.get("parameter", "")).strip().lower()
+        p_val = str(p.get("value", "")).strip()
+        if not p_name or not p_val:
+            continue
+        p_key = f"{p_name}:{p_val}"
+        name_head = p_name.split()[0]
+        for c in claims:
+            matched = str(c.get("matched_pattern", "")).lower()
+            if not matched or name_head not in matched:
+                continue
+            if re.search(rf"\b{re.escape(p_val)}\b", matched):
+                c["parameter_key"] = p_key
+                if not p.get("claim_sentence"):
+                    p["claim_sentence"] = c.get("sentence", "")
 
 
 def extract_parameters(text: str) -> list[dict]:
@@ -3197,7 +3344,11 @@ def extract_definitions(text: str) -> list[dict]:
 
 # === MASTER EXTRACTION FUNCTION ===========================================
 
-def extract_all(text: str, sentences: list[TimestampedSentence] | None = None) -> dict:
+def extract_all(
+    text: str,
+    sentences: list[TimestampedSentence] | None = None,
+    video_id: str = "",
+) -> dict:
     """Run all 10 advanced extraction features on the text.
 
     This is the comprehensive extraction that feeds into the Deep Research package.
@@ -3216,7 +3367,7 @@ def extract_all(text: str, sentences: list[TimestampedSentence] | None = None) -
     """
     return {
         "contradictions": detect_contradictions(
-            extract_claims_enriched(text, sentences)
+            extract_claims_enriched(text, sentences, video_id=video_id)
         ),
         "marketing_pressure": detect_marketing_pressure(text),
         "parameters": extract_parameters(text),
@@ -3410,22 +3561,26 @@ def extract_claims(text: str) -> list[dict]:
         ("definition_fact", _RE_IS_A_DEFN),
     ]
 
-    seen_keys: set[str] = set()
+    seen_keys: set[tuple[str, str]] = set()
 
     for claim_type, pattern in patterns:
         for match in pattern.finditer(text):
             sentence = _extract_sentence(text, match.start(), match.end())
             if not sentence or len(sentence) < 10:
                 continue
-            # Deduplicate by sentence (a sentence might match multiple patterns).
-            # The clamped window in _extract_sentence gives distinct claims in
-            # long unpunctuated caption text their own sentence fragments, so
-            # they no longer collapse into a single entry here.
-            key = sentence.lower()[:100]
+            # Deduplicate by (sentence, matched span). Multiple patterns hitting
+            # the SAME text span collapse into one entry with merged claim_types,
+            # but DISTINCT spans in one sentence stay separate claims. Keying on
+            # the sentence alone silently dropped real claims once sentence
+            # restoration produced clean multi-claim sentences ("overbought at
+            # 70 level and oversold at the 30 level" lost the second threshold).
+            span = match.group().lower()
+            key = (sentence.lower()[:100], span)
             if key in seen_keys:
-                # Add the claim type to the existing entry
+                # Same span already claimed -- just add the claim type to it
                 for c in claims:
-                    if c["sentence"] == sentence:
+                    if (c["sentence"] == sentence
+                            and c["matched_pattern"].lower() == span):
                         if claim_type not in c["claim_types"]:
                             c["claim_types"].append(claim_type)
                         break
@@ -3437,6 +3592,33 @@ def extract_claims(text: str) -> list[dict]:
                 "sentence": sentence,
                 "char_offset": match.start(),
             })
+
+    # Collapse spans fully contained inside a LARGER claimed span of the same
+    # sentence ("the biggest" inside "is the biggest" is one claim, not two).
+    # The contained claim's types merge into the container so nothing is
+    # lost; disjoint and partially-overlapping spans stay separate.
+    def _span(c: dict) -> tuple[int, int]:
+        return c["char_offset"], c["char_offset"] + len(c["matched_pattern"])
+
+    surviving: list[dict] = []
+    for c in claims:
+        c_start, c_end = _span(c)
+        containers = [
+            other for other in claims
+            if other is not c
+            and other["sentence"] == c["sentence"]
+            and _span(other)[0] <= c_start
+            and c_end <= _span(other)[1]
+            and (_span(other)[1] - _span(other)[0]) > (c_end - c_start)
+        ]
+        if containers:
+            target = max(containers, key=lambda o: _span(o)[1] - _span(o)[0])
+            for t in c["claim_types"]:
+                if t not in target["claim_types"]:
+                    target["claim_types"].append(t)
+            continue
+        surviving.append(c)
+    claims = surviving
 
     # Sort by position in text
     claims.sort(key=lambda c: c["char_offset"])
@@ -3506,6 +3688,7 @@ def prepare_deep_research(
     cookies_from_browser: str | None = None,
     proxy: str | None = None,
     retries: int = DEFAULT_RETRIES,
+    enable_visual: bool = False,
 ) -> dict:
     """Fetch transcript, clean it, extract claims + sources, and prepare
     a comprehensive research package for Deep Research analysis.
@@ -3644,6 +3827,54 @@ def prepare_deep_research(
     # Extract sources from cleaned transcript + description
     sources = extract_sources(extractor_body, description)
 
+    # Advanced extraction runs BEFORE the visual stage so chapter starts can
+    # drive frame placement, and before package assembly so the top-level
+    # claims can be cross-referenced against its parameters.
+    advanced = extract_all(extractor_body, ts_sentences or None, video_id=result.id)
+    _link_claims_to_parameters(claims, advanced.get("parameters", []))
+    chapter_starts: list[float] = []
+    for _ch in advanced.get("chapters", []) or []:
+        try:
+            chapter_starts.append(float(_ch.get("start_seconds", 0.0)))
+        except (TypeError, ValueError):
+            continue
+    chapter_starts = sorted({t for t in chapter_starts if t >= 0.0})
+    if len(chapter_starts) < 2:
+        # One chapter at 0:00 means "no real chapter data" -- interval
+        # sampling with hash dedup beats a single lonely frame.
+        chapter_starts = []
+
+    # Extract on-screen content from the video's frames. Fully optional
+    # and isolated: a visual failure is recorded in the result dict and
+    # must never break an otherwise working scrape.
+    try:
+        from visual import empty_result as _visual_empty_result
+
+        visual_content: dict[str, Any] = _visual_empty_result(enable_visual)
+    except Exception as e:
+        visual_content = {
+            "enabled": enable_visual,
+            "vision_error": f"visual module unavailable: {e}",
+        }
+    if enable_visual:
+        print("[4/4] Reading on-screen content from video frames...",
+              file=sys.stderr)
+        try:
+            from visual import extract_visual_content as _extract_visual
+
+            visual_content = _extract_visual(
+                result.id, out,
+                duration=result.duration or 0,
+                cookies_file=cookies_file,
+                cookies_from_browser=cookies_from_browser,
+                proxy=proxy,
+                enable_visual=True,
+                chapter_timestamps=chapter_starts or None,
+            )
+        except Exception as e:
+            visual_content["vision_error"] = f"{type(e).__name__}: {e}"
+            print(f"  [visual] skipped: {e}", file=sys.stderr)
+
     # Build the research package
     package = {
         "ok": True,
@@ -3678,7 +3909,8 @@ def prepare_deep_research(
         "entity_count": sum(len(v) if isinstance(v, list) else 0 for v in entities.values()),
         "source_count": sum(len(v) if isinstance(v, list) else 0 for v in sources.values()),
         "timestamped_sentences": [s.to_dict() for s in ts_sentences] if ts_sentences else [],
-        "advanced_extraction": extract_all(extractor_body, ts_sentences or None),
+        "advanced_extraction": advanced,
+        "visual_extraction": visual_content,
         "schema": DEEP_RESEARCH_SCHEMA,
         "instructions": (
             "DEEP RESEARCH WORKFLOW — QUALITY OVER SPEED\n\n"
@@ -5144,6 +5376,10 @@ def main() -> int:
     sp_dr.add_argument("--cookies-from-browser", default="", help="Browser for cookies")
     sp_dr.add_argument("--proxy", default="", help="Proxy URL")
     sp_dr.add_argument("--retries", type=int, default=DEFAULT_RETRIES, help="Max retries on network errors")
+    sp_dr.add_argument("--visual", action="store_true",
+                       help="Read on-screen text and charts from video "
+                            "frames with a local vision model (Ollama). "
+                            "Slow: roughly 35s per unique frame on CPU.")
     sp_dr.add_argument("--output", default="", help="Custom output directory")
     sp_dr.add_argument("--json", action="store_true", help="Output as JSON (default: human-readable)")
     sp_dr.add_argument("--sentences", choices=["model", "off"], default="model",
@@ -5173,6 +5409,10 @@ def main() -> int:
                          help="Treat --notebook as a name to look up via the API")
     sp_push.add_argument("--with-claims", action="store_true",
                          help="Extract enriched claims and include in metadata footer")
+    sp_push.add_argument("--max-claims", type=int, default=50,
+                         help="Max claims in the metadata footer (default: 50; warns when hit)")
+    sp_push.add_argument("--force", action="store_true",
+                         help="Push even if a source with the same title already exists")
     sp_push.add_argument("--diarize", action="store_true",
                          help="Label transcript segments with speaker IDs (pyannote or heuristic)")
     sp_push.add_argument("--diarize-method", choices=["auto", "pyannote", "heuristic"],
@@ -5215,6 +5455,8 @@ def main() -> int:
                            help="Parallel workers for transcript extraction (default: 3)")
     sp_chpush.add_argument("--with-claims", action="store_true",
                            help="Extract enriched claims for each video")
+    sp_chpush.add_argument("--max-claims", type=int, default=50,
+                           help="Max claims in each metadata footer (default: 50; warns when hit)")
     sp_chpush.add_argument("--no-embed", action="store_true",
                            help="Skip embedding (faster, but not searchable)")
     sp_chpush.add_argument("--async", dest="async_processing", action="store_true",
@@ -5256,12 +5498,98 @@ def main() -> int:
     sp_cluster.add_argument("--output", default="", help="Custom transcripts directory")
     sp_cluster.add_argument("--json", action="store_true", help="Output as JSON")
 
+    sp_graph = sub.add_parser("claim-graph",
+                              help="Cross-video claim graph: dedup claims across research packages, map contradictions + frequency")
+    sp_graph.add_argument("packages", nargs="+",
+                          help="Research package paths or 11-char video IDs (IDs resolve in the default transcripts dir)")
+    sp_graph.add_argument("--save", default="", help="Write the graph JSON to this file")
+    sp_graph.add_argument("--json", action="store_true", help="Print the full graph JSON")
+
+    sp_fc = sub.add_parser("factcheck",
+                           help="Fact-check extracted claims: free web search + local-LLM verdict")
+    sp_fc.add_argument("target", help="Research package path or 11-char video ID")
+    sp_fc.add_argument("--limit", type=int, default=5,
+                       help="Max claims to check (default: 5)")
+    sp_fc.add_argument("--types", nargs="+", default=[],
+                       help="Claim types to check (default: superlative statistical causal scientific authority historical definition_fact)")
+    sp_fc.add_argument("--model", default="",
+                       help="Ollama text model for verdicts (default: $YT_FACTCHECK_MODEL or first non-vision model)")
+    sp_fc.add_argument("--json", action="store_true", help="Output full JSON")
+
     args = p.parse_args()
 
     # Sentence-integrity layer mode: CLI runs default to "model";
     # library callers and tests (which never pass through main) stay "off".
     global SENTENCE_MODE
     SENTENCE_MODE = getattr(args, "sentences", "off") or "off"
+
+    # Corpus-level commands are self-contained (no scraping options needed),
+    # so they dispatch before the common option resolution below.
+    if args.cmd == "claim-graph":
+        from claim_graph import build_graph_from_paths
+        pkg_paths = []
+        missing = []
+        for spec in args.packages:
+            cand = Path(spec)
+            if not cand.exists():
+                cand = OUTPUT_DIR / f"{spec}_research_package.json"
+            if cand.exists():
+                pkg_paths.append(cand)
+            else:
+                missing.append(spec)
+        if missing:
+            print(f"ERROR: package(s) not found: {', '.join(missing)}",
+                  file=sys.stderr)
+            return 1
+        graph = build_graph_from_paths(pkg_paths)
+        if args.save:
+            Path(args.save).write_text(
+                json.dumps(graph, ensure_ascii=False, indent=2),
+                encoding="utf-8")
+            print(f"  Graph saved: {args.save}", file=sys.stderr)
+        if args.json:
+            print(json.dumps(graph, ensure_ascii=False, indent=2))
+        else:
+            print(f"  Videos: {graph['video_count']}  Nodes: {graph['node_count']}  "
+                  f"Edges: {graph['edge_count']}")
+            for tc in graph.get("top_claims", [])[:5]:
+                print(f"   {tc['frequency']}x  {tc['claim']}")
+            for e in graph.get("edges", [])[:5]:
+                scope = "cross-video" if e.get("cross_video") else "intra-video"
+                print(f"   CONTRADICTION ({scope}): {e['reason']}")
+        return 0
+
+    if args.cmd == "factcheck":
+        from factcheck import factcheck_package
+        target = Path(args.target)
+        if not target.exists():
+            target = OUTPUT_DIR / f"{args.target}_research_package.json"
+        if not target.exists():
+            print(f"ERROR: research package not found: {args.target} "
+                  f"(run deep-research first)", file=sys.stderr)
+            return 1
+        print(f"  Fact-checking claims from {target.name}...", file=sys.stderr)
+        result = factcheck_package(
+            target,
+            types=args.types or None,
+            limit=args.limit,
+            model=args.model or None,
+        )
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            counts = result.get("verdict_counts", {})
+            print(f"  Model: {result.get('model') or '(none available)'}")
+            print(f"  Checked {result.get('checked_count', 0)} claims: "
+                  f"{counts.get('verified', 0)} verified, "
+                  f"{counts.get('contradicted', 0)} contradicted, "
+                  f"{counts.get('unverifiable', 0)} unverifiable")
+            for c in result.get("checked", []):
+                print(f"   [{c.get('verdict', '?')}] {c.get('sentence', '')[:90]}")
+                srcs = "; ".join(c.get("sources", [])[:2])
+                if srcs:
+                    print(f"      sources: {srcs}")
+        return 0
 
     # Resolve common options
     out_dir = Path(args.output) if hasattr(args, "output") and args.output else None
@@ -5452,6 +5780,7 @@ def main() -> int:
             cookies_from_browser=cookies_browser,
             proxy=proxy,
             retries=retries,
+            enable_visual=getattr(args, "visual", False),
         )
         if not result.get("ok"):
             print(f"FAILED: {result.get('error', 'unknown error')}", file=sys.stderr)
@@ -5702,10 +6031,20 @@ def main() -> int:
                 embed=args.embed,
                 async_processing=args.async_processing,
                 extra_content=extra_content,
+                max_claims=args.max_claims,
+                skip_existing=not args.force,
             )
         except OpenNotebookError as exc:
             print(f"ERROR: Push failed: {exc}", file=sys.stderr)
             return 1
+
+        if result.get("skipped"):
+            if args.json:
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            else:
+                print(f"  Skipped: already in notebook as '{result.get('title', '')}' "
+                      f"(use --force to push a duplicate)")
+            return 0
 
         source_id = result.get("id", "?")
         if args.json:
@@ -5796,6 +6135,7 @@ def main() -> int:
                 retries=retries,
                 rate_limit_sec=rate_limit,
                 on_progress=on_progress,
+                max_claims=args.max_claims,
             )
         except OpenNotebookError as exc:
             print(f"ERROR: Channel push failed: {exc}", file=sys.stderr)

@@ -438,12 +438,31 @@ class TestExtractClaims:
         assert any("comparative" in c["claim_types"] for c in claims)
 
     def test_deduplicates_by_sentence(self):
-        """A sentence matching multiple patterns should appear once with multiple types."""
+        """Same matched span in a sentence appears once (types merged);
+        distinct spans in the same sentence are separate claims."""
         text = "Studies show this 90% win rate strategy is the best."
         claims = extract_claims(text)
-        # Should be one claim with multiple types, not duplicates
-        sentences = [c["sentence"] for c in claims]
-        assert len(sentences) == len(set(sentences))
+        # No two entries may share the same (sentence, matched span)
+        keys = [(c["sentence"], c["matched_pattern"].lower()) for c in claims]
+        assert len(keys) == len(set(keys))
+
+    def test_two_distinct_threshold_claims_in_one_sentence(self):
+        """Regression: one clean sentence carrying two threshold claims must
+        emit BOTH as distinct entries (5->4 claim_count bug, 2026-08-04)."""
+        text = ("Alright, looking at the RSI, the standard settings for it is "
+                "overbought at 70 level and oversold at the 30 level.")
+        claims = extract_claims(text)
+        thresholds = [c for c in claims if "threshold" in c["claim_types"]]
+        patterns = [c["matched_pattern"].lower() for c in thresholds]
+        assert "overbought at 70 level" in patterns
+        assert "oversold at the 30 level" in patterns
+        assert len(thresholds) == 2
+
+    def test_single_claim_sentence_still_yields_one_claim(self):
+        text = "The RSI is extremely overbought at 76."
+        claims = extract_claims(text)
+        thresholds = [c for c in claims if "threshold" in c["claim_types"]]
+        assert len(thresholds) == 1
 
     def test_returns_empty_for_no_claims(self):
         text = "Hello world, how are you today?"
@@ -1631,6 +1650,115 @@ from yt_scrape import (
 
 
 # === 1. CONTRADICTION DETECTION ===
+class TestOverlappingSpanCollapse:
+    """#4: a span fully contained in a larger claimed span is one claim."""
+
+    def test_contained_span_collapses_with_types_merged(self):
+        text = "I'm going to show you why that is the biggest lie in day trading."
+        claims = extract_claims(text)
+        biggest = [c for c in claims if "biggest" in c["matched_pattern"].lower()]
+        assert len(biggest) == 1, biggest
+        assert biggest[0]["matched_pattern"].lower() == "is the biggest"
+        assert {"definition_fact", "superlative"} <= set(biggest[0]["claim_types"])
+
+    def test_disjoint_spans_in_one_sentence_stay_separate(self):
+        text = ("Alright, looking at the RSI, the standard settings for it is "
+                "overbought at 70 level and oversold at the 30 level.")
+        claims = extract_claims(text)
+        thresholds = [c for c in claims if "threshold" in c["claim_types"]]
+        assert len(thresholds) == 2
+
+
+class TestThresholdSubject:
+    """#5: threshold claims carry the metric as subject at the source."""
+
+    def test_subject_comes_from_matched_span(self):
+        from yt_scrape import _extract_subject
+        s = ("Alright, looking at the RSI, the standard settings for it is "
+             "overbought at 70 level and oversold at the 30 level.")
+        assert _extract_subject(s, "threshold", "overbought at 70 level") == "overbought"
+        assert _extract_subject(s, "threshold", "oversold at the 30 level") == "oversold"
+
+    def test_subject_falls_back_to_sentence_metric(self):
+        from yt_scrape import _extract_subject
+        assert _extract_subject("The RSI is sitting high.", "threshold", "at 76") == "rsi"
+
+    def test_detector_pairs_conflict_without_empty_subject_fallback(self):
+        from yt_scrape import detect_contradictions, extract_claims_enriched
+        claims = extract_claims_enriched(
+            "The RSI is overbought at 70 level today. "
+            "The RSI is extremely overbought at 76 in this chart."
+        )
+        thresholds = [c for c in claims if "threshold" in c.get("claim_types", [])]
+        assert thresholds and all(c["subject"] for c in thresholds)
+        contras = detect_contradictions(claims)
+        assert any(c.get("values") == ["70", "76"] for c in contras)
+
+
+class TestTimestampAnchoring:
+    """#10: timed sentences give claims start_ts/end_ts and a deep link."""
+
+    def test_claim_gets_span_timestamps_and_deep_link(self):
+        from models import TimestampedSentence
+        from yt_scrape import extract_claims_enriched
+        sents = [TimestampedSentence(text="The RSI is overbought at 76.",
+                                     start=61.0, end=64.5, segment_index=0)]
+        claims = extract_claims_enriched(
+            "The RSI is overbought at 76.", sents, video_id="TQMayZS9o1U")
+        assert claims, "expected at least one claim"
+        c = claims[0]
+        assert c["start_ts"] == 61.0
+        assert c["end_ts"] == 64.5
+        assert c["deep_link"] == "https://youtu.be/TQMayZS9o1U?t=61"
+        assert c["timestamp"]["timestamp"] == "1:01"
+
+    def test_contradiction_inherits_timestamps_and_deep_links(self):
+        from models import TimestampedSentence
+        from yt_scrape import detect_contradictions, extract_claims_enriched
+        text = ("The RSI is overbought at 70 level today. "
+                "The RSI is extremely overbought at 76 right now.")
+        sents = [
+            TimestampedSentence(text="The RSI is overbought at 70 level today.",
+                                start=10.0, end=14.0, segment_index=0),
+            TimestampedSentence(text="The RSI is extremely overbought at 76 right now.",
+                                start=90.0, end=95.0, segment_index=1),
+        ]
+        claims = extract_claims_enriched(text, sents, video_id="abc123XYZmn")
+        contras = detect_contradictions(claims)
+        assert contras, "expected a numeric contradiction"
+        entry = contras[0]
+        assert entry["timestamp_a"] and entry["timestamp_b"]
+        assert entry["deep_link_a"].startswith("https://youtu.be/")
+        assert entry["deep_link_b"].startswith("https://youtu.be/")
+        assert entry["timestamp_a"] != entry["timestamp_b"]
+
+
+class TestClaimParameterCrossRef:
+    """#12: claims and parameters describing the same value are linked."""
+
+    def test_claim_gains_parameter_key_and_parameter_gains_sentence(self):
+        from yt_scrape import _link_claims_to_parameters
+        claims = [{
+            "claim_types": ["threshold"],
+            "matched_pattern": "overbought at 70 level",
+            "sentence": "The standard setting is overbought at 70 level.",
+            "char_offset": 0,
+        }]
+        params = [{"parameter": "overbought", "value": 70, "unit": "",
+                   "sentence": "the standard setting is overbought at 70 level"}]
+        _link_claims_to_parameters(claims, params)
+        assert claims[0]["parameter_key"] == "overbought:70"
+        assert params[0]["claim_sentence"] == claims[0]["sentence"]
+
+    def test_no_link_when_values_differ(self):
+        from yt_scrape import _link_claims_to_parameters
+        claims = [{"claim_types": ["threshold"], "matched_pattern": "overbought at 76",
+                   "sentence": "x", "char_offset": 0}]
+        params = [{"parameter": "overbought", "value": 70, "unit": "", "sentence": "y"}]
+        _link_claims_to_parameters(claims, params)
+        assert "parameter_key" not in claims[0]
+
+
 class TestDetectContradictions:
     def test_detects_buy_sell_contradiction(self):
         claims = [
@@ -1675,6 +1803,58 @@ class TestDetectContradictions:
         contradictions = detect_contradictions(claims)
         if contradictions:
             assert "timestamp_a" in contradictions[0]
+
+    def test_numeric_conflict_same_subject_values_70_vs_76(self):
+        """Spec test: two threshold claims, same subject, 70 vs 76 -> one candidate."""
+        claims = [
+            {
+                "claim_types": ["threshold"],
+                "matched_pattern": "overbought at 70 level",
+                "sentence": "The RSI is overbought at 70 level.",
+                "subject": "rsi overbought",
+                "negated": False,
+            },
+            {
+                "claim_types": ["threshold"],
+                "matched_pattern": "overbought at 76",
+                "sentence": "The RSI is extremely overbought at 76.",
+                "subject": "rsi overbought",
+                "negated": False,
+            },
+        ]
+        contradictions = detect_contradictions(claims)
+        assert len(contradictions) == 1
+        entry = contradictions[0]
+        assert entry["values"] == ["70", "76"]
+        assert entry["confidence"] == "high"
+        assert "70" in entry["reason"] and "76" in entry["reason"]
+        assert "70" in entry["claim_a"] and "76" in entry["claim_b"]
+
+    def test_numeric_conflict_with_empty_subjects_uses_metric_fallback(self):
+        """The real TQMayZS9o1U shape: subjects are empty strings, so the
+        detector must pair the claims on the shared metric token instead."""
+        claims = [
+            {
+                "claim_types": ["threshold"],
+                "matched_pattern": "overbought at 70 level",
+                "sentence": ("Alright, looking at the RSI, the standard settings for "
+                             "it is overbought at 70 level and oversold at the 30 level."),
+                "subject": "",
+                "negated": False,
+            },
+            {
+                "claim_types": ["threshold"],
+                "matched_pattern": "overbought at 76",
+                "sentence": "The RSI is extremely overbought at 76.",
+                "subject": "",
+                "negated": False,
+            },
+        ]
+        contradictions = detect_contradictions(claims)
+        assert len(contradictions) == 1
+        assert contradictions[0]["values"] == ["70", "76"]
+        assert contradictions[0]["subject"]  # falls back to the metric token
+        assert contradictions[0]["confidence"] == "high"
 
 
 # === 2. MARKETING PRESSURE ===

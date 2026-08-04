@@ -30,6 +30,37 @@ PUNCTUATED_WORDS_PER_TERMINATOR = 40
 _TERMINATORS = re.compile(r"[.!?]")
 _model = None
 
+# --- Jargon guard -----------------------------------------------------------
+# The punctuation model occasionally drops a terminator INSIDE a domain
+# phrase ("overbought at 70. Level", "RSI. Is a momentum indicator"). Those
+# are never legal sentence boundaries in trading captions, so they are
+# repaired after restoration. Each pattern must match the wrongly-inserted
+# terminator itself and nothing else; repairs are idempotent.
+_INDICATORS = r"(?:RSI|MACD|EMA|SMA|ATR|OBV|ADX|stochastic|bollinger\s+bands?)"
+_LEVEL_WORDS = (r"(?:overbought|oversold|support|resistance|stop\s*loss|"
+                r"take\s*profit|target)")
+_JARGON_SPLITS = [
+    # "... overbought at 70. Level ..." -> "... overbought at 70 level ..."
+    re.compile(r"(?i)(" + _LEVEL_WORDS + r"\s+(?:\w+\s+){0,2}at\s+(?:the\s+)?"
+               r"\d+(?:\.\d+)?)[.!?]\s+(level)\b"),
+    # "RSI. Is a momentum indicator" -> "RSI is a momentum indicator"
+    # (articles only: "RSI. Is that good?" is a real boundary and stays)
+    re.compile(r"(?i)\b(" + _INDICATORS + r")[.!?]\s+((?:is|are)\s+(?:a|an|the)\b)"),
+    # "overbought. At 70" -> "overbought at 70"
+    re.compile(r"(?i)\b(" + _LEVEL_WORDS + r")[.!?]\s+(at\s+(?:the\s+)?\d)"),
+]
+
+
+def _repair_jargon_splits(text: str) -> str:
+    """Undo sentence breaks the model inserted inside protected phrases."""
+    def _mend(m: re.Match) -> str:
+        left, right = m.group(1), m.group(2)
+        return left + " " + right[0].lower() + right[1:]
+
+    for pattern in _JARGON_SPLITS:
+        text = pattern.sub(_mend, text)
+    return text
+
 
 def punctuation_density(text: str) -> float:
     """Sentence terminators per word. 0.0 for empty text."""
@@ -85,7 +116,7 @@ def _cache_path(text: str) -> Path:
 def _restore_paragraph(paragraph: str) -> str:
     cache = _cache_path(paragraph)
     if cache.exists():
-        return cache.read_text(encoding="utf-8")
+        return _repair_jargon_splits(cache.read_text(encoding="utf-8"))
     restored = _get_model().restore_punctuation(paragraph)
     sentences = split_sentences(restored)
     # Capitalize sentence starts; the model does not always do it.
@@ -94,7 +125,7 @@ def _restore_paragraph(paragraph: str) -> str:
         if s and s[0].islower():
             s = s[0].upper() + s[1:]
         fixed.append(s)
-    result = " ".join(fixed)
+    result = _repair_jargon_splits(" ".join(fixed))
     try:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         cache.write_text(result, encoding="utf-8")

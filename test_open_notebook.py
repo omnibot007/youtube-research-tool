@@ -603,6 +603,153 @@ class TestPushChannel:
 
 # ---------------------------------------------------------- citation URLs
 
+class TestFindExistingTitlesPagination:
+    """#7: dedup must see ALL pages of /api/sources, not just the first."""
+
+    def _client(self):
+        return OpenNotebookClient(config=OpenNotebookConfig(
+            base_url="http://localhost:5055", api_key=""))
+
+    def test_single_small_page_costs_one_request(self):
+        client = self._client()
+        calls = []
+
+        def fake_request(method, path, params=None, **kw):
+            calls.append(dict(params or {}))
+            return [{"title": "Video One [id1]"}]
+
+        with patch.object(client, "_request", side_effect=fake_request):
+            titles = client._find_existing_titles("notebook:x")
+        assert len(calls) == 1
+        assert "video one [id1]" in titles
+
+    def test_two_full_pages_are_both_read(self):
+        client = self._client()
+        page1 = [{"title": f"Video {i} [id{i}]"} for i in range(50)]
+        page2 = [{"title": "Late Video [zz9]"}]
+
+        def fake_request(method, path, params=None, **kw):
+            if params and params.get("page", 1) > 1:
+                return page2
+            return page1
+
+        with patch.object(client, "_request", side_effect=fake_request):
+            titles = client._find_existing_titles("notebook:x")
+        assert "late video [zz9]" in titles
+        assert len(titles) == 51
+
+    def test_server_ignoring_page_param_terminates(self):
+        client = self._client()
+        page = [{"title": f"Video {i} [id{i}]"} for i in range(50)]
+        calls = []
+
+        def fake_request(method, path, params=None, **kw):
+            calls.append(1)
+            return page  # same full page forever
+
+        with patch.object(client, "_request", side_effect=fake_request):
+            titles = client._find_existing_titles("notebook:x")
+        assert len(titles) == 50
+        assert len(calls) == 2  # page 2 added nothing new -> stop
+
+    def test_dict_envelope_with_items_is_supported(self):
+        client = self._client()
+
+        def fake_request(method, path, params=None, **kw):
+            return {"items": [{"title": "Enveloped [e1]"}], "total": 1}
+
+        with patch.object(client, "_request", side_effect=fake_request):
+            titles = client._find_existing_titles("notebook:x")
+        assert "enveloped [e1]" in titles
+
+
+class TestPushVideoSkipExisting:
+    """#7: pushing the same video twice must be a no-op, not a duplicate."""
+
+    def _client(self):
+        return OpenNotebookClient(config=OpenNotebookConfig(
+            base_url="http://localhost:5055", api_key=""))
+
+    def test_second_push_is_skipped(self):
+        client = self._client()
+        video = _make_video()
+        existing = {client._title_key(video)}
+        with patch.object(client, "_find_existing_titles",
+                          return_value=existing), \
+             patch.object(client, "create_source") as create:
+            result = client.push_video(video, _make_segments(),
+                                       notebook_id="notebook:x",
+                                       skip_existing=True)
+        assert result.get("skipped") is True
+        assert result.get("reason") == "already_exists"
+        create.assert_not_called()
+
+    def test_default_stays_backward_compatible(self):
+        client = self._client()
+        with patch.object(client, "create_source",
+                          return_value={"id": "source:1"}) as create, \
+             patch.object(client, "_find_existing_titles") as finder:
+            result = client.push_video(_make_video(), _make_segments(),
+                                       notebook_id="notebook:x")
+        assert result == {"id": "source:1"}
+        finder.assert_not_called()
+        create.assert_called_once()
+
+
+class TestSplitContentEdgeCases:
+    """#8: transcripts of len 0/1/1000/100000 chunk sanely, never crash."""
+
+    def test_spec_lengths_do_not_crash_and_chunks_fit(self):
+        from open_notebook import _split_content
+        for n in (0, 1, 1000, 100000):
+            content = "x" * n
+            chunks = _split_content(content, 1000)
+            assert isinstance(chunks, list) and chunks, f"len {n}"
+            if n <= 1000:
+                assert chunks == [content]
+            else:
+                for c in chunks:
+                    assert len(c.encode("utf-8")) <= 1000
+                assert "".join(chunks) == content
+
+    def test_monolithic_line_is_hard_byte_split(self):
+        from open_notebook import _split_content
+        content = "y" * 5000  # no newline anywhere
+        chunks = _split_content(content, 1000)
+        assert len(chunks) >= 5
+        assert all(len(c.encode("utf-8")) <= 1000 for c in chunks)
+        assert "".join(chunks) == content
+
+    def test_multibyte_never_split_mid_codepoint(self):
+        from open_notebook import _split_content
+        content = "\u00e9" * 3000  # 2 UTF-8 bytes each
+        chunks = _split_content(content, 1000)
+        for c in chunks:
+            assert len(c.encode("utf-8")) <= 1000
+        assert "".join(chunks) == content
+
+
+class TestMaxClaimsFooter:
+    """#9: the 50-claim footer cap is configurable and warns when it bites."""
+
+    def _claims(self, n):
+        return [{"claim": f"claim {i:03d}", "timestamp": "0:01",
+                 "confidence": "high"} for i in range(n)]
+
+    def test_default_cap_stays_50_and_warns(self, capsys):
+        footer = _build_metadata_footer(_make_video(), self._claims(60))
+        shown = sum(1 for i in range(60) if f"claim {i:03d}" in footer)
+        assert shown == 50
+        assert "truncated to 50 of 60" in capsys.readouterr().err
+
+    def test_higher_cap_shows_more_and_stays_quiet(self, capsys):
+        footer = _build_metadata_footer(_make_video(), self._claims(60),
+                                        max_claims=100)
+        shown = sum(1 for i in range(60) if f"claim {i:03d}" in footer)
+        assert shown == 60
+        assert "truncated" not in capsys.readouterr().err
+
+
 class TestExtractClaimsForVideo:
     """Tests for extract_claims_for_video — timestamped claims with citation URLs."""
 

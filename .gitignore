@@ -42,3 +42,6 @@ cookies.txt
 
 # Local paragraph cache for punctuation restoration
 .yt_sentences_cache/
+_frames/
+*_video.mp4
+*.vbak

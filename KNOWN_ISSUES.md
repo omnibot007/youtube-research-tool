@@ -8,20 +8,22 @@ or in multi-user scenarios.
 
 ### `GET /api/sources` pagination not handled
 **File:** `open_notebook.py:_find_existing_titles()`
-**Impact:** If a notebook has more sources than the API returns in a single
-page, `_find_existing_titles()` only sees page 1. Dedup will miss entries on
-page 2+, causing duplicate pushes for videos whose titles match later sources.
-**Workaround:** For notebooks with >100 existing sources, manually check for
-duplicates after `channel-push`.
-**Fix:** Check for a `next` cursor or `total` field in the API response and
-paginate. Verify the actual Open Notebook API shape first.
+**Status: FIXED (2026-08-04).** `_find_existing_titles()` now pages
+defensively: bare-list responses and dict envelopes (`items` / `sources` /
+`data` / `results`) are both accepted, `total` / `next` hints are honored,
+and paging stops when a page contributes no new titles — a server that
+ignores the `page` param costs at most two requests, a small single page
+costs exactly one. Hard stop at 50 pages. On top of that, `push` now dedups
+single pushes too: pushing the same video twice is a no-op
+(`skipped: already_exists`) unless `--force` is passed.
+Tests: `TestFindExistingTitlesPagination`, `TestPushVideoSkipExisting`.
 
 ### Title collision skips different videos with same title
 **File:** `open_notebook.py:_title_key()`
 **Impact:** Two different videos with identical titles (e.g. numbered series
 that got reposted) — the second is permanently skipped after the first push.
-**Workaround:** None currently. Use `--no-skip-existing` if this is a concern
-(flag not yet implemented — would need to add).
+**Workaround:** `push --force` bypasses the title dedup for single pushes
+(added 2026-08-04). `channel-push` still has no bypass flag.
 **Fix:** Match on YouTube video ID embedded in the title `[vid_id]` suffix
 instead of full title. The current `_title_key()` includes the ID, so this
 should only collide if two videos share both title AND ID (impossible).
@@ -42,13 +44,11 @@ lines (`re.split(r'(?<=[.!?])\s+', paragraph)`).
 
 ### No hard byte-split fallback for monolithic lines
 **File:** `open_notebook.py:_split_content()`
-**Impact:** If a single line exceeds `MAX_CONTENT_BYTES` (128KB), there's no
-fallback to split it. `create_source_chunked()` would raise
-`PayloadTooLargeError` on that chunk.
-**Workaround:** None. Exceedingly rare — would require a single transcript
-line >128KB.
-**Fix:** Add a hard byte-split with a `# (split mid-line due to size limit)`
-marker as a last resort.
+**Status: FIXED (2026-08-04).** A line larger than the whole chunk budget is
+now hard-split on UTF-8-safe byte windows (never mid-codepoint, lossless
+round-trip, each piece under the byte budget).
+Tests: `TestSplitContentEdgeCases` — transcripts of length 0 / 1 / 1000 /
+100000, a monolithic 5000-char no-newline line, and multibyte content.
 
 ## Testing
 
@@ -73,9 +73,11 @@ on mismatch.
 
 ### Claims cap (50) not configurable via CLI
 **File:** `open_notebook.py:_build_metadata_footer()`
-**Impact:** Videos with >50 claims silently truncate at 50.
-**Workaround:** None.
-**Fix:** Add `--max-claims N` flag to `push` and `channel-push`.
+**Status: FIXED (2026-08-04).** `push` and `channel-push` now take
+`--max-claims N` (default 50, unchanged). Truncation is no longer silent —
+a `[notebook] claim list truncated to X of Y (raise with --max-claims)`
+warning prints to stderr when the cap bites.
+Tests: `TestMaxClaimsFooter` (default cap + warning, higher cap + quiet).
 
 ### Comment extraction has no empty-result warning
 **File:** `comments.py:extract_comments()`
@@ -125,3 +127,74 @@ ran, so the package described text that was never written to disk. This made
 a working feature look broken during review.
 **Status:** Fixed. Metrics are computed after restoration, and
 `restoration_applied` + `sentence_mode` are now reported per run.
+
+### Model splits inside trading jargon
+**File:** `yt_sentences.py`
+**Status: guarded (2026-08-04).** The punctuation model occasionally broke
+sentences inside domain phrases ("overbought at 70. Level", "RSI. Is a
+momentum indicator"). `_repair_jargon_splits()` now re-joins those specific
+patterns post-restoration (applied to both fresh output and the disk cache;
+idempotent). Legitimate boundaries like "RSI. Is that good?" are left alone
+(the indicator rule requires an article after the verb). This is a targeted
+guard, not a general boundary-quality fix — odd splits outside the protected
+patterns can still occur.
+Tests: `TestJargonSplitRepair` (repairs, idempotence, no-touch cases).
+
+## Visual extraction (--visual)
+
+**The feature was silently missing for months.** The original
+OCR-first pipeline (frame extraction, dedup, Tesseract OCR, and
+OpenAI/Anthropic/Ollama frame analysers) lived inside `yt_scrape.py`
+and disappeared when an older copy of that file was committed over it.
+`README.md` and `SKILL.md` kept documenting `--visual` the whole time,
+so the feature looked healthy while no code path called a vision model
+and the CLI flag did not exist. Restored 2026-08-04 as `visual.py`.
+
+- **Tesseract is no longer used.** Frames are read by a local vision
+  model through Ollama (`ui-tars-7b:latest` by default). This removes
+  the Tesseract binary dependency, which was never installed here.
+- **It is slow.** Roughly 35-45s per unique frame on CPU. Vision inference
+  is ~95% of --visual wall time, which is why frame-count reduction below
+  is the lever that matters.
+- **Chapter-aware sampling restored (2026-08-04).** `prepare_deep_research`
+  now runs `extract_all` before the visual pass and feeds real chapter
+  start timestamps to the frame extractor (2+ distinct chapters required;
+  fixed-interval sampling remains the fallback).
+- **Round 4 frame-count reduction (2026-08-04):** global perceptual dedup
+  (dHash, any-to-any — a slide that reappears minutes later no longer
+  re-enters the queue; the old dedup only compared neighbors), a
+  content-density ranking (JPEG-size proxy for on-screen text, no OCR
+  dependency), and an adaptive cap (`YT_VISUAL_TARGET_FRAMES`, default 8)
+  that keeps the densest frames in chronological order.
+  Tests: `TestFrameSelection` (non-adjacent duplicate runs collapse 6->2,
+  density cap evicts near-blank frames, unreadable frames never
+  false-match).
+- **Requires Ollama running** with a vision-capable model. A
+  text-only model is explicitly refused, because it would return
+  confident descriptions of images it cannot see.
+- Tunables: `YT_VISION_MODEL`, `YT_OLLAMA_HOST`, `YT_VISION_TIMEOUT`,
+  `YT_FRAME_INTERVAL`, `YT_MAX_FRAMES`, `YT_VISUAL_TARGET_FRAMES`,
+  `YT_FRAME_HASH_DISTANCE`.
+
+## Corpus tools (claim-graph / factcheck, added 2026-08-04)
+
+### Claim-graph node identity is exact-text, not semantic
+**File:** `claim_graph.py:claim_node_key()`
+**Impact:** Nodes dedupe on normalized span text + claim types. "RSI is
+overbought at 70" and "the RSI overbought level is 70" stay separate nodes;
+paraphrase-level dedup would need embeddings (see `cluster` for the
+BERTopic/sklearn machinery that could back it).
+**Impact 2:** Contradiction edges use a metric-keyword + first-number
+heuristic mirroring the intra-video detector. Metrics outside the keyword
+list (overbought/oversold/support/resistance/stop loss/take profit/win
+rate/RSI/MACD/EMA/SMA/ATR) do not produce edges.
+
+### Fact-check depends on scrape-fragile free search + local-LLM judgment
+**File:** `factcheck.py`
+**Impact:** Search uses DuckDuckGo's HTML endpoint (free, no API key) —
+layout changes or rate limits degrade it to zero results, which degrades
+verdicts to `unverifiable` (never crashes the run). Verdicts come from a
+local Ollama text model (`YT_FACTCHECK_MODEL`, else first non-vision model);
+a box with only vision models loaded gets `unverifiable` with the reason
+recorded. Verdict quality is bounded by the local model — treat `verified` /
+`contradicted` as leads with sources, not ground truth.

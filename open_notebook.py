@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import os
 import random
+import sys
 import threading
 import time
 import unicodedata
@@ -108,6 +109,7 @@ def video_info_to_source_payload(
     embed: bool = True,
     async_processing: bool = False,
     extra_content: str = "",
+    max_claims: int = 50,
 ) -> dict:
     """Map a scraped VideoInfo + TranscriptSegments to Open Notebook's SourceCreate.
 
@@ -142,7 +144,7 @@ def video_info_to_source_payload(
     # Stash rich metadata in the title isn't possible — Open Notebook's
     # SourceCreate schema doesn't have a metadata field. We encode channel +
     # claims as a footer block in the content so they're searchable.
-    metadata_footer = _build_metadata_footer(video, claims or [])
+    metadata_footer = _build_metadata_footer(video, claims or [], max_claims=max_claims)
     if metadata_footer:
         payload["content"] = payload["content"] + "\n\n" + metadata_footer
 
@@ -153,7 +155,7 @@ def video_info_to_source_payload(
     return payload
 
 
-def _build_metadata_footer(video, claims: list[dict]) -> str:
+def _build_metadata_footer(video, claims: list[dict], max_claims: int = 50) -> str:
     """Build a searchable metadata footer appended to the transcript content."""
     lines: list[str] = ["--- METADATA ---"]
     if video.url:
@@ -172,9 +174,17 @@ def _build_metadata_footer(video, claims: list[dict]) -> str:
         lines.append(f"Transcript source: {video.transcript_source}")
 
     if claims:
+        shown = claims
+        if 0 <= max_claims < len(claims):
+            print(
+                f"  [notebook] claim list truncated to {max_claims} of "
+                f"{len(claims)} (raise with --max-claims)",
+                file=sys.stderr,
+            )
+            shown = claims[:max_claims]
         lines.append("")
         lines.append(f"--- CLAIMS ({len(claims)}) ---")
-        for c in claims[:50]:  # cap at 50 to avoid huge payloads
+        for c in shown:
             claim_text = c.get("claim") or c.get("text") or ""
             ts_raw = c.get("timestamp") or c.get("source_timestamp") or ""
             # timestamp can be a dict {start, end, timestamp_str} or a plain string
@@ -233,6 +243,26 @@ def _split_content(content: str, chunk_size: int) -> list[str]:
                 current_bytes = 0
             for line in para.split("\n"):
                 line_bytes = len(line.encode("utf-8")) + 1
+                if line_bytes > chunk_size:
+                    # Hard byte-split fallback (KNOWN_ISSUES): one line larger
+                    # than the whole chunk budget used to sail through here
+                    # and blow up at the API. Split on UTF-8-safe windows.
+                    if current:
+                        chunks.append("\n".join(current))
+                        current = []
+                        current_bytes = 0
+                    encoded = line.encode("utf-8")
+                    step = max(1, chunk_size - 64)
+                    start = 0
+                    while start < len(encoded):
+                        end = min(start + step, len(encoded))
+                        while end < len(encoded) and (encoded[end] & 0xC0) == 0x80:
+                            end -= 1
+                        piece = encoded[start:end].decode("utf-8")
+                        if piece:
+                            chunks.append(piece)
+                        start = end
+                    continue
                 if current_bytes + line_bytes > chunk_size and current:
                     chunks.append("\n".join(current))
                     current = []
@@ -414,12 +444,23 @@ class OpenNotebookClient:
         embed: bool = True,
         async_processing: bool = False,
         extra_content: str = "",
+        max_claims: int = 50,
+        skip_existing: bool = False,
     ) -> dict:
         """Scrape → map → push a single video to Open Notebook.
 
         Returns the created source dict (with `id`). For large transcripts that
         exceed MAX_CONTENT_BYTES, automatically chunks and returns the first chunk.
         """
+        if skip_existing and notebook_id:
+            existing = self._find_existing_titles(notebook_id)
+            if self._title_key(video) in existing:
+                return {
+                    "skipped": True,
+                    "reason": "already_exists",
+                    "title": video.title or f"YouTube: {video.id}",
+                    "video_id": video.id,
+                }
         payload = video_info_to_source_payload(
             video, segments, claims,
             notebook_id=notebook_id,
@@ -427,6 +468,7 @@ class OpenNotebookClient:
             embed=embed,
             async_processing=async_processing,
             extra_content=extra_content,
+            max_claims=max_claims,
         )
         content_bytes = len((payload.get("content") or "").encode("utf-8"))
         if content_bytes > MAX_CONTENT_BYTES:
@@ -485,6 +527,7 @@ class OpenNotebookClient:
         rate_limit_sec: float = 2.0,
         on_progress: Optional[Any] = None,
         skip_existing: bool = True,
+        max_claims: int = 50,
     ) -> dict:
         """Scrape all videos from a channel and push each to Open Notebook.
 
@@ -567,6 +610,7 @@ class OpenNotebookClient:
                     notebook_id=notebook_id,
                     embed=embed,
                     async_processing=async_processing,
+                    max_claims=max_claims,
                 )
                 return idx, vid.id, result, None
             except OpenNotebookError as exc:
@@ -609,16 +653,54 @@ class OpenNotebookClient:
         return unicodedata.normalize("NFC", full).casefold().strip()
 
     def _find_existing_titles(self, notebook_id: str) -> set[str]:
-        """List existing source titles in a notebook for dedup matching.
+        """List ALL existing source titles in a notebook for dedup matching.
 
-        Note: GET /api/sources may be paginated. This currently reads only the
-        first page. For notebooks with >100 existing sources, dedup may miss
-        entries. See KNOWN_ISSUES.md.
+        GET /api/sources may be paginated. This follows pagination
+        defensively: bare-list responses and dict envelopes
+        (items/sources/data/results) are both accepted, and paging continues
+        while full-looking pages keep contributing NEW titles. A server that
+        ignores the page param returns the same page again, which adds
+        nothing and stops the loop, so a non-paginating API costs at most
+        two requests and a small single page costs exactly one.
+        (KNOWN_ISSUES: dedup used to read page 1 only.)
         """
-        result = self._request("GET", "/api/sources", params={"notebook_id": notebook_id})
-        if isinstance(result, list):
-            return {
+        titles: set[str] = set()
+        page = 1
+        while page <= 50:  # hard stop against pathological servers
+            params: dict[str, Any] = {"notebook_id": notebook_id}
+            if page > 1:
+                params["page"] = page
+            try:
+                result = self._request("GET", "/api/sources", params=params)
+            except OpenNotebookError:
+                break  # keep whatever dedup info we already collected
+            if isinstance(result, list):
+                items = result
+                more_hint = len(items) >= 50
+            elif isinstance(result, dict):
+                items = next(
+                    (result[k] for k in ("items", "sources", "data", "results")
+                     if isinstance(result.get(k), list)),
+                    [],
+                )
+                total = result.get("total")
+                if isinstance(total, int):
+                    more_hint = (len(titles) + len(items)) < total
+                elif result.get("next"):
+                    more_hint = True
+                else:
+                    more_hint = len(items) >= 50
+            else:
+                items = []
+                more_hint = False
+            before = len(titles)
+            titles |= {
                 unicodedata.normalize("NFC", s.get("title") or "").casefold().strip()
-                for s in result if s.get("title")
+                for s in items
+                if isinstance(s, dict) and s.get("title")
             }
-        return set()
+            grew = len(titles) > before
+            if not items or not more_hint or (page > 1 and not grew):
+                break
+            page += 1
+        return titles
