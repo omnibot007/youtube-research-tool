@@ -32,6 +32,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+import providers
+
 # Frame extraction interval (seconds) when the video has no chapters.
 FRAME_INTERVAL = int(os.environ.get("YT_FRAME_INTERVAL", "60"))
 # Hard cap on frames per video. Vision inference is ~45s/frame measured on
@@ -116,6 +118,10 @@ def vision_available() -> tuple[bool, str]:
     Returns (available, detail). `detail` is the model name on success or a
     human-readable reason on failure.
     """
+    if os.environ.get("YT_PROVIDER_CHAIN"):
+        chain = providers.load_chain()
+        if any(p.get("name") != "local" for p in chain):
+            return True, "hosted provider chain"
     url = OLLAMA_HOST.rstrip("/") + "/api/tags"
     try:
         with urllib.request.urlopen(url, timeout=5) as r:
@@ -416,33 +422,24 @@ def read_frame(frame_path: Path, timestamp: float) -> dict:
         "timestamp": timestamp,
         "frame_file": frame_path.name,
     }
+    answer = ""
     try:
-        options: dict[str, Any] = {
-            "temperature": 0,
-            "num_predict": VISION_NUM_PREDICT,
-            "num_ctx": VISION_NUM_CTX,
-        }
+        options = {"temperature": 0, "num_predict": VISION_NUM_PREDICT, "num_ctx": VISION_NUM_CTX}
         if VISION_NUM_GPU:
             try:
                 options["num_gpu"] = int(VISION_NUM_GPU)
             except ValueError:
                 pass
-        payload = {
-            "model": VISION_MODEL,
-            "prompt": VISION_PROMPT,
-            "images": [_encode_frame(frame_path)],
-            "stream": False,
-            "options": options,
-            "keep_alive": VISION_KEEP_ALIVE,
-        }
-        req = urllib.request.Request(
-            OLLAMA_HOST.rstrip("/") + "/api/generate",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=VISION_TIMEOUT) as r:
-            body = json.loads(r.read().decode("utf-8"))
-        answer = (body.get("response") or "").strip()
+        encoded = _encode_frame(frame_path)
+        if os.environ.get("YT_PROVIDER_CHAIN"):
+            local_provider = {"name": "local", "host": OLLAMA_HOST, "model": VISION_MODEL, "options": options, "keep_alive": VISION_KEEP_ALIVE}
+            answer, _ = providers.try_chain(VISION_PROMPT, encoded, providers.load_chain(), local_provider=local_provider)
+        else:
+            payload = {"model": VISION_MODEL, "prompt": VISION_PROMPT, "images": [encoded], "stream": False, "options": options, "keep_alive": VISION_KEEP_ALIVE}
+            req = urllib.request.Request(OLLAMA_HOST.rstrip("/") + "/api/generate", data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=VISION_TIMEOUT) as r:
+                body = json.loads(r.read().decode("utf-8"))
+            answer = (body.get("response") or "").strip()
     except Exception as e:
         out["error"] = f"{type(e).__name__}: {e}"
         return out

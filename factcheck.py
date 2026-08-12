@@ -19,6 +19,8 @@ import re
 import urllib.parse
 import urllib.request
 
+import providers
+
 OLLAMA_HOST = os.environ.get("YT_OLLAMA_HOST", "http://127.0.0.1:11434")
 FACTCHECK_MODEL = os.environ.get("YT_FACTCHECK_MODEL", "")
 SEARCH_TIMEOUT = int(os.environ.get("YT_FACTCHECK_SEARCH_TIMEOUT", "20"))
@@ -105,6 +107,16 @@ def pick_text_model() -> str:
 
 
 def _ollama_generate(model: str, prompt: str) -> str:
+    if os.environ.get("YT_PROVIDER_CHAIN"):
+        local_provider = {
+            "name": "local",
+            "host": OLLAMA_HOST,
+            "model": model,
+            "format": "json",
+            "options": {"temperature": 0},
+            "keep_alive": os.environ.get("YT_FACTCHECK_KEEP_ALIVE", "5m"),
+        }
+        return providers.try_chain(prompt, None, providers.load_chain(), local_provider=local_provider)[0]
     payload = {
         "model": model,
         "prompt": prompt,
@@ -125,7 +137,7 @@ def _ollama_generate(model: str, prompt: str) -> str:
 
 def llm_verdict(claim_sentence: str, evidence: list[dict], model: str) -> dict:
     """Ask the local text LLM for a verdict against the search evidence."""
-    if not model:
+    if not model and not os.environ.get("YT_PROVIDER_CHAIN"):
         return {"verdict": "unverifiable",
                 "reason": "no local text model available"}
     if not evidence:

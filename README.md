@@ -265,6 +265,19 @@ python -m pytest test_yt_scrape.py -v
 | Moderate | Industry publications, textbooks, recognized experts, established blogs |
 | Low | YouTube videos, Reddit, personal blogs, marketing content |
 
+## Hosted Inference Provider Chain
+
+`--visual` and fact-check can run through a chain of OpenAI-compatible hosted providers instead of a local Ollama server:
+
+```bash
+set YT_PROVIDER_CHAIN=gemini,groq,openrouter,local
+set YT_GEMINI_API_KEY=...
+set YT_GROQ_API_KEY=...
+set YT_OPENROUTER_API_KEY=...
+```
+
+Models are read from `YT_GEMINI_MODEL`, `YT_GROQ_MODEL`, and `YT_OPENROUTER_MODEL`; defaults are `gemini-2.5-flash-lite`, `meta-llama/llama-4-scout-17b-16e-instruct`, and `google/gemma-4-26b-a4b-it:free`. The chain walks through providers in order, retrying on 429 and advancing on 5xx/timeout/auth errors. If `YT_PROVIDER_CHAIN` is unset, local Ollama behavior is unchanged.
+
 ## License
 
 MIT — see [LICENSE](LICENSE)
