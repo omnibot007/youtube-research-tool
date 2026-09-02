@@ -2,7 +2,8 @@
 
 A Python CLI tool for fetching, cleaning, and analyzing YouTube video transcripts. Supports two research modes: **Light Research** (fast summarization) and **Deep Research** (comprehensive claim verification with web sources).
 
-No API key needed for public videos. No external LLM required — the AI agent does the comprehension directly.
+No API key needed for transcripts. Chart and slide extraction (`--visual`)
+uses Gemini and needs a key; everything else runs without one.
 
 ## Features
 
@@ -67,6 +68,93 @@ Goes beyond summarization — verifies claims, maps arguments, assesses bias, an
 | `scientific` | "Subconscious mind controls everything" |
 | `comparative` | "Better than all others" |
 | `historical` | "Invented in 1995" |
+
+### Chart & Slide Extraction (`--visual`)
+
+Reads what is **on screen**, not just what is said. Built for trading videos:
+candlestick charts, indicator panels, drawn levels and price patterns.
+
+```bash
+export GEMINI_API_KEY=...            # free key: aistudio.google.com/apikey
+python yt_scrape.py deep-research "<url>" --visual --json
+```
+
+The YouTube URL goes straight to Gemini, which fetches the video server-side.
+**No download, no ffmpeg, no local GPU** — which also means YouTube bot
+detection (HTTP 403) never enters the picture. A 72-minute course takes about
+75 seconds.
+
+Real output from an RSI tutorial:
+
+```
+00:01 Candlestick chart, BTCUSD 1W, macro uptrend following bear market low,
+      RSI (14) with 14 SMA, no drawn levels or patterns.
+05:22 Candlestick chart, BTCUSD 1D, 2021 bull market topping phase, weekly
+      RSI (14) SMA, drawn lines identifying regular bearish divergence.
+```
+
+**Typed, not parsed.** The model fills a JSON schema directly — instrument,
+timeframe, chart type, trend, each indicator with its period, drawn objects,
+patterns, price levels. Nothing regex-guesses structure out of prose, and
+values it cannot read come back empty rather than as a placeholder.
+
+**Long videos are windowed automatically.** Video costs roughly 100 tokens per
+second, so a 1M-context model tops out near 3 hours in one request. Anything
+longer is split into 30-minute clips and merged with absolute `HH:MM:SS`
+timestamps. A 9-hour course is 18 windows and works fine.
+
+| Flag | Purpose |
+|---|---|
+| `--visual-provider` | `auto` (default) \| `gemini` \| `ollama` |
+| `--visual-profile` | `trading` (default) \| `general` |
+| `--visual-mode` | `auto` \| `video` \| `frames` |
+
+`auto` selects Gemini only when a key is present, so a machine without one
+behaves exactly as it did before. Ollama remains as an offline fallback.
+
+### Batch Extraction
+
+```bash
+python extract_batch.py --from urls.txt --dry-run   # price it, no API calls
+python extract_batch.py --from urls.txt             # run it
+```
+
+Already-extracted videos are skipped, so a 20-video run that dies at 15 costs
+nothing for the first 14. Transient failures (429, 5xx) retry with exponential
+backoff and jitter. Timeouts scale with video length. Token usage and an
+estimated cost are reported per run, with `YT_PRICE_IN` / `YT_PRICE_OUT` for
+non-Google pricing.
+
+A run that loses windows says so:
+
+```
+[visual] PARTIAL: 66.6% covered, 2 window(s) failed
+```
+
+### Cross-Video Corpus
+
+A single video is worth very little. The value is cross-video.
+
+```bash
+python corpus.py                       # rollups + disagreements
+python corpus.py --csv claims.csv      # one row per claim
+python corpus.py --instrument BTCUSD
+python corpus.py --grep divergence
+python corpus.py --conflicts
+```
+
+Every claim carries provenance: video, timestamp, source, model, and a deep
+link to the exact second. Tickers, timeframes and indicator names are
+normalised (`BTC/USD` and `BINANCE:BTCUSD` both become `BTCUSD`; `M15` and
+`15 min` both become `15m`), so a query does not need to know every spelling.
+
+The payoff is disagreement no single video can show you:
+
+```
+--- indicators taught with different periods ---
+  MACD: 12 (1 video), 12 26 9 (1 video)
+  STOCHASTIC: 14 (1 video), 14 1 3 (1 video)
+```
 
 ### Interactive Web Reports
 ```bash
