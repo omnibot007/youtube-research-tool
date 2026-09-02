@@ -183,26 +183,54 @@ and the CLI flag did not exist. Restored 2026-08-04 as `visual.py`.
 run had ever been verified on this machine. Three independent blockers, each
 measured, each with a receipt:
 
-**1. Ollama was not running.** `ollama --version` hung, then reported
-`Warning: could not connect to a running Ollama instance`. `vision_available()`
-correctly returned false, the scrape correctly did not crash, and the feature
-correctly produced nothing. Starting the server fixed the gate, not the
-pipeline.
+**1. The Ollama server is wedged: metadata answers, inference never returns.**
+The `ollama` CLI hangs (`ollama list` never returned; `ollama --version`
+printed `Warning: could not connect to a running Ollama instance`), which
+looks like "not running". It is not. The HTTP API is bound and healthy on the
+metadata endpoints:
 
-**2. A single frame exceeds the timeout on this GPU.** With Ollama up and
+| Endpoint | Result |
+|---|---|
+| `GET /api/tags` | HTTP 200 in 0.003s, full model list |
+| `GET /api/ps` | HTTP 200 in 0.0008s, `{"models":[]}` |
+| `POST /api/generate` | no response in 25s |
+
+Confirmed with `llama3.2:1b` — a 1.3 GB **text-only** model asked for 5
+tokens — which also times out. So this is not a vision problem, not a model
+problem and not a VRAM problem. Starting another server is not the fix either:
+`ollama serve` exits with
+`bind: Only one usage of each socket address ... is normally permitted`,
+because a server is already listening. **The fix is to restart Ollama**
+(quit the tray app and relaunch, or kill the `ollama.exe` / `ollama app.exe`
+processes and start it again).
+
+**`vision_available()` is a false green against this failure.** It probes
+`/api/tags` only — the endpoint that still answers in 3 ms — so it returns
+`True`, the run proceeds, and every frame then times out. An availability
+check that cannot see the actual failure mode is worth little; a cheap
+`/api/generate` probe with `num_predict: 1` would catch it.
+
+**2. A frame read timed out at 300s.** With
 `YT_VISION_MODEL=qwen2.5vl:3b`, a real run reached inference and died there:
 
     [visual] 1 unique frames; reading with qwen2.5vl:3b
     [visual] frame 1/1 at 00:00...
     [visual] frame 1 failed: TimeoutError: timed out
 
-That is one 768px frame exceeding `YT_VISION_TIMEOUT=300`. **The Round 3
-comment in `visual.py` is wrong about this card.** It says a 7B at ctx 2048
-"fits the T1000 fully (5.0 GB, VRAM flat)" and justifies `num_gpu=99`.
-`nvidia-smi` here reports **4096 MiB total**, so a 5.0 GB model cannot fully
-offload, and forcing `num_gpu=99` is asking for exactly the thrash observed.
-Either that measurement came from an 8 GB T1000 variant or it was never taken
-on this machine. Treat the 43.5s/frame figure as unverified on this hardware.
+**Correction, recorded deliberately.** This was first written up here as a
+GPU/VRAM result. That was wrong, and it is the same error as the 2026-09-01
+scar: *a confirmed mechanism is not a confirmed cause.* A real mechanism
+exists (see below), but the text-only 1.3 GB timeout proves the wedged server
+above is sufficient to produce this symptom on its own. No per-frame timing
+for any local model was successfully measured this session. Treat the
+43.5s/frame figure in `visual.py` as unverified on this machine.
+
+The separate, still-real documentation defect: the Round 3 comment says a 7B
+at ctx 2048 "fits the T1000 fully (5.0 GB, VRAM flat)" and uses that to
+justify `num_gpu=99`. `nvidia-smi` here reports **4096 MiB total**, so a
+5.0 GB model cannot fully offload on this card. Either that measurement came
+from an 8 GB T1000 variant or it was never taken here. Re-measure before
+trusting `num_gpu=99`, but do not blame it for the timeout above.
 
 **3. The video cannot be downloaded at all.** `yt-dlp` gets
 `HTTP Error 403: Forbidden` from YouTube, and every cookie source fails:
@@ -300,11 +328,20 @@ CLI equivalents: `--visual-provider`, `--visual-profile`, `--visual-mode`.
 - **`GEMINI_MODEL` default is `gemini-3.8-flash`**, taken from the quickstart
   page on 2026-09-02. Model IDs vary across Google's own doc pages; if a run
   returns HTTP 404 or 400, set `YT_GEMINI_MODEL` to a current ID.
-- **The local Ollama path stays unusable on this 4 GB card** for multi-frame
-  videos. It is kept as an offline fallback, not a recommendation. Before
-  trusting it, drop `YT_VISION_NUM_GPU` (let the scheduler split) and raise
-  `YT_VISION_TIMEOUT`; the `num_gpu=99` default is tuned for a card this
-  machine does not have.
+- **The local Ollama path is unproven here, not measured as slow.** The server
+  is wedged (above), so no local model produced a single reading this session
+  and no s/frame figure was obtained for any model. Restart Ollama first, then
+  re-measure. When measuring, drop `YT_VISION_NUM_GPU` so the scheduler can
+  split the model: the `num_gpu=99` default is justified by a comment about a
+  card with more VRAM than this one has.
+- **The planned model bake-off did not happen.** `ui-tars-7b:latest` (a UI
+  grounding model, the wrong prior for candlestick charts) and `qwen2.5vl:3b`
+  are both pulled and both declare `vision` in `/api/tags`, but neither could
+  be scored because inference never returns. `ui-tars-7b` is still the
+  `VISION_MODEL` default and has not been dethroned by evidence.
+- **`vision_available()` gives a false green** when the server answers
+  `/api/tags` but hangs on `/api/generate`. A `num_predict: 1` probe would
+  close it, at the cost of one cheap call per run.
 - **Video mode returns one aggregated reading**, timestamped inside the text
   by the model rather than by the pipeline, so `frame_analyses` holds a single
   entry at 00:00. Per-timestamp structure would need the frame path or a

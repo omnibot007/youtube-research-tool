@@ -74,9 +74,11 @@ VISION_KEEP_ALIVE = os.environ.get("YT_VISION_KEEP_ALIVE", "10m")
 VISION_NUM_GPU = os.environ.get("YT_VISION_NUM_GPU", "99").strip()
 
 # --- Vision provider selection (added 2026-09-02) ----------------------------
-# The local Ollama path is offline and free but slow, and a 3-7B model reads
-# candlestick charts poorly. Measured on this machine 2026-09-02: qwen2.5vl:3b
-# exceeded the 300s per-frame timeout on a single 768px frame at num_ctx 2048.
+# The local Ollama path is offline and free. On this machine 2026-09-02 it was
+# also unusable: the Ollama server answers /api/tags in 3ms but never returns
+# from /api/generate, even for a 1.3GB text-only model, so every frame read
+# times out. That is a wedged server, not a slow model -- restart Ollama before
+# concluding anything about local speed. See KNOWN_ISSUES.md.
 # The Gemini backend trades offline-ness for accuracy and speed. "auto" selects
 # Gemini only when a key is present, so a machine without one is unaffected.
 VISION_PROVIDER = os.environ.get("YT_VISION_PROVIDER", "auto").strip().lower()
