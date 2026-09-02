@@ -420,8 +420,13 @@ class TestGeminiBackend:
         cap, _ = self._capture_gemini(monkeypatch, tmp_path)
         fmt = cap["payload"]["response_format"]
         assert fmt["mime_type"] == "application/json"
+        # segments joined the contract 2026-09-02; the two prose keys stay so
+        # every existing consumer keeps working.
         assert set(fmt["schema"]["required"]) == {
-            "on_screen_text", "chart_description"}
+            "on_screen_text", "chart_description", "segments"}
+        seg = fmt["schema"]["properties"]["segments"]["items"]
+        for field in ("instrument", "timeframe", "indicators", "patterns"):
+            assert field in seg["properties"], field
 
     def test_parses_vendors_verbatim_response_example(self):
         text = visual._gemini_extract_text(self.DOC_RESPONSE)
@@ -770,3 +775,66 @@ class TestProxyCompatibleAuth:
         assert os.environ.get("YT_GEMINI_ENDPOINT") or visual.GEMINI_ENDPOINT
         # the constant is env-driven, which is what lets a proxy be swapped in
         assert "YT_GEMINI_ENDPOINT" in open("visual.py", encoding="utf-8").read()
+
+
+class TestTypedSegments:
+    """Model-filled fields instead of regex over prose (added 2026-09-02).
+
+    The regex layer shipped two real bugs in one day. These claims come from
+    fields the model populated, so no pattern can mistake a clock for a period.
+    """
+
+    SEG = {
+        "timestamp": "01:02:03", "instrument": "BTCUSD", "timeframe": "15m",
+        "chart_type": "candlestick", "trend": "downtrend",
+        "indicators": [{"name": "RSI", "period": "14"},
+                       {"name": "MACD", "period": ""}],
+        "drawn": ["descending trendline"], "patterns": ["bearish divergence"],
+        "levels": ["42150"],
+    }
+
+    def _claims(self, seg=None):
+        return visual.claims_from_segments([seg or dict(self.SEG)])
+
+    def test_instrument_and_timeframe_become_claims(self):
+        got = {(c["type"], c["claim"]) for c in self._claims()}
+        assert ("instrument", "Instrument: BTCUSD") in got
+        assert ("timeframe", "Timeframe: 15m") in got
+
+    def test_indicator_period_needs_no_parsing(self):
+        got = {c["claim"] for c in self._claims()}
+        assert "RSI = 14" in got
+        assert "MACD present" in got, "an indicator with no shown period"
+
+    def test_timestamp_parses_to_absolute_seconds(self):
+        c = self._claims()[0]
+        assert c["timestamp"] == 3723.0
+        assert c["timestamp_str"] == "01:02:03"
+
+    def test_every_claim_is_sourced_to_the_segment(self):
+        assert all(c["source"] == "visual_segment" for c in self._claims())
+
+    def test_filler_is_treated_as_absence(self):
+        seg = dict(self.SEG)
+        seg["instrument"] = "unidentified asset"
+        seg["timeframe"] = "unknown"
+        got = {c["type"] for c in self._claims(seg)}
+        assert "instrument" not in got
+        assert "timeframe" not in got
+
+    def test_empty_fields_produce_no_claims(self):
+        seg = {"timestamp": "00:05", "instrument": "", "timeframe": "",
+               "chart_type": "", "trend": "", "indicators": [], "drawn": [],
+               "patterns": [], "levels": []}
+        assert visual.claims_from_segments([seg]) == []
+
+    def test_duplicate_claims_at_one_timestamp_collapse(self):
+        seg = dict(self.SEG)
+        seg["drawn"] = ["trendline", "Trendline", "trendline"]
+        drawn = [c for c in self._claims(seg) if c["claim"] == "trendline"]
+        assert len(drawn) == 1
+
+    def test_malformed_segments_never_raise(self):
+        assert visual.claims_from_segments(None) == []
+        assert visual.claims_from_segments(["not a dict", 7]) == []
+        assert visual.claims_from_segments([{"timestamp": "x"}]) == []

@@ -329,6 +329,29 @@ guessing a number the model cannot read. `YT_VISION_PROFILE=general` or
 `YT_GEMINI_VIDEO_TIMEOUT`, `YT_GEMINI_MAX_TOKENS`, `YT_GEMINI_TARGET_FRAMES`.
 CLI equivalents: `--visual-provider`, `--visual-profile`, `--visual-mode`.
 
+### Typed extraction replaced the regex layer (2026-09-02)
+
+`response_format` now carries a `segments` array: per timestamp the model
+fills instrument, timeframe, chart_type, trend, indicators with periods, drawn
+objects, patterns and levels. Claims are built from those FIELDS, so no
+pattern can mistake a clock for a period. It is additive -- `on_screen_text`
+and `chart_description` still come back and the regex still runs over them as
+a second opinion.
+
+Measured on the same 8-minute video, before and after:
+
+| | prose + regex | typed segments |
+|---|---|---|
+| claims | 19 | 134 |
+| segments | 0 | 22 |
+
+The model now returns an empty string where it used to write "unidentified
+asset". Filler is treated as absence (`_NOT_A_VALUE`), because a placeholder
+that looks like data is worse than no data.
+
+Token usage is captured per run and reported by `extract_batch.py`, with
+`YT_PRICE_IN` / `YT_PRICE_OUT` for non-Google pricing.
+
 ### Remaining debt
 
 - **Two bugs shipped green and only a live run caught them.** 360 offline

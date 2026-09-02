@@ -26,6 +26,12 @@ from pathlib import Path
 
 HERE = Path(__file__).parent
 
+# Google list price for gemini-3.8-flash through 2026-12-31, per 1M tokens.
+# A reseller will differ, so both are overridable. This is an ESTIMATE for
+# budgeting, never a bill.
+PRICE_IN = float(os.environ.get("YT_PRICE_IN", "0.75"))
+PRICE_OUT = float(os.environ.get("YT_PRICE_OUT", "3.75"))
+
 
 def load_urls(args) -> list:
     urls = list(args.urls)
@@ -71,7 +77,11 @@ def extract_one(url: str, out_dir: str, timeout: int) -> dict:
         return {"ok": False, "seconds": elapsed, "error": f"unparseable JSON: {e}"}
 
     vis = pkg.get("visual_extraction") or {}
+    usage = vis.get("usage") or {}
     return {
+        "in_tokens": usage.get("input_tokens", 0),
+        "out_tokens": usage.get("output_tokens", 0),
+        "segments": len(vis.get("segments") or []),
         "ok": True,
         "seconds": elapsed,
         "title": (pkg.get("video") or {}).get("title", "")[:52],
@@ -117,8 +127,10 @@ def main() -> int:
             mins = (r["duration"] or 0) // 60
             note = f" ERROR: {r['vision_error']}" if r["vision_error"] else ""
             print(f"        {mins}min, {r['windows']} window(s), "
-                  f"{r['claims']} claims, {r['charts']} chart reads, "
-                  f"{r['seconds']:.0f}s{note}", file=sys.stderr)
+                  f"{r['segments']} segments, {r['claims']} claims, "
+                  f"{r['seconds']:.0f}s, "
+                  f"{r['in_tokens'] + r['out_tokens']:,} tokens"
+                  f"{note}", file=sys.stderr)
         else:
             print(f"        FAILED: {r['error']}", file=sys.stderr)
 
@@ -134,9 +146,16 @@ def main() -> int:
         else:
             print(f"{label:<54}{'FAIL':>7}{r['seconds']:>6.0f}s", file=sys.stderr)
     print("-" * 68, file=sys.stderr)
+    tin = sum(r.get("in_tokens", 0) for r in results)
+    tout = sum(r.get("out_tokens", 0) for r in results)
+    cost = tin / 1e6 * PRICE_IN + tout / 1e6 * PRICE_OUT
     print(f"{len(ok)}/{len(results)} succeeded, "
-          f"{sum(r.get('claims', 0) for r in results)} claims total",
+          f"{sum(r.get('claims', 0) for r in results)} claims, "
+          f"{sum(r.get('segments', 0) for r in results)} segments",
           file=sys.stderr)
+    print(f"tokens: {tin:,} in / {tout:,} out  ~= ${cost:.3f} "
+          f"at ${PRICE_IN}/${PRICE_OUT} per 1M "
+          f"(override with YT_PRICE_IN / YT_PRICE_OUT)", file=sys.stderr)
     for r in results:
         if r.get("path"):
             print(f"  {r['path']}", file=sys.stderr)

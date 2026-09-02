@@ -118,16 +118,91 @@ GEMINI_VIDEO_CHUNK_SECONDS = int(
 # constraint it is for Ollama. Kept separate so raising one cannot slow the other.
 GEMINI_TARGET_FRAMES = int(os.environ.get("YT_GEMINI_TARGET_FRAMES", "16"))
 
-# Enforced output contract. structured-output.md.txt documents response_format
-# as {"type":"text","mime_type":"application/json","schema":<JSON Schema>}, which
-# makes the two-key contract a server-side guarantee instead of a polite request.
+# Typed extraction (added 2026-09-02, before the first corpus run).
+#
+# The two-string contract made the model write prose that a regex then had to
+# re-parse, and that layer shipped two real bugs in one day: MM:SS prefixes
+# read as indicator periods ("00:29 RSI Settings" -> "RSI = 29") and every
+# colon-less setting missed ("RSI Length 14"). Asking the model for typed
+# fields deletes the parser rather than patching it.
+#
+# `segments` is ADDITIVE. on_screen_text and chart_description still come back
+# unchanged, so every existing consumer, test and claim path keeps working and
+# the regex still runs as a second opinion on the free text.
+GEMINI_SEGMENT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "timestamp": {
+            "type": "string",
+            "description": "HH:MM:SS position in the FULL video",
+        },
+        "instrument": {
+            "type": "string",
+            "description": "ticker exactly as shown, e.g. BTCUSD, EURUSD, "
+                           "TSLA. Empty string if not legible -- never guess "
+                           "and never write a placeholder.",
+        },
+        "timeframe": {
+            "type": "string",
+            "description": "chart timeframe as shown, e.g. 15m, 4H, 1D, 1W. "
+                           "Empty string if not legible.",
+        },
+        "chart_type": {
+            "type": "string",
+            "description": "candlestick, line, bar, Heikin Ashi, renko, or "
+                           "empty if no price chart is visible",
+        },
+        "trend": {
+            "type": "string",
+            "description": "uptrend, downtrend, ranging, consolidation, "
+                           "reversal, or empty",
+        },
+        "indicators": {
+            "type": "array",
+            "description": "every named indicator visible on the chart",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string",
+                             "description": "e.g. RSI, EMA, MACD, TEMA"},
+                    "period": {"type": "string",
+                               "description": "its period/length as shown, "
+                                              "e.g. 14, 200. Empty if not shown."},
+                },
+                "required": ["name", "period"],
+            },
+        },
+        "drawn": {
+            "type": "array",
+            "description": "objects drawn on the chart: trendline, horizontal "
+                           "support, resistance, channel, zone, fibonacci, "
+                           "risk box, arrow",
+            "items": {"type": "string"},
+        },
+        "patterns": {
+            "type": "array",
+            "description": "named price or candlestick patterns, e.g. bullish "
+                           "engulfing, double top, bearish divergence",
+            "items": {"type": "string"},
+        },
+        "levels": {
+            "type": "array",
+            "description": "specific price levels called out, as written",
+            "items": {"type": "string"},
+        },
+    },
+    "required": ["timestamp", "instrument", "timeframe", "chart_type",
+                 "trend", "indicators", "drawn", "patterns", "levels"],
+}
+
 GEMINI_JSON_SCHEMA = {
     "type": "object",
     "properties": {
         "on_screen_text": {"type": "string"},
         "chart_description": {"type": "string"},
+        "segments": {"type": "array", "items": GEMINI_SEGMENT_SCHEMA},
     },
-    "required": ["on_screen_text", "chart_description"],
+    "required": ["on_screen_text", "chart_description", "segments"],
 }
 
 
@@ -504,17 +579,21 @@ TRADING_PROMPT = (
 # download + ffmpeg + dedup + N frame calls.
 VIDEO_PROMPT = (
     "You are analysing a TRADING education video. Watch the whole video and "
-    "report ONLY what is literally shown on screen. Never guess a number you "
-    "cannot read. Respond with JSON only, no commentary, using exactly these "
-    "two keys:\n"
-    '{"on_screen_text": "the on-screen text that matters, grouped by moment '
-    'and prefixed with its MM:SS timestamp, separated by \\n. Include ticker '
-    'symbols, timeframes, indicator names with settings, price levels and '
-    'labels drawn on charts.", '
-    '"chart_description": "for each distinct chart shown, one line prefixed '
-    'with its MM:SS timestamp giving: chart type, instrument and timeframe, '
-    'trend direction, named indicators with settings, drawn levels or '
-    'trendlines or zones, and any named pattern."}'
+    "report ONLY what is literally shown on screen. Never guess a value you "
+    "cannot read: leave the field EMPTY instead. Do not write placeholders "
+    "like 'unidentified' or 'unknown' -- an empty string is the correct "
+    "answer when something is not legible.\n\n"
+    "Return JSON with three keys:\n"
+    '- "segments": one entry per distinct chart or slide, in time order, with '
+    "its timestamp, the instrument and timeframe if legible, the chart type, "
+    "the trend, every named indicator with its period, objects drawn on the "
+    "chart, named price patterns, and any specific price levels. This is the "
+    "important field; be thorough and precise.\n"
+    '- "on_screen_text": the on-screen text that matters, grouped by moment '
+    "and prefixed with its timestamp. Include tickers, timeframes, indicator "
+    "settings panels, and labels drawn on charts.\n"
+    '- "chart_description": one line per distinct chart, prefixed with its '
+    "timestamp, summarising the same content in prose."
 )
 
 VISION_PROFILE = os.environ.get("YT_VISION_PROFILE", "trading").strip().lower()
@@ -583,6 +662,12 @@ def _gemini_extract_text(body: dict) -> str:
     if body.get("output_text"):
         return str(body["output_text"])
     return ""
+
+
+# Token usage from the most recent Gemini call. Read straight after a
+# call; it exists so a batch run can report spend without threading a
+# return value through every layer.
+_LAST_USAGE: dict = {"input": 0, "output": 0}
 
 
 def _gemini_headers(key: str) -> dict:
@@ -665,12 +750,106 @@ def _gemini_post(parts: list, timeout: int, max_tokens: int = 0) -> tuple:
 
         text = _gemini_extract_text(body)
         if text:
+            usage = body.get("usage") or {}
+            _LAST_USAGE["input"] = int(usage.get("total_input_tokens") or 0)
+            _LAST_USAGE["output"] = int(usage.get("total_output_tokens") or 0)
             return text, ""
         status = body.get("status") or "no text in response"
         last_error = f"empty model_output (status: {status})"
         if attempt == 1:
             return "", last_error
     return "", last_error
+
+
+def claims_from_segments(segments: list, window_start: float = 0.0) -> list:
+    """Turn typed segments into claims WITHOUT parsing any prose.
+
+    Every claim here is a field the model filled in, not a string a regex
+    guessed at. The regex path still runs over the free text as a second
+    opinion, but nothing in this function can mistake a clock for a period.
+    """
+    claims: list[dict] = []
+    if not isinstance(segments, list):
+        return claims
+
+    def ts_seconds(label: str) -> float:
+        parts = [p for p in str(label).strip().split(":") if p.strip().isdigit()]
+        if not parts:
+            return float(window_start)
+        nums = [int(p) for p in parts]
+        while len(nums) < 3:
+            nums.insert(0, 0)
+        return float(nums[0] * 3600 + nums[1] * 60 + nums[2])
+
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+        stamp = str(seg.get("timestamp") or "").strip()
+        secs = ts_seconds(stamp)
+        label = stamp or _hhmmss(secs)
+
+        def add(claim: str, ctype: str) -> None:
+            claims.append({
+                "timestamp": secs,
+                "timestamp_str": label,
+                "claim": claim,
+                "source": "visual_segment",
+                "type": ctype,
+            })
+
+        instrument = str(seg.get("instrument") or "").strip()
+        timeframe = str(seg.get("timeframe") or "").strip()
+        # The model is told to leave these empty rather than guess, but it
+        # still reaches for filler now and then. Filler is worse than absence.
+        if instrument and instrument.lower() not in _NOT_A_VALUE:
+            add(f"Instrument: {instrument}", "instrument")
+        if timeframe and timeframe.lower() not in _NOT_A_VALUE:
+            add(f"Timeframe: {timeframe}", "timeframe")
+
+        chart_type = str(seg.get("chart_type") or "").strip()
+        if chart_type and chart_type.lower() not in _NOT_A_VALUE:
+            add(chart_type.lower(), "chart_pattern")
+        trend = str(seg.get("trend") or "").strip()
+        if trend and trend.lower() not in _NOT_A_VALUE:
+            add(trend.lower(), "chart_pattern")
+
+        for ind in seg.get("indicators") or []:
+            if not isinstance(ind, dict):
+                continue
+            name = str(ind.get("name") or "").strip()
+            if not name or name.lower() in _NOT_A_VALUE:
+                continue
+            period = str(ind.get("period") or "").strip()
+            if period and period.lower() not in _NOT_A_VALUE:
+                add(f"{name.upper()} = {period}", "indicator_setting")
+            else:
+                add(f"{name.upper()} present", "indicator_present")
+
+        for kind, ctype in (("drawn", "chart_pattern"),
+                            ("patterns", "chart_pattern"),
+                            ("levels", "price_level")):
+            for item in seg.get(kind) or []:
+                text = str(item or "").strip()
+                if text and text.lower() not in _NOT_A_VALUE:
+                    add(text, ctype)
+
+    # Same claim from the same second twice is noise, not evidence.
+    seen: set = set()
+    unique: list[dict] = []
+    for c in claims:
+        key = (c["type"], c["claim"].lower(), c["timestamp"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(c)
+    return unique
+
+
+# Filler the model emits when it cannot read something. Treated as absence.
+_NOT_A_VALUE = {
+    "", "n/a", "na", "none", "null", "unknown", "unidentified",
+    "unidentified asset", "not visible", "not shown", "not legible",
+    "unspecified", "no chart", "empty", "-",
+}
 
 
 def _parse_vision_json(answer: str) -> tuple:
@@ -690,21 +869,28 @@ def _parse_vision_json(answer: str) -> tuple:
             except Exception:
                 parsed = None
     if isinstance(parsed, dict):
+        segs = parsed.get("segments")
         return (
             str(parsed.get("on_screen_text") or ""),
             str(parsed.get("chart_description") or ""),
+            segs if isinstance(segs, list) else [],
         )
-    return answer, ""
+    return answer, "", []
 
 
-def _finish_reading(out: dict, text: str, chart: str) -> dict:
+def _finish_reading(out: dict, text: str, chart: str,
+                    segments: list | None = None) -> dict:
     """Normalise text/chart into the reading dict every caller expects."""
     text = re.sub(r"\n{3,}", "\n\n", text.replace("\\n", "\n")).strip()
     chart = re.sub(r"\n{3,}", "\n\n", chart.replace("\\n", "\n")).strip()
     out["text"] = text
     out["lines"] = [l.strip() for l in text.split("\n") if l.strip()]
     out["chart"] = chart
-    out["has_content"] = len(text) >= MIN_TEXT_LEN or len(chart) >= MIN_TEXT_LEN
+    out["segments"] = segments or []
+    out["has_content"] = (
+        len(text) >= MIN_TEXT_LEN or len(chart) >= MIN_TEXT_LEN
+        or bool(out["segments"])
+    )
     return out
 
 
@@ -735,8 +921,8 @@ def _read_frame_gemini(frame_path: Path, timestamp: float,
     if error:
         out["error"] = error
         return out
-    text, chart = _parse_vision_json(answer.strip())
-    return _finish_reading(out, text, chart)
+    text, chart, segs = _parse_vision_json(answer.strip())
+    return _finish_reading(out, text, chart, segs)
 
 
 def _hhmmss(seconds: float) -> str:
@@ -804,8 +990,8 @@ def analyze_youtube_video(url: str, prompt: str = "", start_s: float = 0.0,
     if error:
         out["error"] = error
         return out
-    text, chart = _parse_vision_json(answer.strip())
-    return _finish_reading(out, text, chart)
+    text, chart, segs = _parse_vision_json(answer.strip())
+    return _finish_reading(out, text, chart, segs)
 
 
 def video_windows(duration: float, chunk: int = 0) -> list:
@@ -1117,6 +1303,8 @@ def empty_result(enable_visual: bool = False) -> dict:
         "provider": resolve_provider(),
         "mode": "frames",
         "windows": 0,
+        "segments": [],
+        "usage": {"input_tokens": 0, "output_tokens": 0},
         "frame_errors": [],
         "visual_claims": [],
         "on_screen_texts": [],
@@ -1186,6 +1374,7 @@ def extract_visual_content(
                 )
 
             claims: list[dict] = []
+            all_segments: list[dict] = []
             texts: list[dict] = []
             charts: list[dict] = []
             analyses: list[dict] = []
@@ -1221,6 +1410,17 @@ def extract_visual_content(
                 ts = float(w_start)
                 ts_str = _hhmmss(ts)
 
+                segs = reading.get("segments") or []
+                if segs:
+                    for seg in segs:
+                        if isinstance(seg, dict):
+                            seg.setdefault("window_start", ts)
+                    all_segments.extend(segs)
+                    claims.extend(claims_from_segments(segs, ts))
+
+                result["usage"]["input_tokens"] += _LAST_USAGE.get("input", 0)
+                result["usage"]["output_tokens"] += _LAST_USAGE.get("output", 0)
+
                 if reading["text"]:
                     texts.append({
                         "timestamp": ts,
@@ -1252,6 +1452,7 @@ def extract_visual_content(
             result["on_screen_texts"] = texts
             result["chart_patterns"] = charts
             result["frame_analyses"] = analyses
+            result["segments"] = all_segments
             result["visual_claims"] = claims
 
             if result["frames_analyzed"] == 0:
