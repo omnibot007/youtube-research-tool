@@ -24,10 +24,12 @@ from __future__ import annotations
 import base64
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -670,6 +672,54 @@ def _gemini_extract_text(body: dict) -> str:
 _LAST_USAGE: dict = {"input": 0, "output": 0}
 
 
+# --- Retry, backoff and throttle (added 2026-09-02) -------------------------
+# A batch run against a rate-limited gateway will meet 429s. Before this, one
+# 429 lost a whole 30-minute window of video with no way to recover it short
+# of re-running (and re-paying for) the entire request.
+GEMINI_MAX_RETRIES = int(os.environ.get("YT_GEMINI_MAX_RETRIES", "4"))
+GEMINI_RETRY_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
+# Seconds between calls. 0 disables. Raise it if a provider is strict.
+GEMINI_MIN_INTERVAL = float(os.environ.get("YT_GEMINI_MIN_INTERVAL", "0"))
+# Ceiling so a long Retry-After cannot park a batch for an hour.
+GEMINI_MAX_BACKOFF = float(os.environ.get("YT_GEMINI_MAX_BACKOFF", "60"))
+
+_LAST_CALL_AT = [0.0]
+
+
+def _throttle() -> None:
+    """Keep at least GEMINI_MIN_INTERVAL seconds between outbound calls."""
+    if GEMINI_MIN_INTERVAL <= 0:
+        return
+    gap = time.time() - _LAST_CALL_AT[0]
+    if gap < GEMINI_MIN_INTERVAL:
+        time.sleep(GEMINI_MIN_INTERVAL - gap)
+    _LAST_CALL_AT[0] = time.time()
+
+
+def _backoff(attempt: int) -> float:
+    """Exponential backoff with jitter, capped.
+
+    Jitter matters: several windows retrying in lockstep would otherwise hit
+    the same limit at the same instant and fail together again.
+    """
+    base = min(GEMINI_MAX_BACKOFF, 2.0 ** attempt)
+    return base * (0.5 + random.random() * 0.5)
+
+
+def _retry_after(err) -> float:
+    """Honour a Retry-After header when the server sends one."""
+    try:
+        raw = (err.headers or {}).get("Retry-After")
+    except Exception:
+        return 0.0
+    if not raw:
+        return 0.0
+    try:
+        return min(GEMINI_MAX_BACKOFF, max(0.0, float(str(raw).strip())))
+    except ValueError:
+        return 0.0
+
+
 def _gemini_headers(key: str) -> dict:
     """Build request headers for Google or for a compatible proxy.
 
@@ -697,9 +747,15 @@ def _gemini_headers(key: str) -> dict:
 def _gemini_post(parts: list, timeout: int, max_tokens: int = 0) -> tuple:
     """POST one Interactions request. Returns (text, error). Never raises.
 
-    Retries once with the optional blocks stripped if the server rejects the
-    request, so an unrecognised generation_config or response_format key
-    degrades to a plain call instead of failing the frame outright.
+    Three layers of resilience, each earned:
+      1. Transient failures (429, 5xx, socket errors) retry with exponential
+         backoff and jitter, honouring Retry-After when the server sends it.
+         Without this one 429 silently drops a 30-minute window of video.
+      2. A rejection of the rich payload retries once as a plain call, so an
+         unrecognised generation_config or response_format degrades instead of
+         failing the whole read.
+      3. A minimum interval between calls, because batch runs otherwise fire
+         as fast as the loop allows and earn a rate limit.
     """
     key = gemini_key()
     if not key:
@@ -725,28 +781,51 @@ def _gemini_post(parts: list, timeout: int, max_tokens: int = 0) -> tuple:
 
     last_error = ""
     for attempt, payload in enumerate((full, minimal)):
-        try:
-            req = urllib.request.Request(
-                GEMINI_ENDPOINT,
-                data=json.dumps(payload).encode("utf-8"),
-                headers=_gemini_headers(key),
-            )
-            with urllib.request.urlopen(req, timeout=timeout) as response:
-                body = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            detail = ""
+        body = None
+        for retry in range(GEMINI_MAX_RETRIES + 1):
+            _throttle()
             try:
-                detail = e.read().decode("utf-8", "replace")[:300]
-            except Exception:
-                pass
-            last_error = f"HTTP {e.code}: {detail or e.reason}"
-            # 4xx on the rich payload is worth one plain retry; 401/403/429 are
-            # not about the payload at all, so stop immediately.
-            if e.code in (401, 403, 404, 429) or attempt == 1:
+                req = urllib.request.Request(
+                    GEMINI_ENDPOINT,
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers=_gemini_headers(key),
+                )
+                with urllib.request.urlopen(req, timeout=timeout) as response:
+                    body = json.loads(response.read().decode("utf-8"))
+                break
+            except urllib.error.HTTPError as e:
+                detail = ""
+                try:
+                    detail = e.read().decode("utf-8", "replace")[:300]
+                except Exception:
+                    pass
+                last_error = f"HTTP {e.code}: {detail or e.reason}"
+                if e.code in GEMINI_RETRY_CODES and retry < GEMINI_MAX_RETRIES:
+                    wait = _retry_after(e) or _backoff(retry)
+                    print(f"  [visual] {last_error.splitlines()[0][:90]} -- "
+                          f"retry {retry + 1}/{GEMINI_MAX_RETRIES} in "
+                          f"{wait:.0f}s", file=sys.stderr)
+                    time.sleep(wait)
+                    continue
+                # 401/403/404 are about the request, not the moment.
+                if e.code in (401, 403, 404) or attempt == 1:
+                    return "", last_error
+                break
+            except Exception as e:
+                last_error = f"{type(e).__name__}: {e}"
+                if retry < GEMINI_MAX_RETRIES:
+                    wait = _backoff(retry)
+                    print(f"  [visual] {last_error[:90]} -- retry "
+                          f"{retry + 1}/{GEMINI_MAX_RETRIES} in {wait:.0f}s",
+                          file=sys.stderr)
+                    time.sleep(wait)
+                    continue
+                return "", last_error
+
+        if body is None:
+            if attempt == 1:
                 return "", last_error
             continue
-        except Exception as e:
-            return "", f"{type(e).__name__}: {e}"
 
         text = _gemini_extract_text(body)
         if text:
@@ -761,7 +840,117 @@ def _gemini_post(parts: list, timeout: int, max_tokens: int = 0) -> tuple:
     return "", last_error
 
 
-def claims_from_segments(segments: list, window_start: float = 0.0) -> list:
+# --- Normalisation (added 2026-09-02) ---------------------------------------
+# A corpus is only queryable if the same thing has the same name in it. One
+# live run produced "BTC/USD" and "BTCUSD" from the same video, and timeframes
+# arrive as "15m", "15 min", "M15" and "15-minute" depending on how the chart
+# was labelled. Normalising at claim time means a later query does not have to
+# know every spelling. The raw string is always kept alongside.
+
+_TICKER_SEPARATORS = str.maketrans({"/": "", "-": "", "_": "", ":": "", " ": ""})
+
+# Vendor prefixes that are venue, not instrument.
+_TICKER_VENUES = ("BINANCE", "COINBASE", "BITSTAMP", "OANDA", "FX", "FXCM",
+                  "NASDAQ", "NYSE", "AMEX", "CME", "ICE", "FOREXCOM",
+                  "CAPITALCOM", "PEPPERSTONE", "TVC", "CRYPTOCAP")
+
+
+def normalize_ticker(raw: str) -> str:
+    """BTC/USD, BINANCE:BTCUSDT, btc-usd -> BTCUSD-ish canonical form.
+
+    Deliberately conservative: it uppercases, strips a venue prefix and drops
+    separators. It does NOT try to map BTCUSDT to BTCUSD, because those are
+    genuinely different instruments.
+    """
+    text = str(raw or "").strip()
+    if not text or text.lower() in _NOT_A_VALUE:
+        return ""
+    if ":" in text:
+        head, _, tail = text.partition(":")
+        if head.strip().upper() in _TICKER_VENUES:
+            text = tail
+    return text.upper().translate(_TICKER_SEPARATORS)
+
+
+_TF_UNITS = {
+    "m": "m", "min": "m", "mins": "m", "minute": "m", "minutes": "m",
+    "h": "h", "hr": "h", "hrs": "h", "hour": "h", "hours": "h",
+    "d": "d", "day": "d", "days": "d", "daily": "d",
+    "w": "w", "week": "w", "weeks": "w", "weekly": "w",
+    "mo": "M", "month": "M", "months": "M", "monthly": "M",
+}
+
+
+def normalize_timeframe(raw: str) -> str:
+    """15 min / M15 / 15-minute / 15m -> 15m. Daily -> 1d. Empty if unclear."""
+    text = str(raw or "").strip().lower()
+    if not text or text in _NOT_A_VALUE:
+        return ""
+    for word, unit in (("daily", "1d"), ("weekly", "1w"), ("monthly", "1M"),
+                       ("hourly", "1h")):
+        if text == word:
+            return unit
+    # MetaTrader style: M15, H4, D1
+    m = re.fullmatch(r"([mhdw])\s*(\d{1,3})", text)
+    if m:
+        return f"{m.group(2)}{_TF_UNITS.get(m.group(1), m.group(1))}"
+    m = re.fullmatch(r"(\d{1,3})\s*-?\s*([a-z]{1,7})", text)
+    if m and m.group(2) in _TF_UNITS:
+        return f"{m.group(1)}{_TF_UNITS[m.group(2)]}"
+    return ""
+
+
+_INDICATOR_ALIASES = {
+    "relative strength index": "RSI",
+    "moving average convergence divergence": "MACD",
+    "exponential moving average": "EMA",
+    "simple moving average": "SMA",
+    "weighted moving average": "WMA",
+    "moving average": "MA",
+    "average true range": "ATR",
+    "bollinger bands": "BOLLINGER",
+    "bollinger band": "BOLLINGER",
+    "volume weighted average price": "VWAP",
+    "average directional index": "ADX",
+    "on balance volume": "OBV",
+    "on-balance volume": "OBV",
+    "commodity channel index": "CCI",
+    "stochastic oscillator": "STOCHASTIC",
+    "stoch": "STOCHASTIC",
+    "triple exponential moving average": "TEMA",
+    "ichimoku cloud": "ICHIMOKU",
+    "fibonacci retracement": "FIBONACCI",
+}
+
+
+def normalize_indicator(raw: str) -> str:
+    """Relative Strength Index / rsi -> RSI. Unknown names just uppercase."""
+    text = str(raw or "").strip()
+    if not text or text.lower() in _NOT_A_VALUE:
+        return ""
+    key = re.sub(r"\s+", " ", text.lower()).strip(" ()")
+    if key in _INDICATOR_ALIASES:
+        return _INDICATOR_ALIASES[key]
+    # "RSI (14)" or "EMA 200" -- keep only the name part
+    head = re.split(r"[\(\d]", text, 1)[0].strip()
+    return (head or text).upper()
+
+
+def segment_timestamp_ok(seconds: float, window_start: float,
+                         window_end: float, slack: float = 120.0) -> bool:
+    """Is a segment's own timestamp plausible for the window it came from?
+
+    A clipped model sometimes reports a position outside the clip it was
+    shown. Without this the merged timeline silently gains impossible entries.
+    Slack absorbs rounding at the edges.
+    """
+    if not window_end or window_end <= window_start:
+        return True
+    return (window_start - slack) <= seconds <= (window_end + slack)
+
+
+def claims_from_segments(segments: list, window_start: float = 0.0,
+                         window_end: float = 0.0) -> list:
     """Turn typed segments into claims WITHOUT parsing any prose.
 
     Every claim here is a field the model filled in, not a string a regex
@@ -797,13 +986,16 @@ def claims_from_segments(segments: list, window_start: float = 0.0) -> list:
                 "type": ctype,
             })
 
-        instrument = str(seg.get("instrument") or "").strip()
-        timeframe = str(seg.get("timeframe") or "").strip()
-        # The model is told to leave these empty rather than guess, but it
-        # still reaches for filler now and then. Filler is worse than absence.
-        if instrument and instrument.lower() not in _NOT_A_VALUE:
+        # A clipped model sometimes reports a position outside the clip it
+        # was actually shown. Dropping those keeps the merged timeline honest.
+        if not segment_timestamp_ok(secs, window_start, window_end):
+            continue
+
+        instrument = normalize_ticker(seg.get("instrument"))
+        timeframe = normalize_timeframe(seg.get("timeframe"))
+        if instrument:
             add(f"Instrument: {instrument}", "instrument")
-        if timeframe and timeframe.lower() not in _NOT_A_VALUE:
+        if timeframe:
             add(f"Timeframe: {timeframe}", "timeframe")
 
         chart_type = str(seg.get("chart_type") or "").strip()
@@ -816,14 +1008,14 @@ def claims_from_segments(segments: list, window_start: float = 0.0) -> list:
         for ind in seg.get("indicators") or []:
             if not isinstance(ind, dict):
                 continue
-            name = str(ind.get("name") or "").strip()
-            if not name or name.lower() in _NOT_A_VALUE:
+            name = normalize_indicator(ind.get("name"))
+            if not name:
                 continue
             period = str(ind.get("period") or "").strip()
             if period and period.lower() not in _NOT_A_VALUE:
-                add(f"{name.upper()} = {period}", "indicator_setting")
+                add(f"{name} = {period}", "indicator_setting")
             else:
-                add(f"{name.upper()} present", "indicator_present")
+                add(f"{name} present", "indicator_present")
 
         for kind, ctype in (("drawn", "chart_pattern"),
                             ("patterns", "chart_pattern"),
@@ -841,6 +1033,9 @@ def claims_from_segments(segments: list, window_start: float = 0.0) -> list:
         if key not in seen:
             seen.add(key)
             unique.append(c)
+    # Chronological, so a merged multi-window timeline reads in order even when
+    # the model emits segments out of sequence inside a window.
+    unique.sort(key=lambda c: (c["timestamp"], c["type"], c["claim"]))
     return unique
 
 
@@ -1305,6 +1500,9 @@ def empty_result(enable_visual: bool = False) -> dict:
         "windows": 0,
         "segments": [],
         "usage": {"input_tokens": 0, "output_tokens": 0},
+        "duration_seconds": 0,
+        "covered_seconds": 0,
+        "coverage_pct": 0.0,
         "frame_errors": [],
         "visual_claims": [],
         "on_screen_texts": [],
@@ -1373,8 +1571,10 @@ def extract_visual_content(
                     file=sys.stderr,
                 )
 
+            result["duration_seconds"] = int(duration or 0)
             claims: list[dict] = []
             all_segments: list[dict] = []
+            covered = 0.0
             texts: list[dict] = []
             charts: list[dict] = []
             analyses: list[dict] = []
@@ -1407,6 +1607,7 @@ def extract_visual_content(
                     continue
 
                 result["frames_analyzed"] += 1
+                covered += (float(w_end) - float(w_start)) if windows else float(duration or 0)
                 ts = float(w_start)
                 ts_str = _hhmmss(ts)
 
@@ -1416,7 +1617,8 @@ def extract_visual_content(
                         if isinstance(seg, dict):
                             seg.setdefault("window_start", ts)
                     all_segments.extend(segs)
-                    claims.extend(claims_from_segments(segs, ts))
+                    claims.extend(
+                        claims_from_segments(segs, ts, float(w_end)))
 
                 result["usage"]["input_tokens"] += _LAST_USAGE.get("input", 0)
                 result["usage"]["output_tokens"] += _LAST_USAGE.get("output", 0)
@@ -1448,6 +1650,16 @@ def extract_visual_content(
                     "lines": reading["lines"],
                     "chart": reading["chart"],
                 })
+
+            result["covered_seconds"] = int(covered)
+            if duration:
+                result["coverage_pct"] = round(100.0 * covered / duration, 1)
+            # A partly-covered video is not a failed one, but pretending it is
+            # complete is how a gap becomes a silent hole in the corpus.
+            if result["frames_failed"] and result["frames_analyzed"]:
+                print(f"  [visual] PARTIAL: {result['coverage_pct']}% covered, "
+                      f"{result['frames_failed']} window(s) failed",
+                      file=sys.stderr)
 
             result["on_screen_texts"] = texts
             result["chart_patterns"] = charts

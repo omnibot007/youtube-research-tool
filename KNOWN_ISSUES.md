@@ -352,6 +352,49 @@ that looks like data is worse than no data.
 Token usage is captured per run and reported by `extract_batch.py`, with
 `YT_PRICE_IN` / `YT_PRICE_OUT` for non-Google pricing.
 
+### Batch hardening (2026-09-02)
+
+Fifteen changes made before the first real corpus run, because every one of
+them is cheaper to have than to retrofit once packages exist.
+
+**Resilience.** Transient failures (429, 408/409/425, 5xx, socket errors) now
+retry with exponential backoff and jitter, honouring `Retry-After` when sent
+and capping it so a long header cannot park a batch. Before this a single 429
+silently lost a whole 30-minute window of video. `YT_GEMINI_MIN_INTERVAL`
+throttles outbound calls for strict gateways. Auth failures (401/403/404) are
+deliberately NOT retried; they are about the request, not the moment.
+
+**Coverage is now explicit.** `coverage_pct`, `covered_seconds` and
+`duration_seconds` are reported, and a run that loses windows prints
+`PARTIAL: N% covered`. A partly-covered video is not a failed one, but
+pretending it is complete is how a gap becomes a silent hole in a corpus.
+
+**Normalisation.** `BTC/USD`, `BINANCE:BTCUSD` and `btc-usd` all become
+BTCUSD; `15 min`, `M15` and `15-minute` all become `15m`; `Relative Strength
+Index` and `stoch` become RSI and STOCHASTIC. Unparseable values return EMPTY
+rather than a guess. Applied at write time AND at read time in `corpus.py`,
+because packages extracted before the normalisers existed cannot be re-run
+without paying again.
+
+**Window sanity.** A clipped model sometimes reports a position outside the
+clip it was shown; those segments are dropped instead of corrupting the merged
+timeline. Claims come back chronological.
+
+**`extract_batch.py`** skips videos that already have a good package, so a
+20-video run that dies at 15 costs nothing for the first 14. A cached package
+only counts if it parses AND holds claims, so one bad run cannot poison the
+corpus permanently. `--dry-run` prices a batch with no API calls. `--force`
+ignores the cache. Timeouts now scale with duration instead of stranding long
+videos. Token usage and estimated cost are reported per run.
+
+**`corpus.py` is new.** A single video is worth very little; the value is
+cross-video. It flattens every package into one claim table with full
+provenance (video, timestamp, source, model, and a deep link to the exact
+second), writes CSV or JSONL, filters by type/instrument/regex, and reports
+which indicators are taught with DIFFERENT periods across videos. That last
+one is the corpus earning its keep: it already found MACD taught as `12` in
+one video and `12 26 9` in another.
+
 ### Remaining debt
 
 - **Two bugs shipped green and only a live run caught them.** 360 offline

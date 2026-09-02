@@ -838,3 +838,151 @@ class TestTypedSegments:
         assert visual.claims_from_segments(None) == []
         assert visual.claims_from_segments(["not a dict", 7]) == []
         assert visual.claims_from_segments([{"timestamp": "x"}]) == []
+
+
+class TestNormalisation:
+    """A corpus is only queryable if the same thing has one name in it."""
+
+    def test_tickers_collapse_to_one_form(self):
+        for raw in ("BTC/USD", "btc-usd", "BTC USD", "BINANCE:BTCUSD"):
+            assert visual.normalize_ticker(raw) == "BTCUSD", raw
+
+    def test_venue_prefix_is_stripped_but_the_pair_is_not_rewritten(self):
+        assert visual.normalize_ticker("BINANCE:BTCUSDT") == "BTCUSDT"
+
+    def test_filler_ticker_becomes_empty(self):
+        assert visual.normalize_ticker("unidentified asset") == ""
+        assert visual.normalize_ticker("") == ""
+
+    def test_timeframes_collapse_across_spellings(self):
+        for raw in ("15m", "15 min", "M15", "15-minute", "15 minutes"):
+            assert visual.normalize_timeframe(raw) == "15m", raw
+
+    def test_word_timeframes(self):
+        assert visual.normalize_timeframe("Daily") == "1d"
+        assert visual.normalize_timeframe("weekly") == "1w"
+        assert visual.normalize_timeframe("4H") == "4h"
+
+    def test_unparseable_timeframe_returns_empty_not_a_guess(self):
+        assert visual.normalize_timeframe("soon") == ""
+        assert visual.normalize_timeframe("1") == ""
+
+    def test_indicator_aliases(self):
+        assert visual.normalize_indicator("Relative Strength Index") == "RSI"
+        assert visual.normalize_indicator("stoch") == "STOCHASTIC"
+        assert visual.normalize_indicator("rsi") == "RSI"
+
+    def test_indicator_keeps_only_the_name(self):
+        assert visual.normalize_indicator("RSI (14)") == "RSI"
+        assert visual.normalize_indicator("EMA 200") == "EMA"
+
+    def test_claims_use_normalised_names(self):
+        seg = {"timestamp": "00:10", "instrument": "BTC/USD",
+               "timeframe": "15 min", "chart_type": "", "trend": "",
+               "indicators": [{"name": "Relative Strength Index",
+                               "period": "14"}],
+               "drawn": [], "patterns": [], "levels": []}
+        got = {c["claim"] for c in visual.claims_from_segments([seg])}
+        assert "Instrument: BTCUSD" in got
+        assert "Timeframe: 15m" in got
+        assert "RSI = 14" in got
+
+
+class TestWindowSanity:
+    def test_timestamp_inside_the_window_is_kept(self):
+        assert visual.segment_timestamp_ok(1900, 1800, 3600) is True
+
+    def test_timestamp_far_outside_the_window_is_rejected(self):
+        assert visual.segment_timestamp_ok(99999, 1800, 3600) is False
+
+    def test_unwindowed_calls_accept_anything(self):
+        assert visual.segment_timestamp_ok(99999, 0, 0) is True
+
+    def test_out_of_window_segments_are_dropped_from_claims(self):
+        seg = {"timestamp": "09:00:00", "instrument": "BTCUSD",
+               "timeframe": "", "chart_type": "", "trend": "",
+               "indicators": [], "drawn": [], "patterns": [], "levels": []}
+        assert visual.claims_from_segments([seg], 1800.0, 3600.0) == []
+
+    def test_claims_come_back_chronological(self):
+        segs = [
+            {"timestamp": "00:00:30", "instrument": "ETHUSD", "timeframe": "",
+             "chart_type": "", "trend": "", "indicators": [], "drawn": [],
+             "patterns": [], "levels": []},
+            {"timestamp": "00:00:10", "instrument": "BTCUSD", "timeframe": "",
+             "chart_type": "", "trend": "", "indicators": [], "drawn": [],
+             "patterns": [], "levels": []},
+        ]
+        stamps = [c["timestamp"] for c in visual.claims_from_segments(segs)]
+        assert stamps == sorted(stamps)
+
+
+class TestRetryPolicy:
+    """One 429 used to lose a whole 30-minute window of video."""
+
+    def test_transient_codes_are_retryable_and_auth_codes_are_not(self):
+        for code in (429, 500, 502, 503, 504):
+            assert code in visual.GEMINI_RETRY_CODES
+        for code in (401, 403, 404):
+            assert code not in visual.GEMINI_RETRY_CODES
+
+    def test_backoff_grows_and_stays_capped(self):
+        assert visual._backoff(0) < visual._backoff(5) + 1e-9
+        assert visual._backoff(20) <= visual.GEMINI_MAX_BACKOFF
+
+    def test_backoff_is_jittered(self):
+        vals = {round(visual._backoff(4), 6) for _ in range(20)}
+        assert len(vals) > 1, "lockstep retries re-collide on the same limit"
+
+    def test_retry_after_header_is_honoured(self):
+        class E:
+            headers = {"Retry-After": "7"}
+        assert visual._retry_after(E()) == 7.0
+
+    def test_absurd_retry_after_is_capped(self):
+        class E:
+            headers = {"Retry-After": "99999"}
+        assert visual._retry_after(E()) == visual.GEMINI_MAX_BACKOFF
+
+    def test_missing_or_bad_retry_after_is_zero(self):
+        class E:
+            headers = {}
+        class F:
+            headers = {"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}
+        assert visual._retry_after(E()) == 0.0
+        assert visual._retry_after(F()) == 0.0
+
+    def test_a_429_is_retried_then_succeeds(self, monkeypatch, tmp_path):
+        calls = {"n": 0}
+
+        class FakeResp:
+            def read(self):
+                return json.dumps({"steps": [{"type": "model_output", "content": [
+                    {"type": "text", "text": json.dumps(
+                        {"on_screen_text": "RSI Length 14",
+                         "chart_description": "", "segments": []})}]}]}).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def flaky(req, timeout=0):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise visual.urllib.error.HTTPError(
+                    "u", 429, "Too Many Requests", {}, None)
+            return FakeResp()
+
+        monkeypatch.setattr(visual, "VISION_PROVIDER", "gemini")
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key-not-a-real-secret")
+        monkeypatch.setattr(visual.time, "sleep", lambda s: None)
+        monkeypatch.setattr(visual.urllib.request, "urlopen", flaky)
+        from PIL import Image
+        frame = tmp_path / "f.png"
+        Image.new("RGB", (64, 64), (0, 0, 0)).save(frame)
+        reading = visual.read_frame(frame, 0.0)
+        assert calls["n"] == 2, "the 429 was not retried"
+        assert not reading.get("error")
+        assert "RSI Length 14" in reading["text"]
