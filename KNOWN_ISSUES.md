@@ -176,6 +176,143 @@ and the CLI flag did not exist. Restored 2026-08-04 as `visual.py`.
   `YT_FRAME_INTERVAL`, `YT_MAX_FRAMES`, `YT_VISUAL_TARGET_FRAMES`,
   `YT_FRAME_HASH_DISTANCE`.
 
+
+### 2026-09-02 — it had never actually run here, and three things blocked it
+
+`--visual` was documented as working and restored in code, but no end-to-end
+run had ever been verified on this machine. Three independent blockers, each
+measured, each with a receipt:
+
+**1. Ollama was not running.** `ollama --version` hung, then reported
+`Warning: could not connect to a running Ollama instance`. `vision_available()`
+correctly returned false, the scrape correctly did not crash, and the feature
+correctly produced nothing. Starting the server fixed the gate, not the
+pipeline.
+
+**2. A single frame exceeds the timeout on this GPU.** With Ollama up and
+`YT_VISION_MODEL=qwen2.5vl:3b`, a real run reached inference and died there:
+
+    [visual] 1 unique frames; reading with qwen2.5vl:3b
+    [visual] frame 1/1 at 00:00...
+    [visual] frame 1 failed: TimeoutError: timed out
+
+That is one 768px frame exceeding `YT_VISION_TIMEOUT=300`. **The Round 3
+comment in `visual.py` is wrong about this card.** It says a 7B at ctx 2048
+"fits the T1000 fully (5.0 GB, VRAM flat)" and justifies `num_gpu=99`.
+`nvidia-smi` here reports **4096 MiB total**, so a 5.0 GB model cannot fully
+offload, and forcing `num_gpu=99` is asking for exactly the thrash observed.
+Either that measurement came from an 8 GB T1000 variant or it was never taken
+on this machine. Treat the 43.5s/frame figure as unverified on this hardware.
+
+**3. The video cannot be downloaded at all.** `yt-dlp` gets
+`HTTP Error 403: Forbidden` from YouTube, and every cookie source fails:
+
+| Source | Result |
+|---|---|
+| chrome | `Could not copy Chrome cookie database` (locked by a running Chrome) |
+| edge | `Failed to decrypt with DPAPI` (app-bound encryption) |
+| brave | not installed |
+| firefox | not installed |
+
+So on this machine the frame path is blocked before inference even matters.
+
+### The fix: a provider seam, and a path that needs no download
+
+`read_frame()` was a single-function seam. It now dispatches on
+`YT_VISION_PROVIDER` (`auto` | `ollama` | `gemini`). `auto` selects Gemini only
+when `GEMINI_API_KEY` is present, so a machine without a key is unaffected.
+
+`analyze_youtube_video()` sends the YouTube URL straight to Gemini. Google
+fetches the video server-side, so it bypasses blockers 2 and 3 entirely: no
+download, no ffmpeg, no local GPU, and one request in place of
+download + extract + dedup + N inferences.
+
+**Gemini schema provenance (Rule 2).** Verified 2026-09-02 against
+`ai.google.dev` `gemini-api/docs/quickstart`, `/image-understanding`,
+`/video-understanding`, `api/interactions.md.txt` and
+`gemini-api/docs/interactions/structured-output.md.txt`. Google replaced
+`generateContent` with the **Interactions API**:
+
+- `POST https://generativelanguage.googleapis.com/v1beta/interactions`
+- headers `x-goog-api-key` and `Api-Revision: 2026-05-20`
+- body `{"model": ..., "input": [{"type":"text",...},{"type":"image","data":<b64>,"mime_type":"image/jpeg"}]}`
+- a video part is `{"type":"video","uri":"<youtube url>"}`, no mime_type needed,
+  public videos only
+- response text at `steps[] -> type "model_output" -> content[] -> type "text" -> text`;
+  the pre-June-2026 `outputs[]` shape is also accepted so a revision change
+  cannot silently blank a reading
+- `response_format` with a JSON schema makes the two-key output contract a
+  server-side guarantee instead of a polite request
+
+**Not yet verified live.** Every Gemini test is offline: the request shape and
+the parser are pinned against the vendor's own documented example, but no real
+call has been made from this machine because no API key is present. Get a free
+one at `aistudio.google.com/apikey`, set `GEMINI_API_KEY`, and the first real
+run is the remaining acceptance test.
+
+### Silent failure fixed
+
+A run that failed every frame reported `vision_error: ""`, because per-frame
+errors only went to stderr. Measured: `frames_extracted 1`,
+`frames_after_dedup 1`, `frames_analyzed 0`, `frames_failed 1`,
+`vision_error ""`. Per-frame errors now land in `result["frame_errors"]`, and
+an all-frames-failed run sets `vision_error`.
+
+### Claims now come from chart descriptions too
+
+`extract_visual_claims()` ran only on `on_screen_text`, never on
+`chart_description` — so the field that carries the candlestick and indicator
+content produced no claims at all. It now runs on both (chart claims carry
+`source: "visual_chart"`), and the parser learned prose, which is what a chart
+description is:
+
+| Input | Claim |
+|---|---|
+| `RSI(14) sub-panel` | `RSI = 14` (indicator_setting) |
+| `a 200-period EMA` | `EMA = 200` (indicator_setting) |
+| `RSI(14) ... oversold below 30` | `RSI below 30` (indicator_threshold) |
+| `bullish divergence`, `double top` | chart_pattern |
+| `stop loss at 2350.5` | `Stop Loss at 2350.5` (price_level) |
+
+Unsigned levels needed their own rule: the original price matcher requires a
+currency symbol, which forex and crypto never show.
+
+### Trading profile is now the default
+
+The old prompt asked for "one sentence describing any chart", which on a
+TradingView screenshot yields something true and useless. `TRADING_PROMPT`
+asks for chart type, instrument, timeframe, named indicators with settings,
+drawn levels/trendlines/zones/Fibonacci, and named patterns, and forbids
+guessing a number the model cannot read. `YT_VISION_PROFILE=general` or
+`--visual-profile general` restores the old wording.
+
+### New tunables
+
+`YT_VISION_PROVIDER`, `YT_VISION_PROFILE`, `YT_VISUAL_MODE`,
+`YT_GEMINI_API_KEY` / `GEMINI_API_KEY` / `GOOGLE_API_KEY`, `YT_GEMINI_MODEL`,
+`YT_GEMINI_ENDPOINT`, `YT_GEMINI_API_REVISION`, `YT_GEMINI_TIMEOUT`,
+`YT_GEMINI_VIDEO_TIMEOUT`, `YT_GEMINI_MAX_TOKENS`, `YT_GEMINI_TARGET_FRAMES`.
+CLI equivalents: `--visual-provider`, `--visual-profile`, `--visual-mode`.
+
+### Remaining debt
+
+- **No live Gemini call has been made.** Offline contract tests only.
+- **`GEMINI_MODEL` default is `gemini-3.8-flash`**, taken from the quickstart
+  page on 2026-09-02. Model IDs vary across Google's own doc pages; if a run
+  returns HTTP 404 or 400, set `YT_GEMINI_MODEL` to a current ID.
+- **The local Ollama path stays unusable on this 4 GB card** for multi-frame
+  videos. It is kept as an offline fallback, not a recommendation. Before
+  trusting it, drop `YT_VISION_NUM_GPU` (let the scheduler split) and raise
+  `YT_VISION_TIMEOUT`; the `num_gpu=99` default is tuned for a card this
+  machine does not have.
+- **Video mode returns one aggregated reading**, timestamped inside the text
+  by the model rather than by the pipeline, so `frame_analyses` holds a single
+  entry at 00:00. Per-timestamp structure would need the frame path or a
+  follow-up parse of the model's own `MM:SS` prefixes.
+- **`--visual-mode video` saves no audit PNGs**, because it never downloads the
+  video. Use `--visual-mode frames` when you need frames on disk to check the
+  model against, and note that the download blocker above applies.
+
 ## Corpus tools (claim-graph / factcheck, added 2026-08-04)
 
 ### Claim-graph node identity is exact-text, not semantic
