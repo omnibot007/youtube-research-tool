@@ -272,11 +272,18 @@ download + extract + dedup + N inferences.
 - `response_format` with a JSON schema makes the two-key output contract a
   server-side guarantee instead of a polite request
 
-**Not yet verified live.** Every Gemini test is offline: the request shape and
-the parser are pinned against the vendor's own documented example, but no real
-call has been made from this machine because no API key is present. Get a free
-one at `aistudio.google.com/apikey`, set `GEMINI_API_KEY`, and the first real
-run is the remaining acceptance test.
+**VERIFIED LIVE 2026-09-02.** A real run against a chart-heavy RSI tutorial,
+provider `gemini`, mode `video`, `video_downloaded: false`,
+`frames_extracted: 0`, `vision_error: ""`, whole video in **15.6s**. Verbatim
+`chart_description`:
+
+    00:01 Candlestick chart, BTCUSD 1W, macro uptrend following bear market
+          low, RSI (14) with 14 SMA, no drawn levels or patterns.
+    05:22 Candlestick chart, BTCUSD 1D, 2021 bull market topping phase, weekly
+          RSI (14) SMA, drawn lines identifying regular bearish divergence.
+
+Chart type, instrument, timeframe, indicator with settings, drawn objects and
+named pattern -- all present, none downloaded, no local GPU touched.
 
 ### Silent failure fixed
 
@@ -324,7 +331,12 @@ CLI equivalents: `--visual-provider`, `--visual-profile`, `--visual-mode`.
 
 ### Remaining debt
 
-- **No live Gemini call has been made.** Offline contract tests only.
+- **Two bugs shipped green and only a live run caught them.** 360 offline
+  tests passed while the parser read MM:SS prefixes as indicator settings
+  ("00:29 RSI Settings" -> "RSI = 29", 4 of 11 bogus) and missed every real
+  colon-less setting ("RSI Length 14"). Contract tests pin the shape of data
+  you imagined; only real output shows its texture. Both fixed with regression
+  tests, but the lesson generalises to the rest of this pipeline.
 - **`GEMINI_MODEL` default is `gemini-3.8-flash`**, taken from the quickstart
   page on 2026-09-02. Model IDs vary across Google's own doc pages; if a run
   returns HTTP 404 or 400, set `YT_GEMINI_MODEL` to a current ID.
