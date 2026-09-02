@@ -735,3 +735,38 @@ class TestVideoClipRequest:
         text = payload["input"][0]["text"]
         assert "00:30:00" in text and "01:00:00" in text
         assert "ABSOLUTE" in text
+
+
+class TestProxyCompatibleAuth:
+    """Third-party gateways re-expose the native Gemini API but do not all
+    accept Google's header set (added 2026-09-02)."""
+
+    def test_google_default_uses_x_goog_and_pins_the_revision(self, monkeypatch):
+        monkeypatch.setattr(visual, "GEMINI_AUTH_STYLE", "x-goog")
+        monkeypatch.setattr(visual, "GEMINI_SEND_REVISION", True)
+        h = visual._gemini_headers("K")
+        assert h["x-goog-api-key"] == "K"
+        assert h["Api-Revision"] == visual.GEMINI_API_REVISION
+        assert "Authorization" not in h
+
+    def test_bearer_style_for_proxies(self, monkeypatch):
+        monkeypatch.setattr(visual, "GEMINI_AUTH_STYLE", "bearer")
+        h = visual._gemini_headers("K")
+        assert h["Authorization"] == "Bearer K"
+        assert "x-goog-api-key" not in h
+
+    def test_both_sends_either_header(self, monkeypatch):
+        monkeypatch.setattr(visual, "GEMINI_AUTH_STYLE", "both")
+        h = visual._gemini_headers("K")
+        assert h["Authorization"] == "Bearer K"
+        assert h["x-goog-api-key"] == "K"
+
+    def test_revision_can_be_dropped_for_strict_proxies(self, monkeypatch):
+        monkeypatch.setattr(visual, "GEMINI_SEND_REVISION", False)
+        assert "Api-Revision" not in visual._gemini_headers("K")
+
+    def test_endpoint_is_overridable_without_code_changes(self):
+        import os
+        assert os.environ.get("YT_GEMINI_ENDPOINT") or visual.GEMINI_ENDPOINT
+        # the constant is env-driven, which is what lets a proxy be swapped in
+        assert "YT_GEMINI_ENDPOINT" in open("visual.py", encoding="utf-8").read()

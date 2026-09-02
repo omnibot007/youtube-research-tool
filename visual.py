@@ -96,6 +96,12 @@ GEMINI_ENDPOINT = os.environ.get(
 )
 GEMINI_MODEL = os.environ.get("YT_GEMINI_MODEL", "gemini-3.8-flash")
 GEMINI_API_REVISION = os.environ.get("YT_GEMINI_API_REVISION", "2026-05-20")
+# Auth style, for third-party gateways that re-expose the native Gemini API.
+# "x-goog" (Google, default) | "bearer" | "both".
+GEMINI_AUTH_STYLE = os.environ.get("YT_GEMINI_AUTH", "x-goog").strip().lower()
+# Some proxies reject an Api-Revision header they do not recognise.
+GEMINI_SEND_REVISION = os.environ.get(
+    "YT_GEMINI_SEND_REVISION", "1").strip() not in ("0", "false", "no")
 GEMINI_TIMEOUT = int(os.environ.get("YT_GEMINI_TIMEOUT", "180"))
 GEMINI_VIDEO_TIMEOUT = int(os.environ.get("YT_GEMINI_VIDEO_TIMEOUT", "600"))
 GEMINI_MAX_TOKENS = int(os.environ.get("YT_GEMINI_MAX_TOKENS", "1024"))
@@ -579,6 +585,30 @@ def _gemini_extract_text(body: dict) -> str:
     return ""
 
 
+def _gemini_headers(key: str) -> dict:
+    """Build request headers for Google or for a compatible proxy.
+
+    Google's own endpoint authenticates with `x-goog-api-key`. Third-party
+    gateways that re-expose the native Gemini API (AiHubMix and similar) mostly
+    accept the same header, but some want `Authorization: Bearer`. Set
+    YT_GEMINI_AUTH=bearer for those, or YT_GEMINI_AUTH=both to send both, which
+    is harmless when only one is read.
+
+    Api-Revision pins Google's schema revision. A proxy that does not recognise
+    it can reject the whole request, so YT_GEMINI_SEND_REVISION=0 drops it.
+    The key is never logged, and never appears in any error string.
+    """
+    headers = {"Content-Type": "application/json"}
+    style = GEMINI_AUTH_STYLE
+    if style in ("bearer", "both"):
+        headers["Authorization"] = f"Bearer {key}"
+    if style in ("x-goog", "both"):
+        headers["x-goog-api-key"] = key
+    if GEMINI_SEND_REVISION:
+        headers["Api-Revision"] = GEMINI_API_REVISION
+    return headers
+
+
 def _gemini_post(parts: list, timeout: int, max_tokens: int = 0) -> tuple:
     """POST one Interactions request. Returns (text, error). Never raises.
 
@@ -614,11 +644,7 @@ def _gemini_post(parts: list, timeout: int, max_tokens: int = 0) -> tuple:
             req = urllib.request.Request(
                 GEMINI_ENDPOINT,
                 data=json.dumps(payload).encode("utf-8"),
-                headers={
-                    "Content-Type": "application/json",
-                    "x-goog-api-key": key,
-                    "Api-Revision": GEMINI_API_REVISION,
-                },
+                headers=_gemini_headers(key),
             )
             with urllib.request.urlopen(req, timeout=timeout) as response:
                 body = json.loads(response.read().decode("utf-8"))
