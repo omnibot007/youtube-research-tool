@@ -99,6 +99,15 @@ GEMINI_API_REVISION = os.environ.get("YT_GEMINI_API_REVISION", "2026-05-20")
 GEMINI_TIMEOUT = int(os.environ.get("YT_GEMINI_TIMEOUT", "180"))
 GEMINI_VIDEO_TIMEOUT = int(os.environ.get("YT_GEMINI_VIDEO_TIMEOUT", "600"))
 GEMINI_MAX_TOKENS = int(os.environ.get("YT_GEMINI_MAX_TOKENS", "1024"))
+# Video mode answers for a whole window, so it needs far more room than a
+# single frame. At 1024*4 a 30-minute window truncated mid-answer.
+GEMINI_VIDEO_MAX_TOKENS = int(
+    os.environ.get("YT_GEMINI_VIDEO_MAX_TOKENS", "8192"))
+# Window size for clipped analysis. Video costs ~100 tokens/second at the
+# default low media resolution, so ~3h is the 1M-context ceiling for ONE
+# request; 30min windows stay far clear of it and keep each answer dense.
+GEMINI_VIDEO_CHUNK_SECONDS = int(
+    os.environ.get("YT_GEMINI_VIDEO_CHUNK_SECONDS", "1800"))
 # Frames are cheap to Gemini, so the local frame cap is not the binding
 # constraint it is for Ollama. Kept separate so raising one cannot slow the other.
 GEMINI_TARGET_FRAMES = int(os.environ.get("YT_GEMINI_TARGET_FRAMES", "16"))
@@ -704,39 +713,97 @@ def _read_frame_gemini(frame_path: Path, timestamp: float,
     return _finish_reading(out, text, chart)
 
 
-def analyze_youtube_video(url: str, prompt: str = "") -> dict:
-    """Analyse a whole YouTube video in one Gemini request.
+def _hhmmss(seconds: float) -> str:
+    """Absolute position label. Long videos need hours, not MM:SS."""
+    s = max(0, int(seconds))
+    return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+
+
+def analyze_youtube_video(url: str, prompt: str = "", start_s: float = 0.0,
+                          end_s: float = 0.0) -> dict:
+    """Analyse a YouTube video, or one time window of it, in one request.
 
     Schema verified 2026-09-02 against /gemini-api/docs/video-understanding:
     a video part is {"type": "video", "uri": "<youtube url>"}; mime_type is not
-    required for YouTube URLs and only public videos are supported.
+    required and only public videos are supported.
 
-    This replaces download + ffmpeg + dedup + N frame calls entirely. Returns
-    the same reading shape as read_frame so callers need no special casing.
+    Clipping (measured 2026-09-02, NOT documented for YouTube URLs -- the docs
+    show it only for uploaded files, so this was probed directly):
+        {"processing": {"type": "static",
+                        "start_offset": "7200s", "end_offset": "7320s"}}
+    works on a YouTube URL, but ONLY with duration STRINGS. Integer
+    milliseconds -- the form the docs use for uploaded files -- returns
+    HTTP 400 "Invalid input at 'input[1].processing'".
+
+    Video costs roughly 100 tokens per second at the default low media
+    resolution, so a 1M-context model reaches about 3 hours in one request.
+    Windowing is what makes a 9-hour course tractable.
     """
     out = {
         "text": "",
         "lines": [],
         "chart": "",
         "has_content": False,
-        "timestamp": 0.0,
+        "timestamp": float(start_s or 0.0),
         "frame_file": "",
         "provider": "gemini",
         "model": GEMINI_MODEL,
         "mode": "video",
+        "window_start": float(start_s or 0.0),
+        "window_end": float(end_s or 0.0),
     }
-    parts = [
-        {"type": "text", "text": prompt or VIDEO_PROMPT},
-        {"type": "video", "uri": url},
-    ]
+
+    video_part: dict[str, Any] = {"type": "video", "uri": url}
+    instruction = prompt or VIDEO_PROMPT
+    if end_s and end_s > start_s:
+        video_part["processing"] = {
+            "type": "static",
+            "start_offset": f"{int(start_s)}s",
+            "end_offset": f"{int(end_s)}s",
+        }
+        # The model sees only the clip, so its own clock starts at zero. Give
+        # it the window's absolute position and demand absolute stamps back,
+        # otherwise every window collides at 00:00 when merged.
+        instruction = (
+            f"This clip starts at {_hhmmss(start_s)} of a longer video and "
+            f"ends at {_hhmmss(end_s)}. Prefix every line with its ABSOLUTE "
+            f"HH:MM:SS position in the FULL video, not a position within this "
+            f"clip.\n\n" + instruction
+        )
+
+    parts = [{"type": "text", "text": instruction}, video_part]
     answer, error = _gemini_post(
-        parts, GEMINI_VIDEO_TIMEOUT, max_tokens=GEMINI_MAX_TOKENS * 4,
+        parts, GEMINI_VIDEO_TIMEOUT, max_tokens=GEMINI_VIDEO_MAX_TOKENS,
     )
     if error:
         out["error"] = error
         return out
     text, chart = _parse_vision_json(answer.strip())
     return _finish_reading(out, text, chart)
+
+
+def video_windows(duration: float, chunk: int = 0) -> list:
+    """Split a duration into [(start, end)] windows for clipped analysis.
+
+    Returns [] when the video fits in one request, so the caller sends no
+    processing block at all and behaviour is unchanged for short videos.
+    A trailing sliver is folded into the previous window rather than becoming
+    a near-empty request.
+    """
+    size = int(chunk or GEMINI_VIDEO_CHUNK_SECONDS)
+    if size <= 0 or duration <= 0 or duration <= size:
+        return []
+    edges = []
+    start = 0
+    while start < duration:
+        end = min(start + size, int(duration))
+        if duration - end < size * 0.2:      # fold a short tail into this one
+            end = int(duration)
+        edges.append((float(start), float(end)))
+        if end >= duration:
+            break
+        start = end
+    return edges
 
 
 def read_frame(frame_path: Path, timestamp: float, prompt: str = "") -> dict:
@@ -1023,6 +1090,7 @@ def empty_result(enable_visual: bool = False) -> dict:
         "frames_failed": 0,
         "provider": resolve_provider(),
         "mode": "frames",
+        "windows": 0,
         "frame_errors": [],
         "visual_claims": [],
         "on_screen_texts": [],
@@ -1066,57 +1134,107 @@ def extract_visual_content(
 
         # --- Gemini whole-video path (added 2026-09-02) ------------------
         # Measured on this machine 2026-09-02: yt-dlp gets HTTP 403 from
-        # YouTube on this network and every --cookies-from-browser source
-        # fails (Chrome DB locked, Edge DPAPI decrypt error, Brave/Firefox
-        # absent). Gemini fetches the URL server-side, so this path needs no
-        # download, no ffmpeg and no local GPU. One request replaces the whole
-        # download -> extract -> dedup -> N-inference chain.
+        # YouTube and every --cookies-from-browser source fails (Chrome DB
+        # locked, Edge DPAPI, Brave/Firefox absent). Gemini fetches the URL
+        # server-side, so this path needs no download, no ffmpeg and no local
+        # GPU. Long videos are split into clipped windows -- video costs
+        # ~100 tokens/second, so ~3 hours is the single-request ceiling.
         if provider == "gemini" and mode in ("auto", "video"):
             url = f"https://www.youtube.com/watch?v={video_id}"
-            print(
-                f"  [visual] Analysing whole video with {GEMINI_MODEL} "
-                f"(no download)...",
-                file=sys.stderr,
-            )
-            reading = analyze_youtube_video(url)
-            if reading.get("error"):
-                result["vision_error"] = reading["error"]
-                print(f"  [visual] {reading['error']}", file=sys.stderr)
-                # "auto" falls through to frames; an explicit video mode stops.
-                if mode == "video":
-                    return result
+            windows = video_windows(duration)
+            result["mode"] = "video"
+            result["windows"] = len(windows) or 1
+
+            if windows:
+                print(
+                    f"  [visual] {_hhmmss(duration)} video -> {len(windows)} "
+                    f"windows of {GEMINI_VIDEO_CHUNK_SECONDS // 60}min, "
+                    f"analysing with {GEMINI_MODEL} (no download)...",
+                    file=sys.stderr,
+                )
             else:
-                result["mode"] = "video"
-                result["frames_analyzed"] = 1 if reading.get("has_content") else 0
-                claims: list[dict] = []
+                print(
+                    f"  [visual] Analysing whole video with {GEMINI_MODEL} "
+                    f"(no download)...",
+                    file=sys.stderr,
+                )
+
+            claims: list[dict] = []
+            texts: list[dict] = []
+            charts: list[dict] = []
+            analyses: list[dict] = []
+            first_error = ""
+
+            for idx, (w_start, w_end) in enumerate(
+                    windows or [(0.0, 0.0)], start=1):
+                if windows:
+                    print(
+                        f"  [visual] window {idx}/{len(windows)} "
+                        f"{_hhmmss(w_start)}-{_hhmmss(w_end)}...",
+                        file=sys.stderr,
+                    )
+                reading = analyze_youtube_video(
+                    url, start_s=w_start, end_s=w_end)
+
+                if reading.get("error"):
+                    result["frames_failed"] += 1
+                    result["frame_errors"].append({
+                        "timestamp": w_start,
+                        "timestamp_str": _hhmmss(w_start),
+                        "frame_file": "",
+                        "error": reading["error"],
+                    })
+                    first_error = first_error or reading["error"]
+                    print(f"  [visual] window {idx} failed: "
+                          f"{reading['error']}", file=sys.stderr)
+                    continue
+                if not reading.get("has_content"):
+                    continue
+
+                result["frames_analyzed"] += 1
+                ts = float(w_start)
+                ts_str = _hhmmss(ts)
+
                 if reading["text"]:
-                    result["on_screen_texts"] = [{
-                        "timestamp": 0.0,
-                        "timestamp_str": "00:00",
+                    texts.append({
+                        "timestamp": ts,
+                        "timestamp_str": ts_str,
                         "text": reading["text"],
                         "line_count": len(reading["lines"]),
-                    }]
-                    claims.extend(extract_visual_claims(reading["text"], 0.0))
+                    })
+                    claims.extend(extract_visual_claims(reading["text"], ts))
                 if reading["chart"]:
-                    result["chart_patterns"] = [{
-                        "timestamp": 0.0,
-                        "timestamp_str": "00:00",
+                    charts.append({
+                        "timestamp": ts,
+                        "timestamp_str": ts_str,
                         "patterns": reading["chart"],
                         "model": GEMINI_MODEL,
-                    }]
+                    })
                     claims.extend(extract_visual_claims(
-                        reading["chart"], 0.0, source="visual_chart"))
-                result["visual_claims"] = claims
-                result["frame_analyses"] = [{
-                    "timestamp": 0.0,
-                    "timestamp_str": "00:00",
+                        reading["chart"], ts, source="visual_chart"))
+                analyses.append({
+                    "timestamp": ts,
+                    "timestamp_str": ts_str,
                     "frame_file": "",
+                    "window_start": ts,
+                    "window_end": float(w_end),
                     "text": reading["text"],
                     "lines": reading["lines"],
                     "chart": reading["chart"],
-                }]
-                if not reading.get("has_content"):
-                    result["vision_error"] = "model returned no usable content"
+                })
+
+            result["on_screen_texts"] = texts
+            result["chart_patterns"] = charts
+            result["frame_analyses"] = analyses
+            result["visual_claims"] = claims
+
+            if result["frames_analyzed"] == 0:
+                result["vision_error"] = (
+                    first_error or "model returned no usable content")
+                # "auto" may still fall through to frames; video mode stops.
+                if mode == "video" or first_error:
+                    return result
+            else:
                 return result
 
         ffmpeg = find_ffmpeg()

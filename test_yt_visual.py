@@ -659,3 +659,79 @@ class TestReportedModelMatchesProvider:
     def test_ollama_run_reports_the_ollama_model(self, monkeypatch):
         monkeypatch.setattr(visual, "VISION_PROVIDER", "ollama")
         assert visual.empty_result(True)["vision_model"] == visual.VISION_MODEL
+
+
+class TestLongVideoWindows:
+    """Video costs ~100 tokens/sec at low media resolution, so a 1M-context
+    model reaches ~3h in one request. Longer videos must be windowed."""
+
+    def test_short_video_is_not_windowed(self):
+        assert visual.video_windows(491) == []
+        assert visual.video_windows(1800) == []
+
+    def test_long_video_splits_into_contiguous_windows(self):
+        w = visual.video_windows(4355, chunk=1800)
+        assert w[0][0] == 0.0
+        assert w[-1][1] == 4355
+        for a, b in zip(w, w[1:]):
+            assert a[1] == b[0], "windows must not overlap or gap"
+
+    def test_short_tail_is_folded_not_left_as_a_sliver(self):
+        w = visual.video_windows(1900, chunk=1800)
+        assert len(w) == 1 and w[0] == (0.0, 1900.0)
+
+    def test_nine_hour_course_is_tractable(self):
+        w = visual.video_windows(32400, chunk=1800)
+        assert len(w) == 18
+        assert w[-1][1] == 32400
+
+    def test_hhmmss_uses_hours_for_long_videos(self):
+        assert visual._hhmmss(0) == "00:00:00"
+        assert visual._hhmmss(7325) == "02:02:05"
+
+
+class TestVideoClipRequest:
+    """Clipping a YOUTUBE URL is undocumented -- the docs show it only for
+    uploaded files. Probed live 2026-09-02: duration STRINGS work, integer
+    milliseconds return HTTP 400 Invalid input at 'input[1].processing'."""
+
+    def _capture(self, monkeypatch, **kw):
+        captured = {}
+
+        class FakeResp:
+            def read(self):
+                return json.dumps({"steps": [{"type": "model_output",
+                    "content": [{"type": "text", "text": "{}"}]}]}).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=0):
+            captured["payload"] = json.loads(req.data.decode("utf-8"))
+            return FakeResp()
+
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key-not-a-real-secret")
+        monkeypatch.setattr(visual.urllib.request, "urlopen", fake_urlopen)
+        visual.analyze_youtube_video("https://www.youtube.com/watch?v=abc", **kw)
+        return captured["payload"]
+
+    def test_unclipped_request_sends_no_processing_block(self, monkeypatch):
+        payload = self._capture(monkeypatch)
+        assert payload["input"][1] == {
+            "type": "video", "uri": "https://www.youtube.com/watch?v=abc"}
+
+    def test_offsets_are_duration_strings_not_milliseconds(self, monkeypatch):
+        payload = self._capture(monkeypatch, start_s=7200, end_s=7320)
+        proc = payload["input"][1]["processing"]
+        assert proc["type"] == "static"
+        assert proc["start_offset"] == "7200s", "ints return HTTP 400"
+        assert proc["end_offset"] == "7320s"
+
+    def test_clip_prompt_demands_absolute_timestamps(self, monkeypatch):
+        payload = self._capture(monkeypatch, start_s=1800, end_s=3600)
+        text = payload["input"][0]["text"]
+        assert "00:30:00" in text and "01:00:00" in text
+        assert "ABSOLUTE" in text
