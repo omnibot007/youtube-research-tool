@@ -28,6 +28,7 @@ import re
 import shutil
 import subprocess
 import sys
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -72,6 +73,47 @@ VISION_KEEP_ALIVE = os.environ.get("YT_VISION_KEEP_ALIVE", "10m")
 # contention. Set YT_VISION_NUM_GPU= (empty) to let the scheduler decide.
 VISION_NUM_GPU = os.environ.get("YT_VISION_NUM_GPU", "99").strip()
 
+# --- Vision provider selection (added 2026-09-02) ----------------------------
+# The local Ollama path is offline and free but slow, and a 3-7B model reads
+# candlestick charts poorly. Measured on this machine 2026-09-02: qwen2.5vl:3b
+# exceeded the 300s per-frame timeout on a single 768px frame at num_ctx 2048.
+# The Gemini backend trades offline-ness for accuracy and speed. "auto" selects
+# Gemini only when a key is present, so a machine without one is unaffected.
+VISION_PROVIDER = os.environ.get("YT_VISION_PROVIDER", "auto").strip().lower()
+
+# Google Gemini "Interactions API". Schema verified 2026-09-02 against
+# ai.google.dev/gemini-api/docs/quickstart, /image-understanding,
+# /video-understanding, /api/interactions.md.txt and
+# /gemini-api/docs/interactions/structured-output.md.txt.
+#   Request : POST {endpoint}, headers x-goog-api-key + Api-Revision,
+#             body {"model":..., "input":[{"type":"text",...},{"type":"image",...}]}
+#   Response: steps[] -> type "model_output" -> content[] -> type "text" -> text
+GEMINI_ENDPOINT = os.environ.get(
+    "YT_GEMINI_ENDPOINT",
+    "https://generativelanguage.googleapis.com/v1beta/interactions",
+)
+GEMINI_MODEL = os.environ.get("YT_GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_API_REVISION = os.environ.get("YT_GEMINI_API_REVISION", "2026-05-20")
+GEMINI_TIMEOUT = int(os.environ.get("YT_GEMINI_TIMEOUT", "180"))
+GEMINI_VIDEO_TIMEOUT = int(os.environ.get("YT_GEMINI_VIDEO_TIMEOUT", "600"))
+GEMINI_MAX_TOKENS = int(os.environ.get("YT_GEMINI_MAX_TOKENS", "1024"))
+# Frames are cheap to Gemini, so the local frame cap is not the binding
+# constraint it is for Ollama. Kept separate so raising one cannot slow the other.
+GEMINI_TARGET_FRAMES = int(os.environ.get("YT_GEMINI_TARGET_FRAMES", "16"))
+
+# Enforced output contract. structured-output.md.txt documents response_format
+# as {"type":"text","mime_type":"application/json","schema":<JSON Schema>}, which
+# makes the two-key contract a server-side guarantee instead of a polite request.
+GEMINI_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "on_screen_text": {"type": "string"},
+        "chart_description": {"type": "string"},
+    },
+    "required": ["on_screen_text", "chart_description"],
+}
+
+
 _FFMPEG_CMD = ""
 
 VISION_PROMPT = (
@@ -110,7 +152,22 @@ def find_ffmpeg() -> str:
     return ""
 
 
+VISUAL_MODE = os.environ.get("YT_VISUAL_MODE", "auto").strip().lower()
+
+
 def vision_available() -> tuple[bool, str]:
+    """Check the active provider is usable. Returns (available, detail)."""
+    if resolve_provider() == "gemini":
+        if not gemini_key():
+            return False, (
+                "no Gemini API key -- set GEMINI_API_KEY "
+                "(free key at aistudio.google.com/apikey)"
+            )
+        return True, GEMINI_MODEL
+    return _vision_available_ollama()
+
+
+def _vision_available_ollama() -> tuple[bool, str]:
     """Check that Ollama is up and the configured vision model is installed.
 
     Returns (available, detail). `detail` is the model name on success or a
@@ -402,7 +459,293 @@ def _encode_frame(frame_path: Path) -> str:
     return base64.b64encode(raw).decode("ascii")
 
 
-def read_frame(frame_path: Path, timestamp: float) -> dict:
+# --- Trading profile (added 2026-09-02) -------------------------------------
+# The general prompt asks for "one sentence describing any chart", which on a
+# TradingView screenshot yields "a chart with lines on it" -- true, useless.
+# This one names the fields a trader needs and forbids guessing numbers, which
+# is the characteristic failure of small vision models on dense chart frames.
+TRADING_PROMPT = (
+    "You are reading a single frame from a TRADING education video. "
+    "Report ONLY what is literally visible. Never guess a number you cannot "
+    "actually read; omit it instead. "
+    "Respond with JSON only, no commentary, using exactly these two keys:\n"
+    '{"on_screen_text": "every line of text visible in the image, verbatim, '
+    'separated by \\n. Include ticker symbols, the selected timeframe, '
+    'indicator names with their settings (for example RSI 14, EMA 200), '
+    'price-axis values, and any text labels drawn on the chart. '
+    'Empty string if there is no text.", '
+    '"chart_description": "if a price chart is visible, describe it in this '
+    'order: chart type (candlestick, line, bar, Heikin Ashi); instrument and '
+    'timeframe if shown; trend direction; each indicator overlay or sub-panel '
+    'you can name, with its settings if displayed; horizontal levels, '
+    'trendlines, zones, Fibonacci retracements, arrows or annotations drawn '
+    'on it; and any named candlestick or price pattern. '
+    'Empty string if there is no chart."}'
+)
+
+# Whole-video prompt for the Gemini YouTube-URL path. One request replaces
+# download + ffmpeg + dedup + N frame calls.
+VIDEO_PROMPT = (
+    "You are analysing a TRADING education video. Watch the whole video and "
+    "report ONLY what is literally shown on screen. Never guess a number you "
+    "cannot read. Respond with JSON only, no commentary, using exactly these "
+    "two keys:\n"
+    '{"on_screen_text": "the on-screen text that matters, grouped by moment '
+    'and prefixed with its MM:SS timestamp, separated by \\n. Include ticker '
+    'symbols, timeframes, indicator names with settings, price levels and '
+    'labels drawn on charts.", '
+    '"chart_description": "for each distinct chart shown, one line prefixed '
+    'with its MM:SS timestamp giving: chart type, instrument and timeframe, '
+    'trend direction, named indicators with settings, drawn levels or '
+    'trendlines or zones, and any named pattern."}'
+)
+
+VISION_PROFILE = os.environ.get("YT_VISION_PROFILE", "trading").strip().lower()
+
+
+def active_prompt(profile: str = "") -> str:
+    """Return the frame prompt for the active profile.
+
+    Defaults to the trading profile: this tool is pointed at trading videos and
+    the general prompt measurably under-describes chart frames. Set
+    YT_VISION_PROFILE=general for the pre-2026-09-02 wording.
+    """
+    name = (profile or VISION_PROFILE or "trading").strip().lower()
+    return VISION_PROMPT if name == "general" else TRADING_PROMPT
+
+
+# --- Gemini backend ---------------------------------------------------------
+
+def gemini_key() -> str:
+    """Return the Gemini API key from the environment, or "".
+
+    Never logged, never returned in an error string. Checked in priority order
+    so a yt-scrape-specific key can override a machine-wide one.
+    """
+    for name in ("YT_GEMINI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def resolve_provider() -> str:
+    """Decide which backend read_frame should use.
+
+    "auto" (the default) selects Gemini only when a key is present, so a
+    machine with no key behaves exactly as it did before this backend existed.
+    """
+    choice = (VISION_PROVIDER or "auto").strip().lower()
+    if choice == "gemini":
+        return "gemini"
+    if choice == "ollama":
+        return "ollama"
+    return "gemini" if gemini_key() else "ollama"
+
+
+def _gemini_extract_text(body: dict) -> str:
+    """Pull the model's text out of an Interactions API response.
+
+    Current schema (verified 2026-09-02, /api/interactions.md.txt):
+        steps[] -> {"type": "model_output", "content": [{"type":"text","text":...}]}
+    The May-2026 migration guide documents a legacy shape with an `outputs`
+    array; both are accepted so a revision pin change cannot silently blank the
+    reading.
+    """
+    for step in body.get("steps") or []:
+        if not isinstance(step, dict) or step.get("type") != "model_output":
+            continue
+        for chunk in step.get("content") or []:
+            if isinstance(chunk, dict) and chunk.get("type") == "text":
+                text = chunk.get("text")
+                if text:
+                    return str(text)
+    for out in reversed(body.get("outputs") or []):
+        if isinstance(out, dict) and out.get("text"):
+            return str(out["text"])
+    if body.get("output_text"):
+        return str(body["output_text"])
+    return ""
+
+
+def _gemini_post(parts: list, timeout: int, max_tokens: int = 0) -> tuple:
+    """POST one Interactions request. Returns (text, error). Never raises.
+
+    Retries once with the optional blocks stripped if the server rejects the
+    request, so an unrecognised generation_config or response_format key
+    degrades to a plain call instead of failing the frame outright.
+    """
+    key = gemini_key()
+    if not key:
+        return "", (
+            "no Gemini API key -- set GEMINI_API_KEY "
+            "(get one free at aistudio.google.com/apikey)"
+        )
+
+    full = {
+        "model": GEMINI_MODEL,
+        "input": parts,
+        "generation_config": {
+            "temperature": 0,
+            "max_output_tokens": max_tokens or GEMINI_MAX_TOKENS,
+        },
+        "response_format": {
+            "type": "text",
+            "mime_type": "application/json",
+            "schema": GEMINI_JSON_SCHEMA,
+        },
+    }
+    minimal = {"model": GEMINI_MODEL, "input": parts}
+
+    last_error = ""
+    for attempt, payload in enumerate((full, minimal)):
+        try:
+            req = urllib.request.Request(
+                GEMINI_ENDPOINT,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "x-goog-api-key": key,
+                    "Api-Revision": GEMINI_API_REVISION,
+                },
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                body = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            detail = ""
+            try:
+                detail = e.read().decode("utf-8", "replace")[:300]
+            except Exception:
+                pass
+            last_error = f"HTTP {e.code}: {detail or e.reason}"
+            # 4xx on the rich payload is worth one plain retry; 401/403/429 are
+            # not about the payload at all, so stop immediately.
+            if e.code in (401, 403, 404, 429) or attempt == 1:
+                return "", last_error
+            continue
+        except Exception as e:
+            return "", f"{type(e).__name__}: {e}"
+
+        text = _gemini_extract_text(body)
+        if text:
+            return text, ""
+        status = body.get("status") or "no text in response"
+        last_error = f"empty model_output (status: {status})"
+        if attempt == 1:
+            return "", last_error
+    return "", last_error
+
+
+def _parse_vision_json(answer: str) -> tuple:
+    """Split a model reply into (on_screen_text, chart_description).
+
+    Falls back to treating the whole reply as on-screen text when the model
+    ignores the JSON instruction, rather than discarding a good reading.
+    """
+    parsed = None
+    try:
+        parsed = json.loads(answer)
+    except Exception:
+        match = re.search(r"\{.*\}", answer, re.DOTALL)
+        if match:
+            try:
+                parsed = json.loads(match.group())
+            except Exception:
+                parsed = None
+    if isinstance(parsed, dict):
+        return (
+            str(parsed.get("on_screen_text") or ""),
+            str(parsed.get("chart_description") or ""),
+        )
+    return answer, ""
+
+
+def _finish_reading(out: dict, text: str, chart: str) -> dict:
+    """Normalise text/chart into the reading dict every caller expects."""
+    text = re.sub(r"\n{3,}", "\n\n", text.replace("\\n", "\n")).strip()
+    chart = re.sub(r"\n{3,}", "\n\n", chart.replace("\\n", "\n")).strip()
+    out["text"] = text
+    out["lines"] = [l.strip() for l in text.split("\n") if l.strip()]
+    out["chart"] = chart
+    out["has_content"] = len(text) >= MIN_TEXT_LEN or len(chart) >= MIN_TEXT_LEN
+    return out
+
+
+def _read_frame_gemini(frame_path: Path, timestamp: float,
+                       prompt: str = "") -> dict:
+    """Read one frame with Gemini. Never raises."""
+    out = {
+        "text": "",
+        "lines": [],
+        "chart": "",
+        "has_content": False,
+        "timestamp": timestamp,
+        "frame_file": frame_path.name,
+        "provider": "gemini",
+        "model": GEMINI_MODEL,
+    }
+    try:
+        encoded = _encode_frame(frame_path)
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {e}"
+        return out
+
+    parts = [
+        {"type": "text", "text": prompt or active_prompt()},
+        {"type": "image", "data": encoded, "mime_type": "image/jpeg"},
+    ]
+    answer, error = _gemini_post(parts, GEMINI_TIMEOUT)
+    if error:
+        out["error"] = error
+        return out
+    text, chart = _parse_vision_json(answer.strip())
+    return _finish_reading(out, text, chart)
+
+
+def analyze_youtube_video(url: str, prompt: str = "") -> dict:
+    """Analyse a whole YouTube video in one Gemini request.
+
+    Schema verified 2026-09-02 against /gemini-api/docs/video-understanding:
+    a video part is {"type": "video", "uri": "<youtube url>"}; mime_type is not
+    required for YouTube URLs and only public videos are supported.
+
+    This replaces download + ffmpeg + dedup + N frame calls entirely. Returns
+    the same reading shape as read_frame so callers need no special casing.
+    """
+    out = {
+        "text": "",
+        "lines": [],
+        "chart": "",
+        "has_content": False,
+        "timestamp": 0.0,
+        "frame_file": "",
+        "provider": "gemini",
+        "model": GEMINI_MODEL,
+        "mode": "video",
+    }
+    parts = [
+        {"type": "text", "text": prompt or VIDEO_PROMPT},
+        {"type": "video", "uri": url},
+    ]
+    answer, error = _gemini_post(
+        parts, GEMINI_VIDEO_TIMEOUT, max_tokens=GEMINI_MAX_TOKENS * 4,
+    )
+    if error:
+        out["error"] = error
+        return out
+    text, chart = _parse_vision_json(answer.strip())
+    return _finish_reading(out, text, chart)
+
+
+def read_frame(frame_path: Path, timestamp: float, prompt: str = "") -> dict:
+    """Read one frame with the active vision provider. Never raises."""
+    if resolve_provider() == "gemini":
+        return _read_frame_gemini(frame_path, timestamp, prompt)
+    return _read_frame_ollama(frame_path, timestamp, prompt)
+
+
+def _read_frame_ollama(frame_path: Path, timestamp: float,
+                       prompt: str = "") -> dict:
     """Read one frame with the local vision model.
 
     Never raises. Returns a dict with text / lines / chart / has_content, and
@@ -415,6 +758,8 @@ def read_frame(frame_path: Path, timestamp: float) -> dict:
         "has_content": False,
         "timestamp": timestamp,
         "frame_file": frame_path.name,
+        "provider": "ollama",
+        "model": VISION_MODEL,
     }
     try:
         options: dict[str, Any] = {
@@ -429,7 +774,7 @@ def read_frame(frame_path: Path, timestamp: float) -> dict:
                 pass
         payload = {
             "model": VISION_MODEL,
-            "prompt": VISION_PROMPT,
+            "prompt": prompt or active_prompt(),
             "images": [_encode_frame(frame_path)],
             "stream": False,
             "options": options,
@@ -571,6 +916,74 @@ def extract_visual_claims(text: str, timestamp: float,
             ):
                 add(f"Percentage shown: {pct}", "percentage")
 
+    # --- Prose-chart vocabulary (added 2026-09-02) --------------------------
+    # The blocks above were written for slide text ("RSI Length: 14"). A
+    # chart_description is prose ("RSI(14) sub-panel", "a 200-period EMA"), and
+    # measured 2026-09-02 the parser dropped every setting written that way.
+    _IND = (r"RSI|MACD|Stochastic|Stoch|ATR|EMA|SMA|WMA|MA|Bollinger|"
+            r"ADX|OBV|VWAP|CCI|Ichimoku|SuperTrend")
+
+    for line in lines:
+        # "RSI(14)", "EMA (200)"
+        for m in re.finditer(rf"(?i)\b({_IND})\s*\(\s*(\d+(?:\.\d+)?)\s*\)", line):
+            add(f"{m.group(1).upper()} = {m.group(2)}", "indicator_setting")
+        # "200-period EMA", "14 period RSI", "50-day MA"
+        for m in re.finditer(
+            rf"(?i)\b(\d+)[-\s]*(?:period|day|bar|length)?[-\s]+({_IND})\b", line
+        ):
+            add(f"{m.group(2).upper()} = {m.group(1)}", "indicator_setting")
+
+    for line in lines:
+        # "RSI ... oversold below 30" -- allow a few words between the
+        # indicator and its comparison, which prose always has.
+        for m in re.finditer(
+            rf"(?i)\b({_IND})\b(?:\s*\(\d+\))?(?:\W+\w+){{0,4}}?\W+"
+            r"(above|below|over|under|crosses above|crosses below)\s+"
+            r"(\d+(?:\.\d+)?)",
+            line,
+        ):
+            claim = f"{m.group(1).upper()} {m.group(2).lower()} {m.group(3)}"
+            if not any(c["claim"] == claim for c in claims):
+                add(claim, "indicator_threshold")
+
+    # Named chart types, structures and price patterns, so a good
+    # chart_description becomes queryable claims instead of a wall of prose.
+    _CHART_TERMS = (
+        r"candlestick chart|heikin ashi|line chart|bar chart|renko|"
+        r"double top|double bottom|head and shoulders|inverse head and shoulders|"
+        r"bullish engulfing|bearish engulfing|engulfing|doji|hammer|shooting star|"
+        r"morning star|evening star|pin bar|inside bar|"
+        r"ascending triangle|descending triangle|symmetrical triangle|triangle|"
+        r"bull flag|bear flag|flag|pennant|wedge|channel|cup and handle|"
+        r"support level|resistance level|support|resistance|trendline|trend line|"
+        r"supply zone|demand zone|order block|fair value gap|liquidity sweep|"
+        r"fibonacci retracement|fibonacci|golden pocket|"
+        r"bullish divergence|bearish divergence|divergence|"
+        r"breakout|breakdown|retest|pullback|consolidation|"
+        r"moving average crossover|golden cross|death cross"
+    )
+    # Forex and crypto levels carry no currency sign, so the $-anchored block
+    # above never sees them. Anchor on the words instead of the number, which
+    # keeps bare figures from becoming price claims.
+    for line in lines:
+        for m in re.finditer(
+            r"(?i)\b(support|resistance|level|target|entry|stop loss|stop|"
+            r"take profit|tp|sl)\b[^.\n]{0,24}?\b(?:at|near|around|@)\s*"
+            # Comma-grouped form first, else a plain run of digits. A bare
+            # 1-3 digit cap silently truncated "2350.5" to "235".
+            r"(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)",
+            line,
+        ):
+            add(f"{m.group(1).title()} at {m.group(2)}", "price_level")
+
+    seen_terms: set[str] = set()
+    for line in lines:
+        for m in re.finditer(rf"(?i)\b({_CHART_TERMS})\b", line):
+            term = m.group(1).lower()
+            if term not in seen_terms:
+                seen_terms.add(term)
+                add(term, "chart_pattern")
+
     return claims
 
 
@@ -587,6 +1000,9 @@ def empty_result(enable_visual: bool = False) -> dict:
         "frames_after_dedup": 0,
         "frames_analyzed": 0,
         "frames_failed": 0,
+        "provider": resolve_provider(),
+        "mode": "frames",
+        "frame_errors": [],
         "visual_claims": [],
         "on_screen_texts": [],
         "chart_patterns": [],
@@ -622,6 +1038,65 @@ def extract_visual_content(
             result["vision_error"] = detail
             print(f"  [visual] {detail}", file=sys.stderr)
             return result
+
+        provider = resolve_provider()
+        result["provider"] = provider
+        mode = (VISUAL_MODE or "auto").strip().lower()
+
+        # --- Gemini whole-video path (added 2026-09-02) ------------------
+        # Measured on this machine 2026-09-02: yt-dlp gets HTTP 403 from
+        # YouTube on this network and every --cookies-from-browser source
+        # fails (Chrome DB locked, Edge DPAPI decrypt error, Brave/Firefox
+        # absent). Gemini fetches the URL server-side, so this path needs no
+        # download, no ffmpeg and no local GPU. One request replaces the whole
+        # download -> extract -> dedup -> N-inference chain.
+        if provider == "gemini" and mode in ("auto", "video"):
+            url = f"https://www.youtube.com/watch?v={video_id}"
+            print(
+                f"  [visual] Analysing whole video with {GEMINI_MODEL} "
+                f"(no download)...",
+                file=sys.stderr,
+            )
+            reading = analyze_youtube_video(url)
+            if reading.get("error"):
+                result["vision_error"] = reading["error"]
+                print(f"  [visual] {reading['error']}", file=sys.stderr)
+                # "auto" falls through to frames; an explicit video mode stops.
+                if mode == "video":
+                    return result
+            else:
+                result["mode"] = "video"
+                result["frames_analyzed"] = 1 if reading.get("has_content") else 0
+                claims: list[dict] = []
+                if reading["text"]:
+                    result["on_screen_texts"] = [{
+                        "timestamp": 0.0,
+                        "timestamp_str": "00:00",
+                        "text": reading["text"],
+                        "line_count": len(reading["lines"]),
+                    }]
+                    claims.extend(extract_visual_claims(reading["text"], 0.0))
+                if reading["chart"]:
+                    result["chart_patterns"] = [{
+                        "timestamp": 0.0,
+                        "timestamp_str": "00:00",
+                        "patterns": reading["chart"],
+                        "model": GEMINI_MODEL,
+                    }]
+                    claims.extend(extract_visual_claims(
+                        reading["chart"], 0.0, source="visual_chart"))
+                result["visual_claims"] = claims
+                result["frame_analyses"] = [{
+                    "timestamp": 0.0,
+                    "timestamp_str": "00:00",
+                    "frame_file": "",
+                    "text": reading["text"],
+                    "lines": reading["lines"],
+                    "chart": reading["chart"],
+                }]
+                if not reading.get("has_content"):
+                    result["vision_error"] = "model returned no usable content"
+                return result
 
         ffmpeg = find_ffmpeg()
         result["ffmpeg"] = ffmpeg
@@ -678,6 +1153,12 @@ def extract_visual_content(
             reading = read_frame(frame, ts)
             if reading.get("error"):
                 result["frames_failed"] += 1
+                result["frame_errors"].append({
+                    "timestamp": ts,
+                    "timestamp_str": ts_str,
+                    "frame_file": frame.name,
+                    "error": reading["error"],
+                })
                 print(
                     f"  [visual] frame {idx} failed: {reading['error']}",
                     file=sys.stderr,
@@ -698,6 +1179,8 @@ def extract_visual_content(
                 visual_claims.extend(extract_visual_claims(reading["text"], ts))
 
             if reading["chart"]:
+                visual_claims.extend(extract_visual_claims(
+                    reading["chart"], ts, source="visual_chart"))
                 chart_patterns.append({
                     "timestamp": ts,
                     "timestamp_str": ts_str,
@@ -713,6 +1196,13 @@ def extract_visual_content(
                 "lines": reading["lines"],
                 "chart": reading["chart"],
             })
+
+        if result["frames_analyzed"] == 0 and result["frames_failed"]:
+            first = result["frame_errors"][0]["error"]
+            result["vision_error"] = (
+                f'all {result["frames_failed"]} frame(s) failed; '
+                f"first error: {first}"
+            )
 
         result["on_screen_texts"] = on_screen_texts
         result["visual_claims"] = visual_claims

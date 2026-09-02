@@ -5415,9 +5415,22 @@ def main() -> int:
     sp_dr.add_argument("--proxy", default="", help="Proxy URL")
     sp_dr.add_argument("--retries", type=int, default=DEFAULT_RETRIES, help="Max retries on network errors")
     sp_dr.add_argument("--visual", action="store_true",
-                       help="Read on-screen text and charts from video "
-                            "frames with a local vision model (Ollama). "
-                            "Slow: roughly 35s per unique frame on CPU.")
+                       help="Read on-screen text and charts from the video. "
+                            "Uses Gemini when GEMINI_API_KEY is set, else a "
+                            "local Ollama vision model.")
+    sp_dr.add_argument("--visual-provider", default="",
+                       choices=["", "auto", "ollama", "gemini"],
+                       help="Vision backend. 'auto' (default) uses Gemini when "
+                            "GEMINI_API_KEY is set, otherwise Ollama.")
+    sp_dr.add_argument("--visual-profile", default="",
+                       choices=["", "trading", "general"],
+                       help="Frame prompt. 'trading' (default) asks for chart "
+                            "type, indicators, drawn levels and patterns.")
+    sp_dr.add_argument("--visual-mode", default="",
+                       choices=["", "auto", "frames", "video"],
+                       help="'video' sends the YouTube URL straight to Gemini "
+                            "(no download, no ffmpeg, no local GPU). 'frames' "
+                            "forces the download-and-sample pipeline.")
     sp_dr.add_argument("--output", default="", help="Custom output directory")
     sp_dr.add_argument("--json", action="store_true", help="Output as JSON (default: human-readable)")
     sp_dr.add_argument("--sentences", choices=["model", "off"], default="model",
@@ -5811,6 +5824,14 @@ def main() -> int:
         return 0
 
     if args.cmd == "deep-research":
+        # The visual module reads these at import time, and it is imported
+        # lazily inside prepare_deep_research, so setting them here wins.
+        for flag, env in (("visual_provider", "YT_VISION_PROVIDER"),
+                          ("visual_profile", "YT_VISION_PROFILE"),
+                          ("visual_mode", "YT_VISUAL_MODE")):
+            chosen = getattr(args, flag, "")
+            if chosen:
+                os.environ[env] = chosen
         result = prepare_deep_research(
             args.url,
             output_dir=out_dir,

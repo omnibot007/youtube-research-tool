@@ -305,6 +305,9 @@ class TestVisionCallConfig:
             captured["payload"] = json.loads(req.data.decode("utf-8"))
             return FakeResp()
 
+        # Pin the provider: this class asserts on the OLLAMA payload, and
+        # resolve_provider() would pick Gemini on a machine with a key set.
+        monkeypatch.setattr(visual, "VISION_PROVIDER", "ollama")
         monkeypatch.setattr(visual.urllib.request, "urlopen", fake_urlopen)
         from PIL import Image
         frame = tmp_path / "f.png"
@@ -330,3 +333,282 @@ class TestVisionCallConfig:
         img_bytes = base64.b64decode(payload["images"][0])
         assert img_bytes[:2] == b"\xff\xd8", "frame is not JPEG-encoded"
         assert Image.open(io.BytesIO(img_bytes)).width <= visual.FRAME_MAX_WIDTH
+
+
+class TestGeminiBackend:
+    """Contract tests for the Gemini Interactions backend (added 2026-09-02).
+
+    No network. These pin the request against the schema published at
+    ai.google.dev on 2026-09-02 and the response parser against the vendor's
+    own verbatim example, so a doc drift shows up here rather than as an empty
+    reading in production.
+    """
+
+    # Verbatim from ai.google.dev/api/interactions.md.txt, 2026-09-02.
+    DOC_RESPONSE = {
+        "created": "2025-11-26T12:25:15Z",
+        "id": "v1_ChdPU0F4YWFtNkFwS2kxZThQZ05lbXdROBIX",
+        "model": "gemini-3.6-flash",
+        "object": "interaction",
+        "status": "completed",
+        "steps": [
+            {
+                "type": "model_output",
+                "content": [
+                    {"type": "text", "text": "Hello! I'm functioning perfectly."}
+                ],
+            }
+        ],
+        "updated": "2025-11-26T12:25:15Z",
+        "usage": {"total_tokens": 49},
+    }
+
+    def _capture_gemini(self, monkeypatch, tmp_path, answer=None):
+        captured = {}
+
+        class FakeResp:
+            def read(self):
+                body = dict(TestGeminiBackend.DOC_RESPONSE)
+                if answer is not None:
+                    body["steps"] = [{
+                        "type": "model_output",
+                        "content": [{"type": "text", "text": answer}],
+                    }]
+                return json.dumps(body).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=0):
+            captured["url"] = req.full_url
+            captured["headers"] = dict(req.headers)
+            captured["payload"] = json.loads(req.data.decode("utf-8"))
+            return FakeResp()
+
+        monkeypatch.setattr(visual, "VISION_PROVIDER", "gemini")
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key-not-a-real-secret")
+        monkeypatch.setattr(visual.urllib.request, "urlopen", fake_urlopen)
+        from PIL import Image
+        frame = tmp_path / "f.png"
+        Image.new("RGB", (1920, 1080), (20, 20, 20)).save(frame)
+        reading = visual.read_frame(frame, 0.0)
+        return captured, reading
+
+    def test_request_matches_documented_interactions_schema(
+            self, monkeypatch, tmp_path):
+        cap, _ = self._capture_gemini(monkeypatch, tmp_path)
+        assert cap["url"] == visual.GEMINI_ENDPOINT
+        assert cap["url"].endswith("/v1beta/interactions")
+        # Header names are title-cased by urllib's internal store.
+        headers = {k.lower(): v for k, v in cap["headers"].items()}
+        assert headers["x-goog-api-key"] == "test-key-not-a-real-secret"
+        assert headers["api-revision"] == visual.GEMINI_API_REVISION
+        body = cap["payload"]
+        assert body["model"] == visual.GEMINI_MODEL
+        # input[] is a flat list of type-tagged parts, not contents/parts.
+        assert isinstance(body["input"], list)
+        assert body["input"][0]["type"] == "text"
+        img = body["input"][1]
+        assert img["type"] == "image"
+        assert img["mime_type"] == "image/jpeg"
+        assert base64.b64decode(img["data"])[:2] == b"\xff\xd8"
+
+    def test_json_contract_is_enforced_server_side(self, monkeypatch, tmp_path):
+        cap, _ = self._capture_gemini(monkeypatch, tmp_path)
+        fmt = cap["payload"]["response_format"]
+        assert fmt["mime_type"] == "application/json"
+        assert set(fmt["schema"]["required"]) == {
+            "on_screen_text", "chart_description"}
+
+    def test_parses_vendors_verbatim_response_example(self):
+        text = visual._gemini_extract_text(self.DOC_RESPONSE)
+        assert text == "Hello! I'm functioning perfectly."
+
+    def test_parses_legacy_outputs_shape(self):
+        legacy = {"id": "int_123", "role": "model",
+                  "outputs": [{"type": "text", "text": "legacy body"}]}
+        assert visual._gemini_extract_text(legacy) == "legacy body"
+
+    def test_unknown_response_shape_yields_empty_not_crash(self):
+        assert visual._gemini_extract_text({"nonsense": True}) == ""
+
+    def test_two_key_answer_splits_into_text_and_chart(
+            self, monkeypatch, tmp_path):
+        answer = json.dumps({
+            "on_screen_text": "RSI Length: 14\nEURUSD 4H",
+            "chart_description": "Candlestick chart with an RSI sub-panel.",
+        })
+        _, reading = self._capture_gemini(monkeypatch, tmp_path, answer=answer)
+        assert reading["text"].startswith("RSI Length: 14")
+        assert reading["chart"] == "Candlestick chart with an RSI sub-panel."
+        assert reading["has_content"] is True
+        assert reading["provider"] == "gemini"
+
+    def test_missing_key_is_a_clean_error(self, monkeypatch, tmp_path):
+        for name in ("YT_GEMINI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"):
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setattr(visual, "VISION_PROVIDER", "gemini")
+        from PIL import Image
+        frame = tmp_path / "f.png"
+        Image.new("RGB", (64, 64), (0, 0, 0)).save(frame)
+        reading = visual.read_frame(frame, 0.0)
+        assert "GEMINI_API_KEY" in reading["error"]
+        assert reading["has_content"] is False
+
+    def test_api_key_never_appears_in_an_error_string(
+            self, monkeypatch, tmp_path):
+        secret = "AIza-this-must-never-be-echoed-anywhere"
+        monkeypatch.setattr(visual, "VISION_PROVIDER", "gemini")
+        monkeypatch.setenv("GEMINI_API_KEY", secret)
+
+        def boom(req, timeout=0):
+            raise OSError("connection reset")
+
+        monkeypatch.setattr(visual.urllib.request, "urlopen", boom)
+        from PIL import Image
+        frame = tmp_path / "f.png"
+        Image.new("RGB", (64, 64), (0, 0, 0)).save(frame)
+        reading = visual.read_frame(frame, 0.0)
+        assert reading["error"]
+        assert secret not in json.dumps(reading)
+
+    def test_youtube_video_part_shape(self, monkeypatch):
+        captured = {}
+
+        class FakeResp:
+            def read(self):
+                return json.dumps({"steps": [{"type": "model_output",
+                    "content": [{"type": "text", "text": "{}"}]}]}).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=0):
+            captured["payload"] = json.loads(req.data.decode("utf-8"))
+            return FakeResp()
+
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key-not-a-real-secret")
+        monkeypatch.setattr(visual.urllib.request, "urlopen", fake_urlopen)
+        url = "https://www.youtube.com/watch?v=abc123"
+        visual.analyze_youtube_video(url)
+        parts = captured["payload"]["input"]
+        assert parts[0]["type"] == "text"
+        # video-understanding docs: {"type":"video","uri":...}; no mime_type
+        # is required for a YouTube URL.
+        assert parts[1] == {"type": "video", "uri": url}
+
+
+class TestProviderSelection:
+    def test_auto_stays_on_ollama_without_a_key(self, monkeypatch):
+        for name in ("YT_GEMINI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"):
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setattr(visual, "VISION_PROVIDER", "auto")
+        assert visual.resolve_provider() == "ollama"
+
+    def test_auto_switches_to_gemini_when_a_key_exists(self, monkeypatch):
+        monkeypatch.setattr(visual, "VISION_PROVIDER", "auto")
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key-not-a-real-secret")
+        assert visual.resolve_provider() == "gemini"
+
+    def test_explicit_ollama_ignores_a_present_key(self, monkeypatch):
+        monkeypatch.setattr(visual, "VISION_PROVIDER", "ollama")
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key-not-a-real-secret")
+        assert visual.resolve_provider() == "ollama"
+
+
+class TestTradingProfile:
+    def test_trading_is_the_default_profile(self, monkeypatch):
+        monkeypatch.setattr(visual, "VISION_PROFILE", "trading")
+        assert visual.active_prompt() == visual.TRADING_PROMPT
+
+    def test_general_profile_restores_the_old_prompt(self):
+        assert visual.active_prompt("general") == visual.VISION_PROMPT
+
+    def test_trading_prompt_asks_for_the_fields_a_trader_needs(self):
+        p = visual.TRADING_PROMPT.lower()
+        for token in ("candlestick", "timeframe", "trendlines", "indicator"):
+            assert token in p, token
+
+    def test_trading_prompt_keeps_the_two_key_json_contract(self):
+        assert '"on_screen_text"' in visual.TRADING_PROMPT
+        assert '"chart_description"' in visual.TRADING_PROMPT
+
+
+class TestFailuresAreVisible:
+    """A run where every frame failed must not report vision_error "".
+
+    Measured 2026-09-02: a real run returned frames_failed=1,
+    frames_analyzed=0 and vision_error="" -- the per-frame TimeoutError went
+    to stderr only, so the JSON looked clean while carrying nothing.
+    """
+
+    def test_chart_description_produces_claims(self):
+        chart = "Candlestick chart on the 4H timeframe with RSI Length: 14"
+        claims = visual.extract_visual_claims(chart, 0.0, source="visual_chart")
+        kinds = {c["type"] for c in claims}
+        assert "indicator_setting" in kinds
+        assert "timeframe" in kinds
+        assert all(c["source"] == "visual_chart" for c in claims)
+
+    def test_result_shape_carries_provider_mode_and_frame_errors(self):
+        r = visual.empty_result(True)
+        assert r["mode"] == "frames"
+        assert r["frame_errors"] == []
+        assert r["provider"] in ("ollama", "gemini")
+
+
+class TestProseChartClaims:
+    """chart_description is prose, not slide text (added 2026-09-02).
+
+    Measured 2026-09-02: the parser read "RSI Length: 14" from a slide but
+    dropped "RSI(14)", "200-period EMA" and "oversold below 30" from a chart
+    description, so a good reading produced zero claims.
+    """
+
+    def test_parenthesised_indicator_settings(self):
+        claims = visual.extract_visual_claims(
+            "RSI(14) sub-panel and an EMA(200) overlay", 0.0)
+        settings = {c["claim"] for c in claims
+                    if c["type"] == "indicator_setting"}
+        assert "RSI = 14" in settings
+        assert "EMA = 200" in settings
+
+    def test_period_first_indicator_settings(self):
+        claims = visual.extract_visual_claims(
+            "a 200-period EMA and a 14 period RSI", 0.0)
+        settings = {c["claim"] for c in claims
+                    if c["type"] == "indicator_setting"}
+        assert "EMA = 200" in settings
+        assert "RSI = 14" in settings
+
+    def test_threshold_survives_words_in_between(self):
+        claims = visual.extract_visual_claims(
+            "the RSI(14) sub-panel is oversold below 30", 0.0)
+        assert any(c["claim"] == "RSI below 30" for c in claims)
+
+    def test_named_chart_patterns_become_claims(self):
+        claims = visual.extract_visual_claims(
+            "Candlestick chart showing a bullish divergence, a double top "
+            "and a trendline break", 0.0)
+        terms = {c["claim"] for c in claims if c["type"] == "chart_pattern"}
+        assert "candlestick chart" in terms
+        assert "bullish divergence" in terms
+        assert "double top" in terms
+
+    def test_unsigned_price_levels_are_read(self):
+        claims = visual.extract_visual_claims(
+            "stop loss at 2350.5 and resistance at 1.0950", 0.0)
+        levels = {c["claim"] for c in claims if c["type"] == "price_level"}
+        assert "Stop Loss at 2350.5" in levels, levels
+        assert "Resistance at 1.0950" in levels, levels
+
+    def test_bare_numbers_do_not_become_price_claims(self):
+        claims = visual.extract_visual_claims(
+            "the price went up a lot today, roughly 2350 points of it", 0.0)
+        assert not [c for c in claims if c["type"] == "price_level"]
