@@ -612,3 +612,50 @@ class TestProseChartClaims:
         claims = visual.extract_visual_claims(
             "the price went up a lot today, roughly 2350 points of it", 0.0)
         assert not [c for c in claims if c["type"] == "price_level"]
+
+
+class TestTimestampsAreNotContent:
+    """Video mode prefixes every line with MM:SS (added 2026-09-02).
+
+    Caught on the first live Gemini run, not by any offline test: 4 of 11
+    extracted indicator_settings were clock times. "00:29 RSI Settings" became
+    "RSI = 29". A timestamp is data ABOUT the line, not content IN it.
+    """
+
+    TIMESTAMPED = (
+        "00:01 BTCUSD 1W CRYPTO | RSI 14 close, SMA 14 close\n"
+        "00:29 RSI Settings: RSI Length 14, Source Close, MA Length 14\n"
+        "00:31 RSI Style: RSI Upper Band 70, RSI Middle Band 50\n"
+        "02:44 RSI Style: RSI color white, RSI-based MA yellow"
+    )
+
+    def test_clock_times_do_not_become_indicator_settings(self):
+        claims = visual.extract_visual_claims(self.TIMESTAMPED, 0.0)
+        settings = {c["claim"] for c in claims
+                    if c["type"] == "indicator_setting"}
+        for bogus in ("RSI = 29", "RSI = 31", "RSI = 44", "RSI = 1"):
+            assert bogus not in settings, f"{bogus} came from a timestamp"
+
+    def test_real_settings_are_still_read_without_a_colon(self):
+        """The settings panel writes "RSI Length 14" with no colon, which the
+        original [:=]-anchored parser missed entirely."""
+        claims = visual.extract_visual_claims(self.TIMESTAMPED, 0.0)
+        settings = {c["claim"] for c in claims
+                    if c["type"] == "indicator_setting"}
+        assert "RSI = 14" in settings, settings
+        assert "SMA = 14" in settings, settings
+
+    def test_band_values_do_not_become_settings(self):
+        claims = visual.extract_visual_claims("RSI Upper Band 70", 0.0)
+        assert "RSI = 70" not in {c["claim"] for c in claims}
+
+
+class TestReportedModelMatchesProvider:
+    def test_gemini_run_reports_the_gemini_model(self, monkeypatch):
+        monkeypatch.setattr(visual, "VISION_PROVIDER", "gemini")
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key-not-a-real-secret")
+        assert visual.empty_result(True)["vision_model"] == visual.GEMINI_MODEL
+
+    def test_ollama_run_reports_the_ollama_model(self, monkeypatch):
+        monkeypatch.setattr(visual, "VISION_PROVIDER", "ollama")
+        assert visual.empty_result(True)["vision_model"] == visual.VISION_MODEL

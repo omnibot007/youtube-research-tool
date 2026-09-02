@@ -929,11 +929,26 @@ def extract_visual_claims(text: str, timestamp: float,
         # "RSI(14)", "EMA (200)"
         for m in re.finditer(rf"(?i)\b({_IND})\s*\(\s*(\d+(?:\.\d+)?)\s*\)", line):
             add(f"{m.group(1).upper()} = {m.group(2)}", "indicator_setting")
-        # "200-period EMA", "14 period RSI", "50-day MA"
+        # "200-period EMA", "14 period RSI", "50-day MA".
+        # The (?<![:\d]) guard is load-bearing: video mode prefixes every line
+        # with MM:SS, and without it "00:29 RSI Settings" parsed as RSI = 29.
+        # Measured on a real run 2026-09-02 -- 4 of 11 indicator_settings were
+        # clock times. Timestamps are data about the line, not content in it.
         for m in re.finditer(
-            rf"(?i)\b(\d+)[-\s]*(?:period|day|bar|length)?[-\s]+({_IND})\b", line
+            rf"(?i)(?<![:\d])\b(\d+)[-\s]*(?:period|day|bar|length)?[-\s]+"
+            rf"({_IND})\b", line
         ):
             add(f"{m.group(2).upper()} = {m.group(1)}", "indicator_setting")
+        # "RSI 14", "RSI Length 14", "MA Length 14" -- the on-screen settings
+        # panel writes these WITHOUT a colon, so the [:=]-anchored block above
+        # missed every one of them. Requires the number to follow the
+        # indicator directly (optionally via Length/Period), so "RSI Upper
+        # Band 70" stays a threshold rather than becoming a setting.
+        for m in re.finditer(
+            rf"(?i)\b({_IND})\s+(?:length|period|len)?\s*[:=]?\s*(\d{{1,4}})\b",
+            line,
+        ):
+            add(f"{m.group(1).upper()} = {m.group(2)}", "indicator_setting")
 
     for line in lines:
         # "RSI ... oversold below 30" -- allow a few words between the
@@ -994,7 +1009,11 @@ def empty_result(enable_visual: bool = False) -> dict:
     return {
         "enabled": enable_visual,
         "vision_available": False,
-        "vision_model": VISION_MODEL,
+        # Report the model that will actually run, not the Ollama constant.
+        # A live Gemini run reported vision_model "ui-tars-7b:latest".
+        "vision_model": (
+            GEMINI_MODEL if resolve_provider() == "gemini" else VISION_MODEL
+        ),
         "vision_error": "",
         "ffmpeg": "",
         "video_downloaded": False,
