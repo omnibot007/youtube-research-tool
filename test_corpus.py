@@ -188,3 +188,46 @@ class TestSummaryIsSafe:
         out = capsys.readouterr().out
         assert "partially covered" in out
         assert "66.6" in out
+
+
+class TestPlaylistAndDedup:
+    """A watch?v=X&list=Y URL is one video AND a playlist position."""
+
+    class Args:
+        def __init__(self, urls, no_playlist=False):
+            self.urls = urls
+            self.from_file = ""
+            self.no_playlist = no_playlist
+
+    def test_plain_urls_pass_through(self):
+        got = extract_batch.load_urls(self.Args(
+            ["https://www.youtube.com/watch?v=aaaaaaaaaaa"]))
+        assert len(got) == 1
+
+    def test_same_video_twice_is_one_entry(self):
+        got = extract_batch.load_urls(self.Args([
+            "https://www.youtube.com/watch?v=aaaaaaaaaaa",
+            "https://youtu.be/aaaaaaaaaaa",
+        ]))
+        assert len(got) == 1, "de-dupe must key on video id, not URL text"
+
+    def test_tracking_tails_do_not_create_duplicates(self):
+        got = extract_batch.load_urls(self.Args([
+            "https://youtu.be/aaaaaaaaaaa?si=ABC",
+            "https://youtu.be/aaaaaaaaaaa?si=XYZ",
+        ]))
+        assert len(got) == 1
+
+    def test_no_playlist_flag_keeps_the_single_video(self):
+        url = "https://www.youtube.com/watch?v=aaaaaaaaaaa&list=PLxxxx"
+        got = extract_batch.load_urls(self.Args([url], no_playlist=True))
+        assert got == [url], "must not hit the network with --no-playlist"
+
+    def test_a_non_playlist_url_is_never_expanded(self, monkeypatch):
+        def boom(*a, **k):
+            raise AssertionError("expansion attempted on a plain URL")
+        monkeypatch.setattr(extract_batch, "expand_playlist",
+                            lambda u: [u] if "list=" not in u else boom())
+        got = extract_batch.load_urls(self.Args(
+            ["https://www.youtube.com/watch?v=bbbbbbbbbbb"]))
+        assert len(got) == 1

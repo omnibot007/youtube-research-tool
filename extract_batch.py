@@ -49,6 +49,41 @@ def video_id(url: str) -> str:
     return text if re.fullmatch(r"[A-Za-z0-9_-]{11}", text) else ""
 
 
+def expand_playlist(url: str) -> list:
+    """Return every video URL in a playlist, or [url] if it is not one.
+
+    A `watch?v=X&list=Y` URL is ambiguous: it is one video AND a position in a
+    playlist. Expanding is the useful default here, because that is the form
+    YouTube hands you when you copy from inside a playlist. --no-playlist
+    takes just the video.
+
+    Metadata only (extract_flat), so this needs no API key and is not blocked
+    by the HTTP 403 that stops media downloads on this machine.
+    """
+    if "list=" not in url:
+        return [url]
+    try:
+        import yt_dlp
+
+        opts = {"quiet": True, "no_warnings": True, "skip_download": True,
+                "extract_flat": "in_playlist"}
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as e:
+        print(f"  playlist expansion failed ({type(e).__name__}), treating as "
+              f"a single video: {url}", file=sys.stderr)
+        return [url]
+
+    entries = [e for e in (info.get("entries") or []) if e and e.get("id")]
+    if not entries:
+        return [url]
+    title = (info.get("title") or "playlist")[:48]
+    total = sum(int(e.get("duration") or 0) for e in entries)
+    print(f"  playlist '{title}': {len(entries)} videos, "
+          f"{total // 60} min", file=sys.stderr)
+    return [f"https://www.youtube.com/watch?v={e['id']}" for e in entries]
+
+
 def package_path(vid: str, out_dir: str) -> Path:
     base = Path(out_dir) if out_dir else DEFAULT_OUT
     return base / f"{vid}_research_package.json"
@@ -109,10 +144,16 @@ def load_urls(args) -> list:
             line = raw.strip()
             if line and not line.startswith("#"):
                 urls.append(line)
-    seen, out = set(), []
+    expanded = []
     for u in urls:
-        if u not in seen:
-            seen.add(u)
+        expanded.extend([u] if args.no_playlist else expand_playlist(u))
+    # De-dupe by VIDEO ID, not URL string: the same video reached through two
+    # playlists, or with different ?si= tracking tails, is one video.
+    seen, out = set(), []
+    for u in expanded:
+        key = video_id(u) or u
+        if key not in seen:
+            seen.add(key)
             out.append(u)
     return out
 
@@ -173,6 +214,8 @@ def main() -> int:
                     help="Estimate tokens and cost without calling the API")
     ap.add_argument("--force", action="store_true",
                     help="Re-extract videos that already have a package")
+    ap.add_argument("--no-playlist", action="store_true",
+                    help="Treat a watch?v=X&list=Y URL as the single video X")
     args = ap.parse_args()
 
     urls = load_urls(args)
