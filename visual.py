@@ -192,9 +192,42 @@ GEMINI_SEGMENT_SCHEMA = {
             "description": "specific price levels called out, as written",
             "items": {"type": "string"},
         },
+        "concepts": {
+            "type": "array",
+            "description": "Concepts TAUGHT at this moment, whether spoken or "
+                           "drawn. This is the substance of a mentorship or "
+                           "course video, where the charts are schematics and "
+                           "the method is in the narration. Examples: order "
+                           "block, fair value gap, liquidity sweep, market "
+                           "maker buy model, premium/discount array, "
+                           "inception and terminus, killzone, judas swing.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "term": {"type": "string",
+                             "description": "the concept's name as the "
+                                            "speaker calls it"},
+                    "definition": {"type": "string",
+                                   "description": "what it means, in the "
+                                                  "speaker's own terms. Empty "
+                                                  "if only named, not defined."},
+                },
+                "required": ["term", "definition"],
+            },
+        },
+        "rules": {
+            "type": "array",
+            "description": "Actionable rules or conditions stated here, "
+                           "verbatim in substance. Entry, exit, invalidation, "
+                           "confirmation, timing and risk rules. Example: "
+                           "'wait for the sweep of the previous day high "
+                           "before looking for a short'. Empty if none.",
+            "items": {"type": "string"},
+        },
     },
     "required": ["timestamp", "instrument", "timeframe", "chart_type",
-                 "trend", "indicators", "drawn", "patterns", "levels"],
+                 "trend", "indicators", "drawn", "patterns", "levels",
+                 "concepts", "rules"],
 }
 
 GEMINI_JSON_SCHEMA = {
@@ -580,22 +613,29 @@ TRADING_PROMPT = (
 # Whole-video prompt for the Gemini YouTube-URL path. One request replaces
 # download + ffmpeg + dedup + N frame calls.
 VIDEO_PROMPT = (
-    "You are analysing a TRADING education video. Watch the whole video and "
-    "report ONLY what is literally shown on screen. Never guess a value you "
-    "cannot read: leave the field EMPTY instead. Do not write placeholders "
-    "like 'unidentified' or 'unknown' -- an empty string is the correct "
-    "answer when something is not legible.\n\n"
+    "You are studying a TRADING education video in order to reconstruct the "
+    "method it teaches. You can SEE the screen and HEAR the narration; use "
+    "both. In mentorship and course videos most of the method is SPOKEN over "
+    "hand-drawn schematics rather than shown on a live chart, so a report "
+    "that only describes what is visible misses the point of the video.\n\n"
+    "Be thorough. A 20-minute lesson should yield many segments, not three. "
+    "Add a segment whenever the topic changes, a concept is introduced or "
+    "defined, a rule is stated, or the drawing changes.\n\n"
+    "Report only what is actually said or shown. Never invent a value you "
+    "cannot read or hear; leave the field EMPTY instead. Do not write "
+    "placeholders like 'unidentified' or 'unknown'.\n\n"
     "Return JSON with three keys:\n"
-    '- "segments": one entry per distinct chart or slide, in time order, with '
-    "its timestamp, the instrument and timeframe if legible, the chart type, "
-    "the trend, every named indicator with its period, objects drawn on the "
-    "chart, named price patterns, and any specific price levels. This is the "
-    "important field; be thorough and precise.\n"
-    '- "on_screen_text": the on-screen text that matters, grouped by moment '
-    "and prefixed with its timestamp. Include tickers, timeframes, indicator "
-    "settings panels, and labels drawn on charts.\n"
-    '- "chart_description": one line per distinct chart, prefixed with its '
-    "timestamp, summarising the same content in prose."
+    '- "segments": the important field. One entry per teaching moment, in '
+    "time order, each with its timestamp and whichever of these apply: the "
+    "concepts being taught with the speaker's own definitions; the rules or "
+    "conditions stated; the instrument, timeframe, chart type and trend if a "
+    "real chart is on screen; named indicators with their periods; objects "
+    "drawn; named price patterns; and specific price levels. Leave what does "
+    "not apply empty rather than guessing.\n"
+    '- "on_screen_text": on-screen text that carries meaning, prefixed with '
+    "its timestamp. Skip boilerplate disclaimers.\n"
+    '- "chart_description": one line per distinct visual, prefixed with its '
+    "timestamp, describing what is drawn, including schematics and diagrams."
 )
 
 VISION_PROFILE = os.environ.get("YT_VISION_PROFILE", "trading").strip().lower()
@@ -1017,7 +1057,19 @@ def claims_from_segments(segments: list, window_start: float = 0.0,
             else:
                 add(f"{name} present", "indicator_present")
 
-        for kind, ctype in (("drawn", "chart_pattern"),
+        for con in seg.get("concepts") or []:
+            if not isinstance(con, dict):
+                continue
+            term = str(con.get("term") or "").strip()
+            if not term or term.lower() in _NOT_A_VALUE:
+                continue
+            meaning = str(con.get("definition") or "").strip()
+            if meaning and meaning.lower() not in _NOT_A_VALUE:
+                add(f"{term} = {meaning}", "concept_definition")
+            else:
+                add(term, "concept")
+
+        for kind, ctype in (("rules", "rule"), ("drawn", "chart_pattern"),
                             ("patterns", "chart_pattern"),
                             ("levels", "price_level")):
             for item in seg.get(kind) or []:
