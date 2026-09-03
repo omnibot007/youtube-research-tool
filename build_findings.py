@@ -19,6 +19,27 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 import corpus  # noqa: E402
+import extract_batch  # noqa: E402
+
+
+def requested_ids(url_file: str) -> set:
+    """Video ids from a URL list, playlists expanded.
+
+    Filtering on IDS rather than channel names keeps this exact: a channel
+    filter would silently include anything else that channel published, and
+    silently drop a requested video whose channel string differs.
+    """
+    class _Args:
+        urls: list = []
+        from_file = url_file
+        no_playlist = False
+
+    ids = set()
+    for url in extract_batch.load_urls(_Args()):
+        vid = extract_batch.video_id(url)
+        if vid:
+            ids.add(vid)
+    return ids
 
 SOURCE_DIR = Path.home() / "yt_transcripts"
 
@@ -250,6 +271,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--out", required=True, help="Findings repo directory")
     ap.add_argument("--dir", default=str(SOURCE_DIR), help="Packages folder")
+    ap.add_argument("--only-from", default="",
+                    help="URL list file; include ONLY those videos (playlists "
+                         "expanded). Without it, every package is included.")
     args = ap.parse_args()
 
     out = Path(args.out)
@@ -257,6 +281,19 @@ def main() -> int:
     (out / "data").mkdir(parents=True, exist_ok=True)
 
     packages = corpus.load_packages(Path(args.dir))
+    if args.only_from:
+        keep = requested_ids(args.only_from)
+        before = len(packages)
+        packages = [(p, pkg) for p, pkg in packages
+                    if ((pkg.get("video") or {}).get("id")
+                        or p.name.split("_")[0]) in keep]
+        print(f"filtered to the requested set: {len(packages)} of {before} "
+              f"packages ({len(keep)} ids requested)", file=sys.stderr)
+        missing = keep - {((pkg.get("video") or {}).get("id")
+                           or p.name.split("_")[0]) for p, pkg in packages}
+        if missing:
+            print(f"  WARNING: {len(missing)} requested video(s) have no "
+                  f"package: {', '.join(sorted(missing))}", file=sys.stderr)
     rows = corpus.claim_rows(packages)
     if not rows:
         print("no claims found", file=sys.stderr)
